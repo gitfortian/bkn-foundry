@@ -34,7 +34,7 @@ ingress:
 
 evidence:
   store: memory
-  index: bkn-trace-evidence-v1
+  index: bkn-trace-evidence-v2
   indexManagement:
     enabled: false
     maxResultWindow: 10000

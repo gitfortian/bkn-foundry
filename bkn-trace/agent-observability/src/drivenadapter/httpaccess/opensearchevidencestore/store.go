@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/evidencevo"
@@ -15,9 +16,11 @@ import (
 const maxEvidenceSearchResults = 1000
 
 type Store struct {
-	client *opensearch.Client
-	index  string
-	now    func() time.Time
+	client       *opensearch.Client
+	index        string
+	now          func() time.Time
+	ensureMu     sync.Mutex
+	indexEnsured bool
 }
 
 type document struct {
@@ -51,6 +54,10 @@ func New(client *opensearch.Client, index string) *Store {
 }
 
 func (s *Store) StoreEvidence(ctx context.Context, trace evidencevo.NormalizedTrace) error {
+	if err := s.ensureIndex(ctx); err != nil {
+		return err
+	}
+
 	doc := toDocument(trace, s.now().UTC())
 	body, err := json.Marshal(doc)
 	if err != nil {
@@ -71,6 +78,10 @@ func (s *Store) GetEvidenceByRequestID(ctx context.Context, requestID string, op
 }
 
 func (s *Store) search(ctx context.Context, field string, value string, options evidencevo.EvidenceQueryOptions) (evidencevo.EvidenceQueryResult, error) {
+	if err := s.ensureIndex(ctx); err != nil {
+		return evidencevo.EvidenceQueryResult{}, err
+	}
+
 	limit := options.Limit
 	if limit <= 0 {
 		limit = maxEvidenceSearchResults
@@ -109,6 +120,21 @@ func (s *Store) search(ctx context.Context, field string, value string, options 
 	}
 	return result, nil
 }
+
+func (s *Store) ensureIndex(ctx context.Context) error {
+	s.ensureMu.Lock()
+	defer s.ensureMu.Unlock()
+	if s.indexEnsured {
+		return nil
+	}
+	if err := s.client.EnsureIndex(ctx, s.index, []byte(evidenceIndexMapping)); err != nil {
+		return err
+	}
+	s.indexEnsured = true
+	return nil
+}
+
+const evidenceIndexMapping = `{"settings":{"index.mapping.total_fields.limit":200},"mappings":{"dynamic":false,"properties":{"document_id":{"type":"keyword"},"trace_id":{"type":"keyword"},"bkn":{"properties":{"request":{"properties":{"id":{"type":"keyword"}}},"trace":{"properties":{"schema":{"properties":{"version":{"type":"keyword"}}}}}}},"events":{"type":"object","enabled":false},"claim_ids":{"type":"keyword"},"accepted_event_count":{"type":"integer"},"claim_count":{"type":"integer"},"evidence_ref_count":{"type":"integer"},"business_ref_count":{"type":"integer"},"ingested_at":{"type":"date"}}}}`
 
 func toDocument(trace evidencevo.NormalizedTrace, ingestedAt time.Time) document {
 	doc := document{
