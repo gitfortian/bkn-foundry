@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/conf"
@@ -14,10 +15,15 @@ import (
 type TraceHandler struct {
 	traceQueryService *tracesvc.TraceQueryService
 	authz             traceReadAuthz
+	allowRawQuery     bool
 }
 
 func NewTraceHandler(traceQueryService *tracesvc.TraceQueryService) *TraceHandler {
-	return NewTraceHandlerWithAuthz(traceQueryService, conf.NewTraceReadAuthzConfig())
+	return &TraceHandler{
+		traceQueryService: traceQueryService,
+		authz:             newTraceReadAuthz(conf.NewTraceReadAuthzConfig()),
+		allowRawQuery:     strings.EqualFold(strings.TrimSpace(os.Getenv("BKN_TRACE_ALLOW_RAW_TRACE_QUERY")), "true"),
+	}
 }
 
 // NewTraceHandlerWithAuthz builds the handler with an explicit read-authz
@@ -26,6 +32,7 @@ func NewTraceHandlerWithAuthz(traceQueryService *tracesvc.TraceQueryService, aut
 	return &TraceHandler{
 		traceQueryService: traceQueryService,
 		authz:             newTraceReadAuthz(authzCfg),
+		allowRawQuery:     true,
 	}
 }
 
@@ -42,6 +49,10 @@ func NewTraceHandlerWithAuthz(traceQueryService *tracesvc.TraceQueryService, aut
 // @Failure 504 {object} rdto.ErrorResponse
 // @Router /api/agent-observability/v1/traces/_search [post]
 func (h *TraceHandler) SearchTraces(w http.ResponseWriter, r *http.Request) {
+	if !h.allowRawQuery {
+		writeJSON(w, http.StatusForbidden, rdto.ErrorResponse{Code: "RAW_TRACE_QUERY_DISABLED", Message: "unscoped raw trace query is disabled"})
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, rdto.ErrorResponse{
 			Code:    "METHOD_NOT_ALLOWED",
@@ -113,6 +124,10 @@ func (h *TraceHandler) SearchTraces(w http.ResponseWriter, r *http.Request) {
 // @Failure 504 {object} rdto.ErrorResponse
 // @Router /api/agent-observability/v1/traces/by-conversation [get]
 func (h *TraceHandler) SearchTracesByConversationID(w http.ResponseWriter, r *http.Request) {
+	if !h.allowRawQuery {
+		writeJSON(w, http.StatusForbidden, rdto.ErrorResponse{Code: "RAW_TRACE_QUERY_DISABLED", Message: "unscoped conversation trace query is disabled"})
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, rdto.ErrorResponse{
 			Code:    "METHOD_NOT_ALLOWED",
@@ -248,6 +263,17 @@ func traceIDFromTraceGraphPath(path string) string {
 }
 
 func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
+	traceID := ensureWriterTraceID(w)
+	if response, ok := payload.(rdto.ErrorResponse); ok {
+		if response.ErrorCode == "" {
+			response.ErrorCode = response.Code
+		}
+		if response.Code == "" {
+			response.Code = response.ErrorCode
+		}
+		response.TraceID = traceID
+		payload = response
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	_ = json.NewEncoder(w).Encode(payload)

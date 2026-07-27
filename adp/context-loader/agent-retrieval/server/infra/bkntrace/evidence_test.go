@@ -22,6 +22,12 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+type evidenceRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn evidenceRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return fn(req)
+}
+
 func testTraceContext() context.Context {
 	traceID := trace.TraceID{0x71, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
 	spanID := trace.SpanID{0x71, 0x21, 0, 0, 0, 0, 0, 1}
@@ -32,13 +38,157 @@ func testTraceContext() context.Context {
 	})
 	ctx := trace.ContextWithSpanContext(context.Background(), spanContext)
 	ctx = common.SetTraceContextToCtx(ctx, common.TraceContext{
-		RequestID: "req_context_loader_phase2_0001",
+		RequestID:          "req_context_loader_phase2_0001",
+		BusinessDomain:     "domain_demo",
+		InteractionID:      "int_context_loader_0001",
+		OperationID:        "op_context_retrieval_0001",
+		CausationEventID:   "evt_agent_tool_called_0001",
+		Attempt:            2,
+		ObservedAt:         "2026-07-25T08:00:00Z",
+		ObservedAtProvided: true,
 	})
 	ctx = common.SetAccountAuthContextToCtx(ctx, &interfaces.AccountAuthContext{
 		AccountID:   "acct_demo",
 		AccountType: interfaces.AccessorType("user"),
 	})
 	return ctx
+}
+
+func TestBuildSearchSchemaEventsRejectsMissingReplayEnvelope(t *testing.T) {
+	ctx := testTraceContext()
+	traceContext, _ := common.GetTraceContextFromCtx(ctx)
+	traceContext.ObservedAtProvided = false
+	ctx = common.SetTraceContextToCtx(ctx, traceContext)
+	maxConcepts := 1
+	if events := BuildSearchSchemaEvents(ctx, &interfaces.SearchSchemaReq{Query: "q", MaxConcepts: &maxConcepts}, &interfaces.SearchSchemaResp{}); len(events) != 0 {
+		t.Fatalf("missing propagated observed time must not create conflicting replay: %#v", events)
+	}
+}
+
+func testTraceContextWithClaim() context.Context {
+	ctx := testTraceContext()
+	traceContext, _ := common.GetTraceContextFromCtx(ctx)
+	traceContext.ClaimID = "claim_agent_answer_0001"
+	return common.SetTraceContextToCtx(ctx, traceContext)
+}
+
+func TestBuildSearchSchemaEventsEmitsFactWithoutManufacturingClaim(t *testing.T) {
+	maxConcepts := 5
+	events := BuildSearchSchemaEvents(testTraceContext(), &interfaces.SearchSchemaReq{
+		Query: "customer risk", KnID: "kn_demo", MaxConcepts: &maxConcepts,
+	}, &interfaces.SearchSchemaResp{ObjectTypes: []any{map[string]any{"concept_id": "customer"}}})
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d, want one fact event without upstream claim", len(events))
+	}
+	if events[0]["event_type"] != "retrieval.completed" {
+		t.Fatalf("event_type=%v, want retrieval.completed", events[0]["event_type"])
+	}
+	if events[0]["bkn.trace.schema.version"] != "2.1.0" {
+		t.Fatalf("schema version=%v, want 2.1.0", events[0]["bkn.trace.schema.version"])
+	}
+	for key, want := range map[string]any{
+		"interaction_id":     "int_context_loader_0001",
+		"operation_id":       "op_context_retrieval_0001",
+		"causation_event_id": "evt_agent_tool_called_0001",
+		"attempt":            2,
+	} {
+		if events[0][key] != want {
+			t.Fatalf("%s=%v, want %v", key, events[0][key], want)
+		}
+	}
+	raw, _ := json.Marshal(events)
+	if strings.Contains(string(raw), "claim.created") || strings.Contains(string(raw), "claim_id") {
+		t.Fatalf("producer manufactured a claim: %s", raw)
+	}
+}
+
+func TestBuildSearchSchemaEventsReplayIsStable(t *testing.T) {
+	maxConcepts := 5
+	req := &interfaces.SearchSchemaReq{Query: "customer risk", KnID: "kn_demo", MaxConcepts: &maxConcepts}
+	resp := &interfaces.SearchSchemaResp{ObjectTypes: []any{map[string]any{"concept_id": "customer"}}}
+	ctx := testTraceContext()
+	first := BuildSearchSchemaEvents(ctx, req, resp)
+	second := BuildSearchSchemaEvents(ctx, req, resp)
+	if first[0]["event_id"] != second[0]["event_id"] || first[0]["observed_at"] != second[0]["observed_at"] {
+		t.Fatalf("replay changed identity or observed time: %#v != %#v", first[0], second[0])
+	}
+}
+
+func TestBuildRunSQLEventsRecordsBusinessDataSourcesWithoutLeakingSQLOrRows(t *testing.T) {
+	events := BuildRunSQLEvents(
+		testTraceContext(),
+		"SELECT demand_no, quantity FROM {{.forecast_resource}} WHERE month = '2026-06'",
+		[]string{"forecast_resource"},
+		&interfaces.VegaRawQueryResp{
+			Entries: []map[string]any{{
+				"demand_no": "DF-SECRET-001",
+				"quantity":  11594,
+			}},
+		},
+	)
+	if len(events) != 1 || events[0]["event_type"] != "retrieval.completed" {
+		t.Fatalf("unexpected run_sql events: %#v", events)
+	}
+	payload := events[0]["payload"].(map[string]any)
+	if payload["candidate_count"] != 1 || payload["query_hash"] == "" {
+		t.Fatalf("missing query facts: %#v", payload)
+	}
+	raw, _ := json.Marshal(events)
+	text := string(raw)
+	if !strings.Contains(text, `"ref_id":"resource:forecast_resource"`) {
+		t.Fatalf("missing resource reference: %s", text)
+	}
+	for _, leaked := range []string{"SELECT demand_no", "2026-06", "DF-SECRET-001", "11594"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("run_sql evidence leaked %q: %s", leaked, text)
+		}
+	}
+}
+
+func TestBuildSearchSchemaEventsKeepsFactIndependentFromUpstreamClaim(t *testing.T) {
+	maxConcepts := 5
+	events := BuildSearchSchemaEvents(testTraceContextWithClaim(), &interfaces.SearchSchemaReq{
+		Query: "customer risk", KnID: "kn_demo", MaxConcepts: &maxConcepts,
+	}, &interfaces.SearchSchemaResp{ObjectTypes: []any{map[string]any{"concept_id": "customer", "summary": "raw"}}})
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d, want one fact", len(events))
+	}
+	assertOnlyKeys(t, events[0]["payload"].(map[string]any), "query_hash", "candidate_count", "truncated", "version_status", "source_refs")
+	for _, ref := range events[0]["payload"].(map[string]any)["source_refs"].([]map[string]any) {
+		assertOnlyKeys(t, ref, "ref_id", "ref_type", "source_system", "validity", "version_status", "visibility", "summary_hash")
+	}
+	raw, _ := json.Marshal(events)
+	for _, forbidden := range []string{"claim.created", "evidence.refs.created", "business.refs.resolved", "claim_agent_answer_0001", `"summary":`, "customer risk"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("forbidden producer payload %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestBuildQueryObjectInstanceEventsKeepsQueriedObjectAsZeroResultEvidence(t *testing.T) {
+	events := BuildQueryObjectInstanceEvents(
+		testTraceContext(),
+		&interfaces.QueryObjectInstancesReq{
+			KnID: "supplychain_hd0202",
+			OtID: "supplychain_hd0202_forecast",
+		},
+		&interfaces.QueryObjectInstancesResp{},
+	)
+
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d, want one zero-result fact", len(events))
+	}
+	payload := events[0]["payload"].(map[string]any)
+	if payload["candidate_count"] != 0 {
+		t.Fatalf("candidate_count=%v, want 0", payload["candidate_count"])
+	}
+	refs, ok := payload["source_refs"].([]map[string]any)
+	if !ok || len(refs) != 1 {
+		t.Fatalf("source_refs=%#v, want queried object ref", payload["source_refs"])
+	}
+	if refs[0]["ref_id"] != "object:supplychain_hd0202:supplychain_hd0202_forecast" {
+		t.Fatalf("ref_id=%v, want queried object", refs[0]["ref_id"])
+	}
 }
 
 func TestBuildSearchSchemaEventsUsesHashAndRefsOnly(t *testing.T) {
@@ -76,20 +226,17 @@ func TestBuildSearchSchemaEventsUsesHashAndRefsOnly(t *testing.T) {
 		},
 	}
 
-	events := BuildSearchSchemaEvents(testTraceContext(), req, resp)
-	if len(events) != 2 {
-		t.Fatalf("len(events)=%d, want 2", len(events))
+	events := BuildSearchSchemaEvents(testTraceContextWithClaim(), req, resp)
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d, want 1", len(events))
 	}
 	raw, err := json.Marshal(events)
 	if err != nil {
 		t.Fatalf("marshal events: %v", err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, `"event_type":"claim.created"`) {
-		t.Fatalf("missing claim.created event: %s", text)
-	}
-	if !strings.Contains(text, `"event_type":"evidence.refs.created"`) {
-		t.Fatalf("missing evidence.refs.created event: %s", text)
+	if !strings.Contains(text, `"event_type":"retrieval.completed"`) {
+		t.Fatalf("missing retrieval.completed event: %s", text)
 	}
 	for _, leaked := range []string{"customer phone and complaint risk", "Customer", "Contains phone fields"} {
 		if strings.Contains(text, leaked) {
@@ -99,13 +246,13 @@ func TestBuildSearchSchemaEventsUsesHashAndRefsOnly(t *testing.T) {
 	if !strings.Contains(text, `"query_hash":"sha256:`) {
 		t.Fatalf("missing query hash: %s", text)
 	}
-	if !strings.Contains(text, `"ref_id":"object_type:customer"`) {
+	if !strings.Contains(text, `"ref_id":"object:kn_demo:customer"`) {
 		t.Fatalf("missing object type ref: %s", text)
 	}
-	if !strings.Contains(text, `"ref_id":"relation_type:customer_has_complaint"`) {
+	if !strings.Contains(text, `"ref_id":"relation:kn_demo:customer_has_complaint"`) {
 		t.Fatalf("missing relation type ref: %s", text)
 	}
-	if !strings.Contains(text, `"ref_id":"action_type:notify_owner"`) {
+	if !strings.Contains(text, `"ref_id":"action_type:kn_demo:notify_owner"`) {
 		t.Fatalf("missing action type ref: %s", text)
 	}
 }
@@ -124,7 +271,7 @@ func TestBuildSearchSchemaEventsRequiresTraceContext(t *testing.T) {
 	}
 }
 
-func TestBuildQueryObjectInstanceEventsUsesRowRefsOnly(t *testing.T) {
+func TestBuildQueryObjectInstanceEventsUsesBusinessObjectAndPropertyRefs(t *testing.T) {
 	req := &interfaces.QueryObjectInstancesReq{
 		KnID:  "kn_demo",
 		OtID:  "customer",
@@ -145,36 +292,46 @@ func TestBuildQueryObjectInstanceEventsUsesRowRefsOnly(t *testing.T) {
 		SearchAfter: []any{"cursor_001"},
 	}
 
-	events := BuildQueryObjectInstanceEvents(testTraceContext(), req, resp)
-	if len(events) != 2 {
-		t.Fatalf("len(events)=%d, want 2", len(events))
+	events := BuildQueryObjectInstanceEvents(testTraceContextWithClaim(), req, resp)
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d, want one fact", len(events))
 	}
 	raw, err := json.Marshal(events)
 	if err != nil {
 		t.Fatalf("marshal events: %v", err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, `"event_type":"claim.created"`) {
-		t.Fatalf("missing claim.created event: %s", text)
+	if !strings.Contains(text, `"event_type":"retrieval.completed"`) {
+		t.Fatalf("missing retrieval.completed event: %s", text)
 	}
-	if !strings.Contains(text, `"event_type":"evidence.refs.created"`) {
-		t.Fatalf("missing evidence.refs.created event: %s", text)
+	if !strings.Contains(text, `"ref_id":"object:kn_demo:customer"`) || !strings.Contains(text, `"ref_type":"object"`) {
+		t.Fatalf("missing object ref: %s", text)
 	}
-	if !strings.Contains(text, `"ref_type":"row_ref"`) {
-		t.Fatalf("missing row_ref evidence: %s", text)
+	if !strings.Contains(text, `"ref_id":"property:kn_demo:customer:customer_name"`) || !strings.Contains(text, `"ref_type":"property"`) {
+		t.Fatalf("missing property ref: %s", text)
 	}
-	if !strings.Contains(text, `"condition_hash":"sha256:`) {
-		t.Fatalf("missing condition hash: %s", text)
-	}
-	if !strings.Contains(text, `"properties_hash":"sha256:`) {
-		t.Fatalf("missing properties hash: %s", text)
+	if !strings.Contains(text, `"query_hash":"sha256:`) {
+		t.Fatalf("missing safe query hash: %s", text)
 	}
 	if !strings.Contains(text, `"truncated":true`) {
 		t.Fatalf("missing truncation signal: %s", text)
 	}
-	for _, leaked := range []string{"18800001111", "Alice", "cust_001", "customer_name"} {
+	for _, leaked := range []string{"18800001111", "Alice", "cust_001"} {
 		if strings.Contains(text, leaked) {
 			t.Fatalf("event leaked raw object query content %q: %s", leaked, text)
+		}
+	}
+}
+
+func assertOnlyKeys(t *testing.T, value map[string]any, allowed ...string) {
+	t.Helper()
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedSet[key] = struct{}{}
+	}
+	for key := range value {
+		if _, ok := allowedSet[key]; !ok {
+			t.Fatalf("unregistered key %q in %#v", key, value)
 		}
 	}
 }
@@ -263,32 +420,26 @@ func TestBuildQueryInstanceSubgraphEventsUsesHashAndRefsOnly(t *testing.T) {
 		},
 	}
 
-	events := BuildQueryInstanceSubgraphEvents(testTraceContext(), req, resp)
-	if len(events) != 2 {
-		t.Fatalf("len(events)=%d, want 2", len(events))
+	events := BuildQueryInstanceSubgraphEvents(testTraceContextWithClaim(), req, resp)
+	if len(events) != 1 {
+		t.Fatalf("len(events)=%d, want 1", len(events))
 	}
 	raw, err := json.Marshal(events)
 	if err != nil {
 		t.Fatalf("marshal events: %v", err)
 	}
 	text := string(raw)
-	if !strings.Contains(text, `"event_type":"claim.created"`) {
-		t.Fatalf("missing claim.created event: %s", text)
+	if !strings.Contains(text, `"event_type":"retrieval.completed"`) {
+		t.Fatalf("missing retrieval.completed event: %s", text)
 	}
-	if !strings.Contains(text, `"event_type":"evidence.refs.created"`) {
-		t.Fatalf("missing evidence.refs.created event: %s", text)
-	}
-	if !strings.Contains(text, `"ref_type":"row_ref"`) {
-		t.Fatalf("missing row_ref evidence: %s", text)
-	}
-	if !strings.Contains(text, `"ref_id":"relation_type:has_order"`) {
+	if !strings.Contains(text, `"ref_id":"relation:kn_demo:has_order"`) {
 		t.Fatalf("missing relation type evidence: %s", text)
 	}
-	if !strings.Contains(text, `"ref_type":"schema_ref"`) {
-		t.Fatalf("missing schema_ref evidence: %s", text)
+	if !strings.Contains(text, `"ref_type":"relation"`) {
+		t.Fatalf("missing relation evidence: %s", text)
 	}
-	if !strings.Contains(text, `"path_hash":"sha256:`) {
-		t.Fatalf("missing relation path hash: %s", text)
+	if !strings.Contains(text, `"query_hash":"sha256:`) {
+		t.Fatalf("missing safe path query hash: %s", text)
 	}
 	for _, leaked := range []string{"cust_001", "ord_001", "Alice", "18800001111", "Sensitive Address", "target_instance_phone"} {
 		if strings.Contains(text, leaked) {
@@ -301,7 +452,10 @@ func TestBuildQueryInstanceSubgraphEventsUsesHashAndRefsOnly(t *testing.T) {
 }
 
 func TestBuildQueryInstanceSubgraphEventsDeduplicatesRefs(t *testing.T) {
-	req := &interfaces.QueryInstanceSubgraphReq{KnID: "kn_demo"}
+	req := &interfaces.QueryInstanceSubgraphReq{KnID: "kn_demo", RelationTypePaths: []any{
+		map[string]any{"source_ot_id": "customer", "relation_type_id": "has_order", "target_ot_id": "order"},
+		map[string]any{"source_ot_id": "customer", "relation_type_id": "has_order", "target_ot_id": "order"},
+	}}
 	resp := &interfaces.QueryInstanceSubgraphResp{
 		Entries: []any{
 			map[string]any{
@@ -323,15 +477,12 @@ func TestBuildQueryInstanceSubgraphEventsDeduplicatesRefs(t *testing.T) {
 		t.Fatalf("marshal events: %v", err)
 	}
 	text := string(raw)
-	if got := strings.Count(text, `"ref_type":"row_ref"`); got != 2 {
-		t.Fatalf("row_ref count=%d, want 2 unique refs: %s", got, text)
-	}
-	if got := strings.Count(text, `"ref_id":"relation_type:has_order"`); got != 1 {
-		t.Fatalf("relation schema ref count=%d, want 1: %s", got, text)
+	if got := strings.Count(text, `"ref_id":"relation:kn_demo:has_order"`); got != 1 {
+		t.Fatalf("relation ref count=%d, want 1: %s", got, text)
 	}
 }
 
-func TestBuildQueryInstanceSubgraphEventsCapsEvidenceRefs(t *testing.T) {
+func TestBuildQueryInstanceSubgraphEventsDoesNotDeriveRefsFromRowContent(t *testing.T) {
 	entries := make([]any, 0, maxSubgraphEvidenceRefs+5)
 	for i := 0; i < maxSubgraphEvidenceRefs+5; i++ {
 		entries = append(entries, map[string]any{
@@ -348,11 +499,8 @@ func TestBuildQueryInstanceSubgraphEventsCapsEvidenceRefs(t *testing.T) {
 		t.Fatalf("marshal events: %v", err)
 	}
 	text := string(raw)
-	if got := strings.Count(text, `"ref_type":"row_ref"`); got != maxSubgraphEvidenceRefs {
-		t.Fatalf("row_ref count=%d, want capped %d: %s", got, maxSubgraphEvidenceRefs, text)
-	}
-	if !strings.Contains(text, `"refs_truncated"`) {
-		t.Fatalf("missing refs_truncated partial reason: %s", text)
+	if strings.Contains(text, `"ref_type":"row_ref"`) || strings.Contains(text, "customer_id") {
+		t.Fatalf("row-derived ref leaked: %s", text)
 	}
 }
 
@@ -379,27 +527,84 @@ func TestSubmitEventsNoopsWhenAccountContextMissing(t *testing.T) {
 	SubmitEvents(ctx, nil, nil, []Event{{"event_type": "claim.created"}})
 }
 
-func TestSubmitEventsHandlesServerFailureWithoutBlocking(t *testing.T) {
-	var calls atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		calls.Add(1)
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	t.Setenv(envEvidenceIngestURL, server.URL)
-	t.Setenv(envEvidenceIngestTimeoutMS, "500")
-
-	SubmitEvents(testTraceContext(), nil, nil, []Event{{"event_type": "claim.created"}})
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if calls.Load() > 0 {
-			return
+func TestSubmitEventsPreservesCallerOwnedConversationID(t *testing.T) {
+	t.Setenv(envEvidenceIngestURL, "http://trace.local/ingest")
+	previous := evidenceHTTPClient
+	t.Cleanup(func() { evidenceHTTPClient = previous })
+	payloads := make(chan batch, 1)
+	evidenceHTTPClient = &http.Client{Transport: evidenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var payload batch
+		if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode evidence batch: %v", err)
 		}
-		time.Sleep(10 * time.Millisecond)
+		payloads <- payload
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+
+	headers := map[string]string{
+		common.HeaderBKNRequestID:       "req_context_loader_phase2_0002",
+		"bkn-conversation-id":           "agent:thread_supply_chain",
+		common.HeaderBKNInteractionID:   "int_context_loader_0002",
+		common.HeaderBKNOperationID:     "op_context_retrieval_0002",
+		common.HeaderBKNAttempt:         "1",
+		common.HeaderBusinessDomain:     "domain_demo",
+		common.HeaderBKNEventObservedAt: "2026-07-27T09:00:00Z",
 	}
-	t.Fatalf("expected evidence ingestion request")
+	traceID := trace.TraceID{0x71, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
+	spanID := trace.SpanID{0x71, 0x22, 0, 0, 0, 0, 0, 1}
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled,
+	}))
+	ctx = common.SetTraceContextToCtx(ctx, common.TraceContextFromHeaders(func(key string) string {
+		return headers[key]
+	}))
+	ctx = common.SetAccountAuthContextToCtx(ctx, &interfaces.AccountAuthContext{
+		AccountID: "acct_demo", AccountType: interfaces.AccessorType("user"),
+	})
+
+	SubmitEvents(ctx, nil, nil, []Event{{"event_type": "retrieval.completed"}})
+	select {
+	case payload := <-payloads:
+		if got := payload.Trace["bkn.conversation.id"]; got != "agent:thread_supply_chain" {
+			t.Fatalf("bkn.conversation.id=%v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for evidence batch")
+	}
+}
+
+func TestPostBatchWithRetryTreatsNon2xxAsFailure(t *testing.T) {
+	previous := evidenceHTTPClient
+	t.Cleanup(func() { evidenceHTTPClient = previous })
+	var calls atomic.Int32
+	evidenceHTTPClient = &http.Client{Transport: evidenceRoundTripFunc(func(*http.Request) (*http.Response, error) {
+		status := http.StatusServiceUnavailable
+		if calls.Add(1) == 3 {
+			status = http.StatusNoContent
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+	if err := postBatchWithRetry("http://trace.local", time.Second, batch{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("calls=%d, want 3", calls.Load())
+	}
+}
+
+func TestPostBatchSendsDedicatedIngestToken(t *testing.T) {
+	t.Setenv("BKN_TRACE_EVIDENCE_INGEST_TOKEN", "producer-token")
+	previous := evidenceHTTPClient
+	t.Cleanup(func() { evidenceHTTPClient = previous })
+	evidenceHTTPClient = &http.Client{Transport: evidenceRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("X-BKN-Trace-Ingest-Token"); got != "producer-token" {
+			t.Fatalf("ingest token header=%q", got)
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+	if err := postBatch("http://trace.local", time.Second, batch{}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func captureIngestedTrace(t *testing.T, ctx context.Context) map[string]any {

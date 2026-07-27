@@ -1,72 +1,57 @@
-# mf-model-api Trace Contract
+# mf-model-api BKN Trace 接入合同
 
-> 状态：阶段二 L2 模型调用 evidence 接入合同
-> 适用版本：`bkn.trace.schema.version=2.0.0`
-> 依据：`bkn-docs/docs/foundry/bkn-trace/design/BKN Trace 设计.md`
+> 状态：BKN Trace 2.1 生产者实施基线
+> 更新时间：2026-07-25
+> 权威依据：`bkn-docs/docs/foundry/bkn-trace/registry/核心业务事件注册表.md`
 
-## Module
+## 一、模块责任
 
-- module name: `mf-model-api`
-- observed service: `mf-model-api`
-- owner: OpenBKN Foundry / Model Factory
-- runtime: Python FastAPI service
-- repository path: `infra/mf-model-api`
-- contract version: `2.0.0`
+- 模块名与观测服务：`mf-model-api`。
+- OpenAI、Claude、Baidu、Baidu Tianchen 和其他实际模型分支统一记录 `model.call.observed`，覆盖普通与流式响应。
+- 本模块只记录模型调用事实，不替 Agent/AI 应用创建结论、证据引用或业务引用。
+- 成功构造模型事实后，通过响应头 `bkn-evidence-event-id` 返回稳定事件 ID；同时将请求中安全校验且实际进入模型上下文的 `bkn-candidate-source-event-ids` 作为 `bkn-adopted-source-event-ids` 回执，供上层创建结论时绑定来源。
 
-## Entry Operations
+## 二、上下文与重放
 
-| operation | trigger | required context | emitted events |
-| --- | --- | --- | --- |
-| `model.chat.completions` | `POST /chat/completions` OpenAI-compatible model call | `traceparent`、`bkn-request-id`、account/business-domain headers | `claim.created`、`evidence.refs.created` |
+上游必须传入合法 trace/request，以及 `bkn-interaction-id`、`bkn-operation-id`、`bkn-causation-event-id` 和 `bkn-event-observed-at`；`bkn-attempt` 默认 `1`。
 
-## Inbound Context
+- `bkn-event-observed-at` 是首次业务调用创建的 UTC RFC3339Nano 时间，重试和跨进程重放必须复用。
+- 缺少任一业务因果字段或可靠 observed time 时不创建业务事实，只保留技术日志/trace。
+- `event_id = evt_ + sha256(trace_id|operation_id|event_type|attempt)` 的完整 64 位十六进制结果。
+- 不能仅复用 operation 并用当前时间重建事件；生产者不持久化 envelope，这种重启场景明确不受支持。
 
-- accepted headers: `traceparent`、`bkn-request-id`、legacy `x-request-id`、`x-account-id`、`x-account-type`、`x-business-domain`。
-- request id rule: evidence uses `bkn-request-id` first, then `x-request-id`; when missing or invalid it generates `req_<random>` for evidence completeness.
-- external trace trust policy: only valid W3C `traceparent` is reused. Invalid context is not propagated into evidence.
-- auth context source: account headers and resolved user id only; token, authorization and cookie must never enter evidence payload.
+## 三、事件与敏感边界
 
-## Phase 2 Evidence Event Rules
+payload 精确允许：
 
-- Successful and failed OpenAI-compatible model calls emit one `claim.created` and one `evidence.refs.created` event when `BKN_TRACE_EVIDENCE_INGEST_URL` is configured.
-- Event submission is asynchronous and fail-open; BKN Trace ingestion failure does not change the model API response.
-- `claim.created.payload.claim_type` is `finding`，通过 `subject_refs.operation=model.chat.completions` 和 `producer_module=mf-model-api` 标识模型调用结论。
-- `claim_hash` is computed from safe summary only: model id/name/provider, operation, status, parameter hash, prompt hash, output hash, usage counters and error category.
-- `evidence_refs.created.payload.evidence_refs` contains:
-  - `source_ref` for model: model id/name/provider reference.
-  - `source_ref` for message context: message hash and parameter hash only.
-  - `source_ref` for model result: result hash, status, usage counters and error category only.
+```text
+model_name
+model_provider
+status
+input_token_count
+output_token_count
+prompt_hash
+output_hash
+error_category（错误时）
+error_hash（错误时）
+```
 
-## Sensitive Data Rules
+完整 prompt/messages、模型输出、工具 schema/参数/结果、供应商错误、PII、API key、Authorization 和 Cookie 均不得进入事件、普通日志或 span。成功与失败仅记录哈希、计数和安全枚举。
 
-- never emit: API key、authorization、cookie、完整 prompt/messages、完整 output/answer、tool schema/input/output、PII、token header、provider raw error body。
-- hash only: messages、model output、generation parameter shape、tool presence.
-- allowed counters: `input_unit_count`、`output_unit_count`; avoid any field name containing `token` because generic token scanners treat it as credential-like.
-- controlled reference: `source:model:<id>`、`source:message_hash:<hash>`、`source:model_result:<hash>`。
-- `data.classification`: current model evidence events are `internal`.
+## 四、可靠性
 
-## Fixtures
+- ingest HTTP 非 2xx 视为失败，最多尝试三次。
+- 异步任务保留强引用；最终失败记录 warning，模型业务响应保持失败开放。
+- 当前没有持久 outbox，进程退出可能丢失未提交事件；完整可靠重放由调用方保存并复用 envelope 后主动重试。
 
-| fixture | path | purpose | expected result |
-| --- | --- | --- | --- |
-| phase2 positive | `fixtures/bkn-trace/phase2/mf_model_call_l2_positive.json` | model call L2 finding and hash-only evidence refs | pass |
+## 五、验收
 
-## Covered GWT
+- fixture：`fixtures/bkn-trace/phase2/mf_model_call_l2_positive.json`。
+- Given 任一实际模型 provider，When 普通或流式调用结束，Then 使用同一 producer 合同产出成功或失败事实。
+- Given 相同完整 envelope 重放，Then event ID 和 observed time 不变。
+- Given 缺少 `bkn-event-observed-at`，When 模型结束，Then 不产生会冲突的新事件。
+- Given 非 2xx ingest，When 上报，Then 重试三次并记录最终失败。
 
-- GWT-MF-01 Given legal trace/request/account context, When a model call succeeds, Then mf-model-api emits `claim.created` and `evidence.refs.created` tied to the same `trace_id`、`span_id`、`bkn.request.id`.
-- GWT-MF-02 Given messages/output/tool schema contain business or personal content, When evidence events are built, Then payload contains only hashes, refs, counters and status.
-- GWT-MF-03 Given `BKN_TRACE_EVIDENCE_INGEST_URL` is not configured, When model call succeeds or fails, Then business response remains unchanged and no event submission occurs.
-- GWT-MF-04 Given BKN Trace ingestion is unavailable, When async event submission fails, Then model API response remains unchanged.
+## 六、已知限制
 
-## Known Gaps
-
-- Current implementation covers OpenAI-compatible `/chat/completions` path first; Claude/Baidu adapter branches should be aligned in a follow-up.
-- Prompt/output immutable snapshot storage is not yet connected; current refs are hash-only and `unversioned`.
-- Model provider latency bucket and retry attempt count are not yet emitted.
-
-## Owner Sign-off
-
-- owner: OpenBKN Foundry / Model Factory
-- reviewed at: 2026-07-25
-- reviewer: pending
-- compatibility risk: low; event emission is disabled by default and fail-open when enabled.
+模型模块不保存 prompt/output 快照，也没有持久 outbox；结论绑定、业务语义解析和快照由上层 Agent/AI 应用与 BKN Trace 核心负责。

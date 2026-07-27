@@ -9,14 +9,15 @@ package bkntrace
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
-	"sort"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,12 +26,13 @@ import (
 )
 
 const (
-	ContractVersion = "2.0.0"
+	ContractVersion = "2.1.0"
 	ModuleName      = "bkn-backend"
 )
 
 const (
 	envEvidenceIngestURL       = "BKN_TRACE_EVIDENCE_INGEST_URL"
+	envEvidenceIngestToken     = "BKN_TRACE_EVIDENCE_INGEST_TOKEN"
 	envEvidenceIngestTimeoutMS = "BKN_TRACE_EVIDENCE_TIMEOUT_MS"
 )
 
@@ -44,18 +46,26 @@ const (
 )
 
 const (
-	RefTypeSchema = "schema_ref"
-	RefTypeAction = "action_ref"
-	RefTypeMetric = "metric_ref"
+	RefTypeObject   = "object"
+	RefTypeProperty = "property"
+	RefTypeRelation = "relation"
+	RefTypeAction   = "action"
+	RefTypeMetric   = "metric"
 )
 
 type Event map[string]any
 
 type RequestContext struct {
-	RequestID      string
-	AccountID      string
-	AccountType    string
-	BusinessDomain string
+	RequestID        string
+	AccountID        string
+	AccountType      string
+	BusinessDomain   string
+	InteractionID    string
+	OperationID      string
+	CausationEventID string
+	ClaimID          string
+	Attempt          int
+	ObservedAt       string
 }
 
 type ReadSubject struct {
@@ -82,18 +92,25 @@ type batch struct {
 }
 
 type eventContext struct {
-	traceID        string
-	spanID         string
-	traceparent    string
-	requestID      string
-	accountID      string
-	accountType    string
-	businessDomain string
+	traceID          string
+	spanID           string
+	traceparent      string
+	requestID        string
+	accountID        string
+	accountType      string
+	businessDomain   string
+	interactionID    string
+	operationID      string
+	causationEventID string
+	attempt          int
+	observedAt       string
 }
 
 var (
 	evidenceHTTPClient = &http.Client{}
 	evidenceInFlight   = make(chan struct{}, maxInFlightEvidenceBatches)
+	safeErrorCodeRE    = regexp.MustCompile(`^[0-9A-Za-z_.-]{1,128}$`)
+	safeErrorPathRE    = regexp.MustCompile(`^\$(?:\.[0-9A-Za-z_.-]+|\[[0-9]+\])+$`)
 )
 
 func EvidenceEnabled() bool {
@@ -109,18 +126,9 @@ func HashValue(value any) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
-func ClaimID(kind, subjectID string, value any) string {
-	sum := sha256.Sum256([]byte(HashValue(map[string]any{
-		"kind":       kind,
-		"subject_id": subjectID,
-		"value":      value,
-	})))
-	return "claim_" + hex.EncodeToString(sum[:])[:24]
-}
-
 func BuildSchemaReadEvents(ctx context.Context, reqCtx RequestContext, subject ReadSubject, refs []EvidenceRef) []Event {
 	ec, ok := contextFromRequest(ctx, reqCtx)
-	if !ok || len(refs) == 0 {
+	if !ok {
 		return nil
 	}
 	operation := strings.TrimSpace(subject.Operation)
@@ -128,85 +136,80 @@ func BuildSchemaReadEvents(ctx context.Context, reqCtx RequestContext, subject R
 		operation = "bkn.schema.read"
 	}
 
+	_, businessRefs := controlledRefs(refs, subject.KNID)
+	readEvent := buildEvent(ec, "knowledge.read.observed", operation, map[string]any{
+		"kn_id":          strings.TrimSpace(subject.KNID),
+		"read_kind":      strings.TrimSpace(subject.EntityKind),
+		"version_status": "unversioned",
+		"business_refs":  businessRefs,
+	})
+	return []Event{readEvent}
+}
+
+func controlledRefs(refs []EvidenceRef, knID string) ([]map[string]any, []map[string]any) {
 	evidenceRefs := make([]map[string]any, 0, len(refs))
-	refFingerprints := make([]string, 0, len(refs))
+	businessRefs := make([]map[string]any, 0, len(refs))
 	for _, ref := range refs {
-		if strings.TrimSpace(ref.RefID) == "" || strings.TrimSpace(ref.RefType) == "" {
-			continue
-		}
 		refID := strings.TrimSpace(ref.RefID)
 		refType := strings.TrimSpace(ref.RefType)
-		summaryHash := HashValue(ref.Summary)
-		partialReasons := ref.PartialReasons
-		if len(partialReasons) == 0 {
-			partialReasons = []string{refType + "_unversioned"}
+		if refID == "" || refType == "" {
+			continue
+		}
+		if !isQualifiedBusinessRef(refID, refType, knID) {
+			continue
+		}
+		businessType := refType
+		switch businessType {
+		case RefTypeObject, RefTypeProperty, RefTypeRelation, RefTypeAction, RefTypeMetric:
+		default:
+			continue
 		}
 		evidenceRefs = append(evidenceRefs, map[string]any{
-			"ref_id":         refID,
-			"ref_type":       refType,
-			"source_system":  ModuleName,
-			"summary":        ref.Summary,
-			"summary_hash":   summaryHash,
-			"validity":       "observed",
-			"version_status": "unversioned",
-			"visibility":     "visible",
-			"partial_reason": partialReasons,
+			"ref_id": refID, "ref_type": refType, "source_system": "bkn",
+			"validity": "observed", "version_status": "unversioned", "visibility": "visible",
+			"summary_hash": HashValue(ref.Summary),
 		})
-		refFingerprints = append(refFingerprints, refType+":"+refID+":"+summaryHash)
+		businessRefs = append(businessRefs, map[string]any{
+			"ref_id": refID, "ref_type": businessType, "source_system": "bkn",
+			"validity": "available", "version_status": "unversioned", "visibility": "visible",
+		})
 	}
-	if len(evidenceRefs) == 0 {
-		return nil
-	}
-	sort.Strings(refFingerprints)
-	evidenceRefsHash := HashValue(refFingerprints)
+	return evidenceRefs, businessRefs
+}
 
-	resultSummary := map[string]any{
-		"kn_id":              strings.TrimSpace(subject.KNID),
-		"branch":             strings.TrimSpace(subject.Branch),
-		"entity_kind":        strings.TrimSpace(subject.EntityKind),
-		"requested_hash":     HashValue(subject.RequestedIDs),
-		"returned_count":     subject.ReturnedCount,
-		"total_count":        subject.TotalCount,
-		"evidence_count":     len(evidenceRefs),
-		"evidence_refs_hash": evidenceRefsHash,
-		"operation":          operation,
-		"producer_module":    ModuleName,
-		"contract_version":   ContractVersion,
+func isQualifiedBusinessRef(refID, refType, knID string) bool {
+	parts := strings.Split(refID, ":")
+	knID = strings.TrimSpace(knID)
+	if knID == "" || len(parts) < 3 || parts[1] != knID {
+		return false
 	}
-	claimID := ClaimID(operation, subject.KNID, resultSummary)
-
-	return []Event{
-		buildEvent(ec, "claim.created", operation, map[string]any{
-			"claim_id":       claimID,
-			"claim_type":     "finding",
-			"claim_hash":     HashValue(resultSummary),
-			"visibility":     "visible",
-			"version_status": "unversioned",
-			"partial_reason": []string{"schema_refs_unversioned"},
-			"subject_refs": map[string]any{
-				"kn_id":               strings.TrimSpace(subject.KNID),
-				"branch":              strings.TrimSpace(subject.Branch),
-				"entity_kind":         strings.TrimSpace(subject.EntityKind),
-				"requested_hash":      resultSummary["requested_hash"],
-				"evidence_refs_hash":  evidenceRefsHash,
-				"returned_ref_count":  len(evidenceRefs),
-				"returned_count":      subject.ReturnedCount,
-				"total_count":         subject.TotalCount,
-				"data.classification": "internal",
-			},
-		}),
-		buildEvent(ec, "evidence.refs.created", operation, map[string]any{
-			"claim_id":      claimID,
-			"evidence_refs": evidenceRefs,
-		}),
+	switch refType {
+	case RefTypeObject:
+		return parts[0] == "object" && len(parts) == 3 && parts[2] != ""
+	case RefTypeProperty:
+		return parts[0] == "property" && len(parts) == 4 && parts[2] != "" && parts[3] != ""
+	case RefTypeRelation:
+		return parts[0] == "relation" && len(parts) == 3 && parts[2] != ""
+	case RefTypeAction:
+		return parts[0] == "action_type" && len(parts) == 3 && parts[2] != ""
+	case RefTypeMetric:
+		return parts[0] == "metric" && len(parts) == 3 && parts[2] != ""
+	default:
+		return false
 	}
 }
 
-func EmitSchemaReadEvents(ctx context.Context, reqCtx RequestContext, subject ReadSubject, refs []EvidenceRef) {
+func EmitSchemaReadEvents(ctx context.Context, reqCtx RequestContext, subject ReadSubject, refs []EvidenceRef) string {
 	if !EvidenceEnabled() {
-		return
+		return ""
 	}
-	SubmitEvents(ctx, reqCtx, BuildSchemaReadEvents(ctx, reqCtx, subject, refs))
+	events := BuildSchemaReadEvents(ctx, reqCtx, subject, refs)
+	SubmitEvents(ctx, reqCtx, events)
+	if len(events) == 0 {
+		return ""
+	}
+	eventID, _ := events[0]["event_id"].(string)
+	return eventID
 }
 
 func SubmitEvents(ctx context.Context, reqCtx RequestContext, events []Event) {
@@ -238,25 +241,46 @@ func SubmitEvents(ctx context.Context, reqCtx RequestContext, events []Event) {
 	select {
 	case evidenceInFlight <- struct{}{}:
 	default:
+		log.Printf("BKN Trace evidence ingestion dropped: in-flight limit reached")
 		return
 	}
 
 	timeout := evidenceTimeout()
 	go func() {
 		defer func() { <-evidenceInFlight }()
-		_ = postBatch(ingestURL, timeout, payload)
+		if err := postBatchWithRetry(ingestURL, timeout, payload); err != nil {
+			log.Printf("BKN Trace evidence ingestion unavailable: %v", err)
+		}
 	}()
+}
+
+func postBatchWithRetry(ingestURL string, timeout time.Duration, payload batch) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = postBatch(ingestURL, timeout, payload); err == nil {
+			return nil
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(attempt+1) * 20 * time.Millisecond)
+		}
+	}
+	return err
 }
 
 func ObjectTypeRefs(items []*interfaces.ObjectType) []EvidenceRef {
 	refs := make([]EvidenceRef, 0, len(items))
 	for _, item := range items {
-		if item == nil || strings.TrimSpace(item.OTID) == "" {
+		if item == nil {
 			continue
 		}
+		knID := strings.TrimSpace(item.KNID)
+		if strings.TrimSpace(item.OTID) == "" || knID == "" {
+			continue
+		}
+		objectTypeID := strings.TrimSpace(item.OTID)
 		refs = append(refs, EvidenceRef{
-			RefID:   "object_type:" + strings.TrimSpace(item.OTID),
-			RefType: RefTypeSchema,
+			RefID:   "object:" + knID + ":" + objectTypeID,
+			RefType: RefTypeObject,
 			Summary: map[string]any{
 				"kind":                 EntityKindObjectType,
 				"id":                   strings.TrimSpace(item.OTID),
@@ -271,6 +295,16 @@ func ObjectTypeRefs(items []*interfaces.ObjectType) []EvidenceRef {
 				"update_time":          item.UpdateTime,
 			},
 		})
+		for _, property := range item.DataProperties {
+			if property != nil && strings.TrimSpace(property.Name) != "" {
+				refs = append(refs, EvidenceRef{RefID: "property:" + knID + ":" + objectTypeID + ":" + strings.TrimSpace(property.Name), RefType: RefTypeProperty})
+			}
+		}
+		for _, property := range item.LogicProperties {
+			if property != nil && strings.TrimSpace(property.Name) != "" {
+				refs = append(refs, EvidenceRef{RefID: "property:" + knID + ":" + objectTypeID + ":" + strings.TrimSpace(property.Name), RefType: RefTypeProperty})
+			}
+		}
 	}
 	return refs
 }
@@ -278,12 +312,16 @@ func ObjectTypeRefs(items []*interfaces.ObjectType) []EvidenceRef {
 func RelationTypeRefs(items []*interfaces.RelationType) []EvidenceRef {
 	refs := make([]EvidenceRef, 0, len(items))
 	for _, item := range items {
-		if item == nil || strings.TrimSpace(item.RTID) == "" {
+		if item == nil {
+			continue
+		}
+		knID := strings.TrimSpace(item.KNID)
+		if strings.TrimSpace(item.RTID) == "" || knID == "" {
 			continue
 		}
 		refs = append(refs, EvidenceRef{
-			RefID:   "relation_type:" + strings.TrimSpace(item.RTID),
-			RefType: RefTypeSchema,
+			RefID:   "relation:" + knID + ":" + strings.TrimSpace(item.RTID),
+			RefType: RefTypeRelation,
 			Summary: map[string]any{
 				"kind":                  EntityKindRelationType,
 				"id":                    strings.TrimSpace(item.RTID),
@@ -304,11 +342,15 @@ func RelationTypeRefs(items []*interfaces.RelationType) []EvidenceRef {
 func ActionTypeRefs(items []*interfaces.ActionType) []EvidenceRef {
 	refs := make([]EvidenceRef, 0, len(items))
 	for _, item := range items {
-		if item == nil || strings.TrimSpace(item.ATID) == "" {
+		if item == nil {
+			continue
+		}
+		knID := strings.TrimSpace(item.KNID)
+		if strings.TrimSpace(item.ATID) == "" || knID == "" {
 			continue
 		}
 		refs = append(refs, EvidenceRef{
-			RefID:          "action_type:" + strings.TrimSpace(item.ATID),
+			RefID:          "action_type:" + knID + ":" + strings.TrimSpace(item.ATID),
 			RefType:        RefTypeAction,
 			PartialReasons: []string{"action_ref_unversioned"},
 			Summary: map[string]any{
@@ -331,11 +373,15 @@ func ActionTypeRefs(items []*interfaces.ActionType) []EvidenceRef {
 func MetricRefs(items []*interfaces.MetricDefinition) []EvidenceRef {
 	refs := make([]EvidenceRef, 0, len(items))
 	for _, item := range items {
-		if item == nil || strings.TrimSpace(item.ID) == "" {
+		if item == nil {
+			continue
+		}
+		knID := strings.TrimSpace(item.KnID)
+		if strings.TrimSpace(item.ID) == "" || knID == "" {
 			continue
 		}
 		refs = append(refs, EvidenceRef{
-			RefID:          "metric:" + strings.TrimSpace(item.ID),
+			RefID:          "metric:" + knID + ":" + strings.TrimSpace(item.ID),
 			RefType:        RefTypeMetric,
 			PartialReasons: []string{"metric_ref_unversioned"},
 			Summary: map[string]any{
@@ -370,6 +416,9 @@ func postBatch(ingestURL string, timeout time.Duration, payload batch) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if token := strings.TrimSpace(os.Getenv(envEvidenceIngestToken)); token != "" {
+		req.Header.Set("X-BKN-Trace-Ingest-Token", token)
+	}
 
 	resp, err := evidenceHTTPClient.Do(req)
 	if err != nil {
@@ -377,9 +426,38 @@ func postBatch(ingestURL string, timeout time.Duration, payload batch) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusBadRequest {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return fmt.Errorf("%s", safeIngestFailureSummary(resp.StatusCode, resp.Body))
 	}
 	return nil
+}
+
+func safeIngestFailureSummary(status int, body io.Reader) string {
+	summary := fmt.Sprintf("HTTP %d", status)
+	var response struct {
+		Code    string `json:"code"`
+		Details []struct {
+			Path string `json:"path"`
+		} `json:"details"`
+	}
+	if err := json.NewDecoder(io.LimitReader(body, 64<<10)).Decode(&response); err != nil {
+		return summary
+	}
+	if safeErrorCodeRE.MatchString(response.Code) {
+		summary += " code=" + response.Code
+	}
+	paths := make([]string, 0, 3)
+	for _, detail := range response.Details {
+		if safeErrorPathRE.MatchString(detail.Path) {
+			paths = append(paths, detail.Path)
+			if len(paths) == 3 {
+				break
+			}
+		}
+	}
+	if len(paths) > 0 {
+		summary += " paths=" + strings.Join(paths, ",")
+	}
+	return summary
 }
 
 func evidenceIngestURL() string {
@@ -409,6 +487,15 @@ func contextFromRequest(ctx context.Context, reqCtx RequestContext) (eventContex
 	if requestID == "" || accountID == "" || accountType == "" {
 		return eventContext{}, false
 	}
+	observedAt := strings.TrimSpace(reqCtx.ObservedAt)
+	if _, err := time.Parse(time.RFC3339Nano, observedAt); err != nil {
+		return eventContext{}, false
+	}
+	interactionID := strings.TrimSpace(reqCtx.InteractionID)
+	operationID := strings.TrimSpace(reqCtx.OperationID)
+	if interactionID == "" || operationID == "" {
+		return eventContext{}, false
+	}
 	flags := "00"
 	if spanContext.TraceFlags().IsSampled() {
 		flags = "01"
@@ -418,20 +505,25 @@ func contextFromRequest(ctx context.Context, reqCtx RequestContext) (eventContex
 		businessDomain = accountID
 	}
 	return eventContext{
-		traceID:        spanContext.TraceID().String(),
-		spanID:         spanContext.SpanID().String(),
-		traceparent:    fmt.Sprintf("00-%s-%s-%s", spanContext.TraceID().String(), spanContext.SpanID().String(), flags),
-		requestID:      requestID,
-		accountID:      accountID,
-		accountType:    accountType,
-		businessDomain: businessDomain,
+		traceID:          spanContext.TraceID().String(),
+		spanID:           spanContext.SpanID().String(),
+		traceparent:      fmt.Sprintf("00-%s-%s-%s", spanContext.TraceID().String(), spanContext.SpanID().String(), flags),
+		requestID:        requestID,
+		accountID:        accountID,
+		accountType:      accountType,
+		businessDomain:   businessDomain,
+		interactionID:    interactionID,
+		operationID:      operationID,
+		causationEventID: strings.TrimSpace(reqCtx.CausationEventID),
+		attempt:          normalizedAttempt(reqCtx.Attempt),
+		observedAt:       observedAt,
 	}, true
 }
 
 func buildEvent(ec eventContext, eventType, operationName string, payload map[string]any) Event {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	return Event{
-		"event_id":                 "evt_" + randomHex(16),
+	now := ec.observedAt
+	event := Event{
+		"event_id":                 stableEventID(ec.traceID, ec.operationID, eventType, ec.attempt),
 		"event_type":               eventType,
 		"bkn.trace.schema.version": ContractVersion,
 		"observed_at":              now,
@@ -441,18 +533,25 @@ func buildEvent(ec eventContext, eventType, operationName string, payload map[st
 		"span_id":                  ec.spanID,
 		"bkn.request.id":           ec.requestID,
 		"bkn.operation.name":       operationName,
+		"interaction_id":           ec.interactionID,
+		"operation_id":             ec.operationID,
+		"attempt":                  ec.attempt,
 		"payload":                  payload,
 	}
+	if ec.causationEventID != "" {
+		event["causation_event_id"] = ec.causationEventID
+	}
+	return event
 }
 
-func randomHex(length int) string {
-	if length <= 0 {
-		return ""
+func stableEventID(traceID, operationID, eventType string, attempt int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d", traceID, operationID, eventType, attempt)))
+	return "evt_" + hex.EncodeToString(sum[:])
+}
+
+func normalizedAttempt(attempt int) int {
+	if attempt > 0 {
+		return attempt
 	}
-	buf := make([]byte, (length+1)/2)
-	if _, err := rand.Read(buf); err != nil {
-		sum := sha256.Sum256([]byte(time.Now().UTC().Format(time.RFC3339Nano)))
-		return hex.EncodeToString(sum[:])[:length]
-	}
-	return hex.EncodeToString(buf)[:length]
+	return 1
 }

@@ -1,6 +1,15 @@
 package evidencevo
 
-const ContractVersion = "2.0.0"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+)
+
+const (
+	ContractVersion       = "2.1.0"
+	LegacyContractVersion = "2.0.0"
+)
 
 type IngestRequest struct {
 	SchemaVersion string          `json:"bkn.trace.schema.version"`
@@ -12,6 +21,7 @@ type TraceContext struct {
 	TraceID        string `json:"trace_id"`
 	Traceparent    string `json:"traceparent"`
 	RequestID      string `json:"bkn.request.id"`
+	ConversationID string `json:"bkn.conversation.id,omitempty"`
 	TenantID       string `json:"bkn.tenant.id,omitempty"`
 	BusinessDomain string `json:"business_domain,omitempty"`
 	AccountID      string `json:"bkn.account.id"`
@@ -29,7 +39,205 @@ type EvidenceEvent struct {
 	SpanID        string         `json:"span_id"`
 	RequestID     string         `json:"bkn.request.id"`
 	OperationName string         `json:"bkn.operation.name"`
+	InteractionID string         `json:"interaction_id,omitempty"`
+	OperationID   string         `json:"operation_id,omitempty"`
+	CausationID   string         `json:"causation_event_id,omitempty"`
+	ClaimID       string         `json:"claim_id,omitempty"`
+	Attempt       int            `json:"attempt,omitempty"`
 	Payload       map[string]any `json:"payload"`
+}
+
+const (
+	AppendViolationEventIDConflict = "event_id_conflict"
+	AppendViolationCausation       = "causation_invalid"
+	AppendViolationAction          = "action_transition_invalid"
+	AppendViolationOwnership       = "ownership_conflict"
+	AppendViolationCapacity        = "trace_capacity_exceeded"
+	MaxTraceEvents                 = 10000
+	MaxTraceSerializedBytes        = 8 << 20
+)
+
+type AppendViolation struct {
+	Kind    string
+	EventID string
+}
+
+func (e EvidenceEvent) ContentHash() (string, error) {
+	body, err := json.Marshal(e)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func SupportedContractVersion(version string) bool {
+	return version == LegacyContractVersion || version == ContractVersion || version == ArtifactContractVersion
+}
+
+func NovelEvents(existing []NormalizedTrace, incoming []EvidenceEvent) ([]EvidenceEvent, string, error) {
+	hashes := map[string]string{}
+	for _, trace := range existing {
+		for _, event := range trace.Events {
+			hash, err := event.ContentHash()
+			if err != nil {
+				return nil, "", err
+			}
+			hashes[event.EventID] = hash
+		}
+	}
+	novel := make([]EvidenceEvent, 0, len(incoming))
+	for _, event := range incoming {
+		hash, err := event.ContentHash()
+		if err != nil {
+			return nil, "", err
+		}
+		if existingHash, ok := hashes[event.EventID]; ok {
+			if existingHash != hash {
+				return nil, event.EventID, nil
+			}
+			continue
+		}
+		hashes[event.EventID] = hash
+		novel = append(novel, event)
+	}
+	return novel, "", nil
+}
+
+// ValidateAppend protects invariants that must be checked at the atomic storage boundary.
+func ValidateAppend(existing []NormalizedTrace, incoming NormalizedTrace) *AppendViolation {
+	priorEventIDs := map[string]struct{}{}
+	type actionState struct {
+		state       string
+		claimID     string
+		operationID string
+		lastEventID string
+	}
+	actions := map[string]actionState{}
+	for _, trace := range existing {
+		if !SameOwnership(trace, incoming) {
+			return &AppendViolation{Kind: AppendViolationOwnership}
+		}
+		for _, event := range trace.Events {
+			priorEventIDs[event.EventID] = struct{}{}
+			if actionID := payloadString(event.Payload, "action_instance_id"); actionID != "" && isActionEvent(event.EventType) {
+				actions[actionID] = actionState{
+					state:       actionEventState(event.EventType),
+					claimID:     event.ClaimID,
+					operationID: event.OperationID,
+					lastEventID: event.EventID,
+				}
+			}
+		}
+	}
+
+	novel, conflictID, err := NovelEvents(existing, incoming.Events)
+	if err != nil || conflictID != "" {
+		return &AppendViolation{Kind: AppendViolationEventIDConflict, EventID: conflictID}
+	}
+	causes := map[string]string{}
+	for _, trace := range existing {
+		for _, event := range trace.Events {
+			causes[event.EventID] = event.CausationID
+		}
+	}
+	for _, event := range novel {
+		causes[event.EventID] = event.CausationID
+	}
+	if eventID := causationCycleEventID(causes); eventID != "" {
+		return &AppendViolation{Kind: AppendViolationCausation, EventID: eventID}
+	}
+	for _, event := range novel {
+		if isActionEvent(event.EventType) {
+			actionID := payloadString(event.Payload, "action_instance_id")
+			previous, exists := actions[actionID]
+			expectedPrevious := map[string]string{
+				"action.approval_requested": "recommended",
+				"action.approved":           "approval_requested",
+				"action.rejected":           "approval_requested",
+				"action.executed":           "approved",
+				"action.result_recorded":    "executed",
+			}[event.EventType]
+			valid := event.EventType == "action.recommended" && !exists
+			if event.EventType != "action.recommended" {
+				valid = exists && previous.state == expectedPrevious && event.CausationID == previous.lastEventID
+			}
+			if exists && (previous.claimID != event.ClaimID || previous.operationID != event.OperationID) {
+				valid = false
+			}
+			if !valid {
+				return &AppendViolation{Kind: AppendViolationAction, EventID: event.EventID}
+			}
+			actions[actionID] = actionState{
+				state:       actionEventState(event.EventType),
+				claimID:     event.ClaimID,
+				operationID: event.OperationID,
+				lastEventID: event.EventID,
+			}
+		}
+		priorEventIDs[event.EventID] = struct{}{}
+	}
+	return nil
+}
+
+func causationCycleEventID(causes map[string]string) string {
+	for eventID := range causes {
+		seen := map[string]struct{}{}
+		for current := eventID; current != ""; current = causes[current] {
+			if _, ok := seen[current]; ok {
+				return eventID
+			}
+			seen[current] = struct{}{}
+			if _, known := causes[current]; !known {
+				break
+			}
+		}
+	}
+	return ""
+}
+
+func payloadString(payload map[string]any, key string) string {
+	value, _ := payload[key].(string)
+	return value
+}
+
+func isActionEvent(eventType string) bool {
+	return len(eventType) > len("action.") && eventType[:len("action.")] == "action."
+}
+
+func actionEventState(eventType string) string {
+	return eventType[len("action."):]
+}
+
+func WithEvents(trace NormalizedTrace, events []EvidenceEvent) NormalizedTrace {
+	trace.Events = events
+	trace.AcceptedEvents = len(events)
+	trace.ClaimIDs = nil
+	trace.ClaimCount = 0
+	trace.EvidenceRefCount = 0
+	trace.BusinessRefCount = 0
+	for _, event := range events {
+		switch event.EventType {
+		case "claim.created":
+			trace.ClaimCount++
+			if claimID, ok := event.Payload["claim_id"].(string); ok && claimID != "" {
+				trace.ClaimIDs = append(trace.ClaimIDs, claimID)
+			}
+		case "evidence.refs.created":
+			if refs, ok := event.Payload["evidence_refs"].([]any); ok {
+				trace.EvidenceRefCount += len(refs)
+			}
+		case "business.refs.resolved":
+			if refs, ok := event.Payload["business_refs"].([]any); ok {
+				trace.BusinessRefCount += len(refs)
+			}
+		case "knowledge.read.observed":
+			if refs, ok := event.Payload["business_refs"].([]any); ok {
+				trace.BusinessRefCount += len(refs)
+			}
+		}
+	}
+	return trace
 }
 
 type ValidationError struct {
@@ -50,6 +258,11 @@ func (e ValidationErrors) Error() string {
 type NormalizedTrace struct {
 	TraceID          string
 	RequestID        string
+	ConversationID   string
+	TenantID         string
+	BusinessDomain   string
+	AccountID        string
+	AccountType      string
 	SchemaVersion    string
 	Events           []EvidenceEvent
 	ClaimIDs         []string
@@ -61,6 +274,45 @@ type NormalizedTrace struct {
 
 type EvidenceQueryOptions struct {
 	Limit int
+	Scope QueryScope
+}
+
+type QueryScope struct {
+	TenantID       string
+	BusinessDomain string
+	AccountID      string
+	AccountType    string
+	Authorization  string `json:"-"`
+}
+
+func SameOwnership(existing NormalizedTrace, incoming NormalizedTrace) bool {
+	return existing.TraceID == incoming.TraceID &&
+		existing.RequestID == incoming.RequestID &&
+		compatibleOptionalIdentity(existing.ConversationID, incoming.ConversationID) &&
+		existing.TenantID == incoming.TenantID &&
+		existing.BusinessDomain == incoming.BusinessDomain &&
+		existing.AccountID == incoming.AccountID &&
+		existing.AccountType == incoming.AccountType
+}
+
+func compatibleOptionalIdentity(existing, incoming string) bool {
+	return existing == "" || incoming == "" || existing == incoming
+}
+
+func MatchesScope(trace NormalizedTrace, scope QueryScope) bool {
+	if trace.AccountID == "" || trace.AccountType == "" || trace.TenantID == "" && trace.BusinessDomain == "" {
+		return false
+	}
+	if trace.AccountID != scope.AccountID || trace.AccountType != scope.AccountType {
+		return false
+	}
+	if trace.TenantID != "" && trace.TenantID != scope.TenantID {
+		return false
+	}
+	if trace.BusinessDomain != "" && trace.BusinessDomain != scope.BusinessDomain {
+		return false
+	}
+	return true
 }
 
 type EvidenceQueryResult struct {
@@ -95,9 +347,20 @@ type EvidencePage struct {
 }
 
 type EvidenceChainData struct {
-	Claims       []map[string]any `json:"claims"`
-	EvidenceRefs []map[string]any `json:"evidence_refs"`
-	BusinessRefs []map[string]any `json:"business_refs"`
+	Claims        []map[string]any `json:"claims"`
+	EvidenceRefs  []map[string]any `json:"evidence_refs"`
+	BusinessRefs  []map[string]any `json:"business_refs"`
+	ArtifactLinks []ArtifactLink   `json:"artifact_links"`
+}
+
+type ArtifactLink struct {
+	ArtifactRef  string       `json:"artifact_ref"`
+	ArtifactType ArtifactType `json:"artifact_type"`
+	Role         string       `json:"role"`
+	EventID      string       `json:"event_id"`
+	EventType    string       `json:"event_type"`
+	OperationID  string       `json:"operation_id,omitempty"`
+	ClaimID      string       `json:"claim_id,omitempty"`
 }
 
 type BusinessGraphResponse struct {
@@ -162,13 +425,27 @@ type BusinessGraphData struct {
 }
 
 type BusinessGraphNode struct {
-	ID            string         `json:"id"`
-	NodeType      string         `json:"node_type"`
-	Label         string         `json:"label,omitempty"`
-	ClaimID       string         `json:"claim_id,omitempty"`
-	VersionStatus string         `json:"version_status,omitempty"`
-	Visibility    string         `json:"visibility,omitempty"`
-	Properties    map[string]any `json:"properties,omitempty"`
+	ID            string           `json:"id"`
+	NodeType      string           `json:"node_type"`
+	Stage         string           `json:"stage,omitempty"`
+	Label         string           `json:"label,omitempty"`
+	EventID       string           `json:"event_id,omitempty"`
+	InteractionID string           `json:"interaction_id,omitempty"`
+	OperationID   string           `json:"operation_id,omitempty"`
+	ClaimID       string           `json:"claim_id,omitempty"`
+	ActionID      string           `json:"action_instance_id,omitempty"`
+	VersionStatus string           `json:"version_status,omitempty"`
+	Visibility    string           `json:"visibility,omitempty"`
+	Display       *BusinessDisplay `json:"display,omitempty"`
+	Properties    map[string]any   `json:"properties,omitempty"`
+}
+
+type BusinessDisplay struct {
+	Name              string   `json:"name"`
+	BusinessPath      []string `json:"business_path,omitempty"`
+	ControlledSummary string   `json:"controlled_summary,omitempty"`
+	ResolutionStatus  string   `json:"resolution_status"`
+	SourceVersion     string   `json:"source_version,omitempty"`
 }
 
 type BusinessGraphEdge struct {

@@ -9,231 +9,185 @@ package bkntrace
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"bkn-backend/interfaces"
 	"go.opentelemetry.io/otel/trace"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return fn(req) }
+
 func testTraceContext() context.Context {
-	traceID := trace.TraceID{0x71, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
-	spanID := trace.SpanID{0x71, 0x22, 0, 0, 0, 0, 0, 1}
-	spanContext := trace.NewSpanContext(trace.SpanContextConfig{
-		TraceID:    traceID,
-		SpanID:     spanID,
-		TraceFlags: trace.FlagsSampled,
+	sc := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: trace.TraceID{0x71, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+		SpanID:  trace.SpanID{0x71, 0x22, 0, 0, 0, 0, 0, 1}, TraceFlags: trace.FlagsSampled,
 	})
-	return trace.ContextWithSpanContext(context.Background(), spanContext)
+	return trace.ContextWithSpanContext(context.Background(), sc)
 }
 
 func testRequestContext() RequestContext {
 	return RequestContext{
-		RequestID:      "req_bkn_backend_schema_0001",
-		AccountID:      "acct_demo",
-		AccountType:    "user",
-		BusinessDomain: "domain_demo",
+		RequestID: "req_bkn_backend_schema_0001", AccountID: "acct_demo", AccountType: "user", BusinessDomain: "domain_demo",
+		InteractionID: "int_schema_read_001", OperationID: "op_schema_read_001", CausationEventID: "evt_retrieval_001", Attempt: 2,
+		ObservedAt: "2026-07-25T08:00:00Z",
 	}
 }
 
-func TestBuildSchemaReadEventsUsesRefsAndHashesOnly(t *testing.T) {
-	items := []*interfaces.ObjectType{
-		{
-			ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{
-				OTID:   "customer",
-				OTName: "Customer PII",
-				DataProperties: []*interfaces.DataProperty{
-					{Name: "phone", DisplayName: "Phone Number", Comment: "Do not emit this field"},
-				},
-			},
-			CommonInfo: interfaces.CommonInfo{Comment: "Contains sensitive model notes"},
-			KNID:       "kn_demo",
-			Branch:     "main",
-		},
+func TestBuildSchemaReadEventsRejectsMissingReplayEnvelope(t *testing.T) {
+	req := testRequestContext()
+	req.ObservedAt = ""
+	if events := BuildSchemaReadEvents(testTraceContext(), req, ReadSubject{EntityKind: EntityKindObjectType}, nil); len(events) != 0 {
+		t.Fatalf("missing bkn-event-observed-at must not create conflicting replay: %#v", events)
 	}
+}
 
+func TestPostBatchWithRetryRetriesNon2xx(t *testing.T) {
+	previous := evidenceHTTPClient
+	t.Cleanup(func() { evidenceHTTPClient = previous })
+	var calls atomic.Int32
+	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		status := http.StatusServiceUnavailable
+		if calls.Add(1) == 3 {
+			status = http.StatusNoContent
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+	if err := postBatchWithRetry("http://trace.local", time.Second, batch{}); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("calls=%d, want 3", calls.Load())
+	}
+}
+
+func TestPostBatchSendsDedicatedIngestToken(t *testing.T) {
+	t.Setenv("BKN_TRACE_EVIDENCE_INGEST_TOKEN", "producer-token")
+	previous := evidenceHTTPClient
+	t.Cleanup(func() { evidenceHTTPClient = previous })
+	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.Header.Get("X-BKN-Trace-Ingest-Token"); got != "producer-token" {
+			t.Fatalf("ingest token header=%q", got)
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})}
+	if err := postBatch("http://trace.local", time.Second, batch{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostBatchReportsOnlySafeValidationCodeAndPaths(t *testing.T) {
+	previous := evidenceHTTPClient
+	t.Cleanup(func() { evidenceHTTPClient = previous })
+	evidenceHTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body := `{
+			"code":"BKN_TRACE_REQUIRED_FIELD_MISSING",
+			"message":"sensitive customer value",
+			"details":[
+				{"code":"BKN_TRACE_REQUIRED_FIELD_MISSING","path":"$.events[0].payload.business_refs","message":"secret one"},
+				{"code":"BKN_TRACE_REFERENCE_ID_INVALID","path":"$.events[0].payload.business_refs[0].ref_id","message":"secret two"}
+			]
+		}`
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+
+	err := postBatch("http://trace.local", time.Second, batch{})
+	if err == nil {
+		t.Fatal("expected validation failure")
+	}
+	got := err.Error()
+	for _, want := range []string{
+		"HTTP 400",
+		"code=BKN_TRACE_REQUIRED_FIELD_MISSING",
+		"paths=$.events[0].payload.business_refs,$.events[0].payload.business_refs[0].ref_id",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %q from %q", want, got)
+		}
+	}
+	for _, forbidden := range []string{"sensitive customer value", "secret one", "secret two"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("unsafe response value %q leaked in %q", forbidden, got)
+		}
+	}
+}
+
+func TestBuildSchemaReadEventsRecordsKnowledgeWithoutFabricatingClaim(t *testing.T) {
+	items := []*interfaces.ObjectType{{
+		ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "customer", OTName: "Customer PII", DataProperties: []*interfaces.DataProperty{{Name: "risk_level", DisplayName: "Risk Level"}}},
+		CommonInfo:             interfaces.CommonInfo{Comment: "must not emit"}, KNID: "kn_demo", Branch: "main",
+	}}
 	events := BuildSchemaReadEvents(testTraceContext(), testRequestContext(), ReadSubject{
-		EntityKind:    EntityKindObjectType,
-		Operation:     "bkn.schema.object_type.list",
-		KNID:          "kn_demo",
-		Branch:        "main",
-		ReturnedCount: len(items),
+		EntityKind: EntityKindObjectType, Operation: "bkn.schema.object_type.list", KNID: "kn_demo", Branch: "main", ReturnedCount: 1,
 	}, ObjectTypeRefs(items))
 
-	assertSafeEvents(t, events, []string{
-		`"event_type":"claim.created"`,
-		`"event_type":"evidence.refs.created"`,
-		`"ref_id":"object_type:customer"`,
-		`"ref_type":"schema_ref"`,
-		`"summary_hash":"sha256:`,
-		`"property_count":1`,
-	}, []string{
-		"Customer PII",
-		"phone",
-		"Phone Number",
-		"Do not emit this field",
-		"Contains sensitive model notes",
-	})
+	assertSafeEvents(t, events, 1, []string{
+		`"event_type":"knowledge.read.observed"`, `"bkn.trace.schema.version":"2.1.0"`,
+		`"interaction_id":"int_schema_read_001"`, `"operation_id":"op_schema_read_001"`,
+		`"causation_event_id":"evt_retrieval_001"`, `"attempt":2`, `"kn_id":"kn_demo"`,
+		`"read_kind":"object_type"`, `"ref_id":"object:kn_demo:customer"`, `"ref_type":"object"`,
+		`"ref_id":"property:kn_demo:customer:risk_level"`, `"ref_type":"property"`,
+	}, []string{`"event_type":"claim.created"`, `"event_type":"evidence.refs.created"`, `"event_type":"business.refs.resolved"`, `"summary":`, "Customer PII", "Risk Level", "must not emit"})
 }
 
-func TestBuildSchemaReadEventsCoversRelationActionAndMetricRefs(t *testing.T) {
-	relationRefs := RelationTypeRefs([]*interfaces.RelationType{
-		{
-			RelationTypeWithKeyField: interfaces.RelationTypeWithKeyField{
-				RTID:               "customer_has_order",
-				RTName:             "Customer Order Relation",
-				SourceObjectTypeID: "customer",
-				TargetObjectTypeID: "order",
-				Type:               interfaces.RELATION_TYPE_DIRECT,
-				MappingRules:       []interfaces.Mapping{{SourceProp: interfaces.SimpleProperty{Name: "customer_id"}}},
-			},
-			CommonInfo: interfaces.CommonInfo{Comment: "Mapping detail must not be emitted"},
-		},
-	})
-	actionRefs := ActionTypeRefs([]*interfaces.ActionType{
-		{
-			ActionTypeWithKeyField: interfaces.ActionTypeWithKeyField{
-				ATID:         "notify_owner",
-				ATName:       "Notify Account Owner",
-				ActionType:   "tool",
-				ActionIntent: "Send customer phone to owner",
-				ObjectTypeID: "customer",
-			},
-		},
-	})
-	metricRefs := MetricRefs([]*interfaces.MetricDefinition{
-		{
-			ID:         "customer_risk_score",
-			Name:       "Customer Risk Score",
-			MetricType: "derived",
-			ScopeType:  "object_type",
-			ScopeRef:   "customer",
-			CommonInfo: interfaces.CommonInfo{Comment: "Sensitive metric commentary"},
-			Branch:     "main",
-			KnID:       "kn_demo",
-			Unit:       "score",
-			UnitType:   "number",
-			UpdateTime: 123,
-			CreateTime: 100,
-			ModuleType: "metric",
-		},
-	})
-	refs := append(append(relationRefs, actionRefs...), metricRefs...)
+func TestBuildSchemaReadEventsKeepsFactRefsIndependentFromUpstreamClaim(t *testing.T) {
+	req := testRequestContext()
+	req.ClaimID = "claim_agent_001"
+	events := BuildSchemaReadEvents(testTraceContext(), req, ReadSubject{
+		EntityKind: EntityKindObjectType, Operation: "bkn.schema.object_type.get", KNID: "kn_demo", Branch: "main", ReturnedCount: 1,
+	}, []EvidenceRef{{RefID: "object:kn_demo:customer", RefType: RefTypeObject, Summary: map[string]any{"raw": "must-not-appear"}}})
 
-	events := BuildSchemaReadEvents(testTraceContext(), testRequestContext(), ReadSubject{
-		EntityKind:    EntityKindMetric,
-		Operation:     "bkn.schema.mixed.test",
-		KNID:          "kn_demo",
-		Branch:        "main",
-		ReturnedCount: len(refs),
-	}, refs)
-
-	assertSafeEvents(t, events, []string{
-		`"ref_id":"relation_type:customer_has_order"`,
-		`"ref_type":"schema_ref"`,
-		`"ref_id":"action_type:notify_owner"`,
-		`"ref_type":"action_ref"`,
-		`"ref_id":"metric:customer_risk_score"`,
-		`"ref_type":"metric_ref"`,
-		`"version_status":"unversioned"`,
-	}, []string{
-		"Customer Order Relation",
-		"Mapping detail must not be emitted",
-		"customer_id",
-		"Notify Account Owner",
-		"Send customer phone to owner",
-		"Customer Risk Score",
-		"Sensitive metric commentary",
-	})
+	assertSafeEvents(t, events, 1, []string{
+		`"event_type":"knowledge.read.observed"`, `"ref_id":"object:kn_demo:customer"`, `"ref_type":"object"`,
+		`"version_status":"unversioned"`, `"visibility":"visible"`,
+	}, []string{`"event_type":"claim.created"`, `"event_type":"evidence.refs.created"`, `"event_type":"business.refs.resolved"`, `"claim_id":"claim_agent_001"`, `"summary":`, "must-not-appear"})
 }
 
-func TestBuildSchemaReadEventsDifferentiatesSameCountDifferentRefs(t *testing.T) {
-	subject := ReadSubject{
-		EntityKind:    EntityKindObjectType,
-		Operation:     "bkn.schema.object_type.list",
-		KNID:          "kn_demo",
-		Branch:        "main",
-		ReturnedCount: 1,
-		TotalCount:    1,
-	}
-	customerEvents := BuildSchemaReadEvents(testTraceContext(), testRequestContext(), subject, ObjectTypeRefs([]*interfaces.ObjectType{
-		{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "customer"}, KNID: "kn_demo", Branch: "main"},
-	}))
-	orderEvents := BuildSchemaReadEvents(testTraceContext(), testRequestContext(), subject, ObjectTypeRefs([]*interfaces.ObjectType{
-		{ObjectTypeWithKeyField: interfaces.ObjectTypeWithKeyField{OTID: "order"}, KNID: "kn_demo", Branch: "main"},
-	}))
-
-	customerClaim := claimPayload(t, customerEvents)
-	orderClaim := claimPayload(t, orderEvents)
-	if customerClaim["claim_id"] == orderClaim["claim_id"] {
-		t.Fatalf("claim_id should differ for same-count different refs: %v", customerClaim["claim_id"])
-	}
-	if customerClaim["claim_hash"] == orderClaim["claim_hash"] {
-		t.Fatalf("claim_hash should differ for same-count different refs: %v", customerClaim["claim_hash"])
-	}
-	customerSubjectRefs, ok := customerClaim["subject_refs"].(map[string]any)
-	if !ok {
-		t.Fatalf("subject_refs missing or invalid: %#v", customerClaim["subject_refs"])
-	}
-	if _, ok := customerSubjectRefs["evidence_refs_hash"].(string); !ok {
-		t.Fatalf("missing evidence_refs_hash in subject_refs: %#v", customerSubjectRefs)
-	}
-}
-
-func TestBuildSchemaReadEventsRequiresTraceAndRequestContext(t *testing.T) {
-	events := BuildSchemaReadEvents(context.Background(), testRequestContext(), ReadSubject{
-		EntityKind:    EntityKindObjectType,
-		Operation:     "bkn.schema.object_type.list",
-		KNID:          "kn_demo",
-		Branch:        "main",
-		ReturnedCount: 1,
-	}, []EvidenceRef{{RefID: "object_type:customer", RefType: RefTypeSchema}})
+func TestBuildSchemaReadEventsRejectsMissingCausalIDs(t *testing.T) {
+	req := testRequestContext()
+	req.InteractionID, req.OperationID, req.CausationEventID = "", "", ""
+	events := BuildSchemaReadEvents(testTraceContext(), req, ReadSubject{EntityKind: EntityKindMetric, KNID: "kn_demo", ReturnedCount: 1}, []EvidenceRef{{RefID: "metric:kn_demo:risk", RefType: RefTypeMetric}})
 	if len(events) != 0 {
-		t.Fatalf("len(events)=%d, want 0 without trace context", len(events))
-	}
-
-	events = BuildSchemaReadEvents(testTraceContext(), RequestContext{}, ReadSubject{
-		EntityKind:    EntityKindObjectType,
-		Operation:     "bkn.schema.object_type.list",
-		KNID:          "kn_demo",
-		Branch:        "main",
-		ReturnedCount: 1,
-	}, []EvidenceRef{{RefID: "object_type:customer", RefType: RefTypeSchema}})
-	if len(events) != 0 {
-		t.Fatalf("len(events)=%d, want 0 without request context", len(events))
+		t.Fatalf("missing interaction/operation must not create an unstable envelope: %#v", events)
 	}
 }
 
-func claimPayload(t *testing.T, events []Event) map[string]any {
-	t.Helper()
-	if len(events) == 0 {
-		t.Fatalf("events are empty")
+func TestBuildSchemaReadEventsRequiresTraceAndRequest(t *testing.T) {
+	if got := BuildSchemaReadEvents(context.Background(), testRequestContext(), ReadSubject{EntityKind: EntityKindObjectType}, []EvidenceRef{{RefID: "object:kn_demo:x", RefType: RefTypeObject}}); len(got) != 0 {
+		t.Fatalf("events without trace=%d", len(got))
 	}
-	payload, ok := events[0]["payload"].(map[string]any)
-	if !ok {
-		t.Fatalf("claim payload missing or invalid: %#v", events[0]["payload"])
+	if got := BuildSchemaReadEvents(testTraceContext(), RequestContext{}, ReadSubject{EntityKind: EntityKindObjectType}, []EvidenceRef{{RefID: "object:kn_demo:x", RefType: RefTypeObject}}); len(got) != 0 {
+		t.Fatalf("events without request=%d", len(got))
 	}
-	return payload
 }
 
-func assertSafeEvents(t *testing.T, events []Event, want []string, forbidden []string) {
+func assertSafeEvents(t *testing.T, events []Event, count int, want, forbidden []string) {
 	t.Helper()
-	if len(events) != 2 {
-		t.Fatalf("len(events)=%d, want 2", len(events))
+	if len(events) != count {
+		t.Fatalf("len(events)=%d, want %d", len(events), count)
 	}
 	raw, err := json.Marshal(events)
 	if err != nil {
-		t.Fatalf("marshal events: %v", err)
+		t.Fatal(err)
 	}
 	text := string(raw)
 	for _, item := range want {
 		if !strings.Contains(text, item) {
-			t.Fatalf("missing %q in events: %s", item, text)
+			t.Fatalf("missing %q: %s", item, text)
 		}
 	}
 	for _, item := range forbidden {
 		if strings.Contains(text, item) {
-			t.Fatalf("event leaked raw content %q: %s", item, text)
+			t.Fatalf("leaked/forbidden %q: %s", item, text)
 		}
 	}
 }

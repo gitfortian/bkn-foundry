@@ -9,23 +9,34 @@ package common
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/openbkn-ai/adp/context-loader/agent-retrieval/server/interfaces"
 	"go.opentelemetry.io/otel/trace"
 )
 
 const (
-	HeaderTraceparent       = "traceparent"
-	HeaderBKNRequestID      = "bkn-request-id"
-	HeaderLegacyRequestID   = "x-request-id"
-	HeaderBaggage           = "baggage"
-	HeaderBKNConversationID = "bkn-conversation-id"
-	HeaderBKNInteractionID  = "bkn-interaction-id"
+	HeaderTraceparent         = "traceparent"
+	HeaderBKNRequestID        = "bkn-request-id"
+	HeaderLegacyRequestID     = "x-request-id"
+	HeaderBaggage             = "baggage"
+	HeaderBKNConversationID   = "bkn-conversation-id"
+	HeaderBKNInteractionID    = "bkn-interaction-id"
+	HeaderBKNOperationID      = "bkn-operation-id"
+	HeaderBKNCausationEventID = "bkn-causation-event-id"
+	HeaderBKNClaimID          = "bkn-claim-id"
+	HeaderBKNAttempt          = "bkn-attempt"
+	HeaderTenantID            = "x-tenant-id"
+	HeaderBusinessDomain      = "x-business-domain"
+	HeaderBKNEventObservedAt  = "bkn-event-observed-at"
 )
 
 type traceContextKey string
@@ -34,20 +45,25 @@ const keyTraceContext traceContextKey = "bkn_trace_context"
 
 var bknRequestIDRe = regexp.MustCompile(`^req_[A-Za-z0-9_-]{8,128}$`)
 
-// correlationIDRe 约束会话/交互 id 的字符集：允许调用方带 issuer 前缀（如 `agent:thread_x`），
-// 拒绝空白、控制字符和超长值，避免非法值污染 header 与证据事件。
-var correlationIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-
-// TraceContext carries the OpenBKN phase-one correlation context.
-//
-// ConversationID/InteractionID 只做关联标签：由调用方生成并传入，本服务只透传，
-// 不生成、不推断，也不参与任何鉴权、限流或缓存判定。
+// TraceContext carries OpenBKN correlation and business causality context.
+// ConversationID and InteractionID are caller-owned correlation labels. This
+// service validates and propagates them, but never creates or infers them.
 type TraceContext struct {
-	RequestID      string
-	ConversationID string
-	InteractionID  string
-	Baggage        map[string]string
+	RequestID          string
+	TenantID           string
+	BusinessDomain     string
+	Baggage            map[string]string
+	ConversationID     string
+	InteractionID      string
+	OperationID        string
+	CausationEventID   string
+	ClaimID            string
+	Attempt            int
+	ObservedAt         string
+	ObservedAtProvided bool
 }
+
+var businessTraceIDRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
 // GetLanguageFromCtx 从context中获取语言设置
 func GetLanguageFromCtx(ctx context.Context) Language {
@@ -108,11 +124,30 @@ func SetTraceContextToCtx(ctx context.Context, traceContext TraceContext) contex
 	if !IsValidBKNRequestID(traceContext.RequestID) {
 		traceContext.RequestID = NewBKNRequestID()
 	}
-	// 会话/交互 id 缺失或非法时直接丢弃：本轮降级为单请求 trace，绝不在服务端补造，
-	// 否则每次调用都会生成一个与 request id 一一对应的假分组。
-	traceContext.ConversationID = sanitizeCorrelationID(traceContext.ConversationID)
-	traceContext.InteractionID = sanitizeCorrelationID(traceContext.InteractionID)
 	traceContext.Baggage = sanitizeBaggage(traceContext.Baggage)
+	traceContext.TenantID = sanitizeBusinessTraceID(traceContext.TenantID)
+	traceContext.BusinessDomain = sanitizeBusinessTraceID(traceContext.BusinessDomain)
+	if traceContext.BusinessDomain == "" {
+		traceContext.BusinessDomain = sanitizeBusinessTraceID(traceContext.Baggage["business_domain"])
+	}
+	traceContext.ConversationID = sanitizeBusinessTraceID(traceContext.ConversationID)
+	traceContext.InteractionID = sanitizeBusinessTraceID(traceContext.InteractionID)
+	traceContext.OperationID = sanitizeBusinessTraceID(traceContext.OperationID)
+	traceContext.CausationEventID = sanitizeBusinessTraceID(traceContext.CausationEventID)
+	traceContext.ClaimID = sanitizeBusinessTraceID(traceContext.ClaimID)
+	if traceContext.BusinessDomain != "" {
+		if traceContext.Baggage == nil {
+			traceContext.Baggage = map[string]string{}
+		}
+		traceContext.Baggage["business_domain"] = traceContext.BusinessDomain
+	}
+	if traceContext.Attempt < 1 || traceContext.Attempt > 1000 {
+		traceContext.Attempt = 1
+	}
+	if _, err := time.Parse(time.RFC3339Nano, traceContext.ObservedAt); err != nil {
+		traceContext.ObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		traceContext.ObservedAtProvided = false
+	}
 	return context.WithValue(ctx, keyTraceContext, traceContext)
 }
 
@@ -126,11 +161,25 @@ func TraceContextFromHeaders(getHeader func(string) string) TraceContext {
 	if requestID == "" {
 		requestID = strings.TrimSpace(getHeader(HeaderLegacyRequestID))
 	}
+	attempt, _ := strconv.Atoi(strings.TrimSpace(getHeader(HeaderBKNAttempt)))
+	if attempt < 1 || attempt > 1000 {
+		attempt = 1
+	}
+	observedAt := strings.TrimSpace(getHeader(HeaderBKNEventObservedAt))
+	_, observedAtErr := time.Parse(time.RFC3339Nano, observedAt)
 	return TraceContext{
-		RequestID:      requestID,
-		ConversationID: strings.TrimSpace(getHeader(HeaderBKNConversationID)),
-		InteractionID:  strings.TrimSpace(getHeader(HeaderBKNInteractionID)),
-		Baggage:        parseBaggage(getHeader(HeaderBaggage)),
+		RequestID:          requestID,
+		TenantID:           sanitizeBusinessTraceID(getHeader(HeaderTenantID)),
+		BusinessDomain:     firstNonEmpty(getHeader(HeaderBusinessDomain), parseBaggage(getHeader(HeaderBaggage))["business_domain"]),
+		Baggage:            parseBaggage(getHeader(HeaderBaggage)),
+		ConversationID:     sanitizeBusinessTraceID(getHeader(HeaderBKNConversationID)),
+		InteractionID:      sanitizeBusinessTraceID(getHeader(HeaderBKNInteractionID)),
+		OperationID:        sanitizeBusinessTraceID(getHeader(HeaderBKNOperationID)),
+		CausationEventID:   sanitizeBusinessTraceID(getHeader(HeaderBKNCausationEventID)),
+		ClaimID:            sanitizeBusinessTraceID(getHeader(HeaderBKNClaimID)),
+		Attempt:            attempt,
+		ObservedAt:         observedAt,
+		ObservedAtProvided: observedAtErr == nil,
 	}
 }
 
@@ -138,17 +187,8 @@ func IsValidBKNRequestID(requestID string) bool {
 	return bknRequestIDRe.MatchString(requestID)
 }
 
-// IsValidCorrelationID 判断调用方传入的会话/交互 id 是否可透传。
 func IsValidCorrelationID(id string) bool {
-	return correlationIDRe.MatchString(id)
-}
-
-func sanitizeCorrelationID(id string) string {
-	id = strings.TrimSpace(id)
-	if !IsValidCorrelationID(id) {
-		return ""
-	}
-	return id
+	return businessTraceIDRe.MatchString(strings.TrimSpace(id))
 }
 
 func NewBKNRequestID() string {
@@ -174,21 +214,79 @@ func GetHeaderFromCtx(ctx context.Context) (header map[string]string) {
 	if ok {
 		header[HeaderBKNRequestID] = traceContext.RequestID
 		header[HeaderLegacyRequestID] = traceContext.RequestID
-		// 缺失即不下发，保持下游「无上游会话则降级为单请求」的语义。
-		if traceContext.ConversationID != "" {
-			header[HeaderBKNConversationID] = traceContext.ConversationID
-		}
-		if traceContext.InteractionID != "" {
-			header[HeaderBKNInteractionID] = traceContext.InteractionID
-		}
 		if baggage := formatBaggage(outboundBaggage(traceContext.Baggage, authContext)); baggage != "" {
 			header[HeaderBaggage] = baggage
+		}
+		setBusinessTraceHeaders(header, traceContext)
+		if traceContext.BusinessDomain != "" {
+			header[HeaderBusinessDomain] = traceContext.BusinessDomain
+		}
+		if traceContext.TenantID != "" {
+			header[HeaderTenantID] = traceContext.TenantID
+		}
+		if traceContext.ObservedAtProvided {
+			header[HeaderBKNEventObservedAt] = traceContext.ObservedAt
 		}
 	}
 	if traceparent := traceparentFromCtx(ctx); traceparent != "" {
 		header[HeaderTraceparent] = traceparent
 	}
 	return
+}
+
+func setBusinessTraceHeaders(header map[string]string, traceContext TraceContext) {
+	for key, value := range map[string]string{
+		HeaderBKNConversationID:   traceContext.ConversationID,
+		HeaderBKNInteractionID:    traceContext.InteractionID,
+		HeaderBKNOperationID:      traceContext.OperationID,
+		HeaderBKNCausationEventID: traceContext.CausationEventID,
+		HeaderBKNClaimID:          traceContext.ClaimID,
+	} {
+		if value != "" {
+			header[key] = value
+		}
+	}
+	if traceContext.OperationID != "" && traceContext.Attempt > 0 {
+		header[HeaderBKNAttempt] = strconv.Itoa(traceContext.Attempt)
+	}
+}
+
+// StripBusinessTraceHeaders removes OpenBKN-only causality before an untrusted outbound hop.
+func StripBusinessTraceHeaders(header map[string]string) {
+	for key := range header {
+		for _, protected := range []string{HeaderBKNConversationID, HeaderBKNInteractionID, HeaderBKNOperationID, HeaderBKNCausationEventID, HeaderBKNClaimID, HeaderBKNAttempt, HeaderBKNEventObservedAt, HeaderTenantID, HeaderBusinessDomain} {
+			if strings.EqualFold(key, protected) {
+				delete(header, key)
+				break
+			}
+		}
+	}
+}
+
+func sanitizeBusinessTraceID(value string) string {
+	value = strings.TrimSpace(value)
+	if !businessTraceIDRe.MatchString(value) {
+		return ""
+	}
+	return value
+}
+
+// GetHeaderForChildOperation forks a deterministic child operation without changing the direct cause.
+func GetHeaderForChildOperation(ctx context.Context, operationName string, callOrdinal int) map[string]string {
+	traceContext, ok := GetTraceContextFromCtx(ctx)
+	if !ok {
+		return GetHeaderFromCtx(ctx)
+	}
+	traceContext.OperationID = childOperationID(traceContext.OperationID, operationName, traceContext.Attempt, callOrdinal)
+	return GetHeaderFromCtx(SetTraceContextToCtx(ctx, traceContext))
+}
+
+func childOperationID(parentOperationID, operationName string, attempt, callOrdinal int) string {
+	if callOrdinal < 1 {
+		callOrdinal = 1
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d|%d", parentOperationID, strings.TrimSpace(operationName), attempt, callOrdinal)))
+	return "op_" + hex.EncodeToString(sum[:])
 }
 
 func sanitizeBaggage(baggage map[string]string) map[string]string {
@@ -198,7 +296,7 @@ func sanitizeBaggage(baggage map[string]string) map[string]string {
 	cleaned := map[string]string{}
 	for key, value := range baggage {
 		switch key {
-		case "bkn.runtime.env":
+		case "bkn.runtime.env", "business_domain":
 			cleaned[key] = value
 		}
 	}
@@ -206,6 +304,15 @@ func sanitizeBaggage(baggage map[string]string) map[string]string {
 		return nil
 	}
 	return cleaned
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func outboundBaggage(baggage map[string]string, authContext *interfaces.AccountAuthContext) map[string]string {

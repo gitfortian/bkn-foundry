@@ -1,189 +1,71 @@
-# context-loader Trace Contract
+# context-loader BKN Trace 接入合同
 
-> 状态：阶段二 L2 证据事件局部接入
-> 适用版本：`bkn.trace.schema.version=2.0.0`（阶段一日志/传播 fixture 仍保留 `1.0.0`）
-> 依据：`bkn-docs/docs/foundry/bkn-trace/design/阶段一：OpenBKN 可观测记录规范与 Trace Context 基线.md`
+> 状态：BKN Trace 2.1 生产者实施基线
+> 更新时间：2026-07-25
+> 权威依据：`bkn-docs/docs/foundry/bkn-trace/registry/核心业务事件注册表.md`
 
-## Module
+## 一、模块责任
 
-- module name: `context-loader`
-- owner: OpenBKN Foundry / context-loader
-- service identity: `context-loader`
-- runtime: Go HTTP / MCP / toolbox service
-- repository path: `adp/context-loader/agent-retrieval`
-- contract version: `2.0.0`
+- 模块名：`context-loader`。
+- 观测操作：`context.search_schema`、`context.query_object`、`context.query_instance_subgraph`。
+- 标准事实：`retrieval.completed`。
+- 模块只陈述检索事实，不生成 claim，也不根据上游 claim 在事实阶段生成 `evidence.refs.created/business.refs.resolved`。结论和绑定由 Agent/AI 应用在得到真实事实事件 ID 后完成。
 
-## Entry Operations
+## 二、入站上下文
 
-| operation | trigger | required context | emitted spans | emitted events |
-| --- | --- | --- | --- | --- |
-| `context.search_schema` | schema search HTTP/MCP/tool call | `traceparent`、`bkn-request-id`、account/auth context | `context-loader.request`、`context-loader.search` | `claim.created`、`evidence.refs.created`、`context.refs.resolved` |
-| `context.query_object` | object query HTTP/MCP/tool call | `traceparent`、`bkn-request-id`、account/auth context | `context-loader.request`、`context-loader.source.resolve` | `claim.created`、`evidence.refs.created`、`tool.called`、`tool.failed` |
-| `context.query_instance_subgraph` | instance subgraph HTTP/MCP/tool call | `traceparent`、`bkn-request-id`、account/auth context | `context-loader.request`、`context-loader.source.resolve` | `claim.created`、`evidence.refs.created` |
-| `context.load_refs` | source refs load | `traceparent`、`bkn-request-id`、business refs | `context-loader.source.resolve` | `context.refs.resolved` |
-| `context.resolve_source` | source resolver call | `traceparent`、`bkn-request-id`、resource refs | `context-loader.source.resolve` | `context.refs.resolved` |
-
-## Inbound Context
-
-- accepted headers / metadata: `traceparent`、`bkn-request-id`、legacy `x-request-id`、`baggage`、`bkn-conversation-id`、`bkn-interaction-id`、`x-account-id`、`x-account-type`、`user_id`。
-- `traceparent` parsing: HTTP trace middleware extracts W3C Trace Context into OTel context; invalid external trace must not be propagated as an internal parent.
-- external trace trust policy: external trace can be linked or used as parent only after format validation and boundary classification.
-- invalid context handling: invalid or missing request id is replaced by a generated `req_<uuid>` value.
-- request id generation: `SetTraceContextToCtx` generates a request id when inbound `bkn-request-id` and `x-request-id` are missing or invalid.
-- tenant/account/auth context source: auth middleware reads account headers or public token introspection result; request id is independent of account id and must not be placed in baggage.
-
-### Conversation And Interaction Correlation
-
-- `bkn-conversation-id` groups one business conversation; `bkn-interaction-id` groups one user question and the multiple context calls it triggers. Both are caller-owned correlation labels only.
-- caller ownership: only the caller (third-party agent, AI application, bkn-agent, SDK/CLI user) knows where a conversation or one round of analysis starts and ends, so only the caller may mint these ids. context-loader never generates, infers, or reuses them; it never derives them from time proximity, SQL text, or natural language.
-- accepted format: `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`; an issuer prefix such as `agent:thread_x` is allowed so a caller-side id keeps its origin. Blank or malformed values are dropped, never rejected with an error.
-- degraded mode: with no inbound conversation/interaction id the request stays a single-request trace, exactly as before; BKN Trace query side may present such a request as a derived single-request interaction, but nothing is written as if the caller had supplied an id.
-- authorization boundary: these ids are correlation labels only. They must never take part in authorization, tenant/business-domain resolution, rate limiting, or cache keys, and they must never be placed in baggage.
-- MCP boundary: `Mcp-Session-Id` is a transport session and is not a business conversation; it is not read as a conversation id by this module.
-
-## Outbound Calls
-
-| target | protocol | propagated fields | baggage policy | timeout | retry |
-| --- | --- | --- | --- | --- | --- |
-| BKN backend / ontology | HTTP | `traceparent`、`bkn-request-id`、`x-request-id`、`bkn-conversation-id`、`bkn-interaction-id`、account headers | allowlist only | existing client timeout | existing retry policy |
-| Vega/data | HTTP | `traceparent`、`bkn-request-id`、`x-request-id`、`bkn-conversation-id`、`bkn-interaction-id`、account headers | allowlist only | existing client timeout | existing retry policy |
-| Operator integration / toolbox | HTTP | `traceparent`、`bkn-request-id`、`x-request-id`、`bkn-conversation-id`、`bkn-interaction-id`、account headers | allowlist only | existing client timeout | existing retry policy |
-| MCP tools | MCP metadata / returned headers | `bkn-request-id`、`bkn-conversation-id`、`bkn-interaction-id`、account headers、allowed baggage | allowlist only | caller controlled | caller controlled |
-
-Conversation and interaction ids are only emitted when the caller supplied them; an absent id is omitted from the outbound request rather than replaced by a generated value.
-
-Allowed baggage fields:
+接受 `traceparent`、`bkn-request-id/x-request-id`、account/auth 头和：
 
 ```text
-bkn.account.type
-bkn.runtime.env
+x-business-domain
+bkn-conversation-id
+bkn-interaction-id
+bkn-operation-id
+bkn-causation-event-id
+bkn-claim-id
+bkn-attempt
+bkn-event-observed-at
 ```
 
-Trust policy:
+- `business_domain` 来自 `x-business-domain` 或受控 baggage 的 `business_domain`，不得错误使用 `account_id` 代替。
+- conversation/interaction 由调用方拥有；Context Loader 仅校验、透传和记录，缺失时不生成，`Mcp-Session-Id` 也不得替代业务 conversation。
+- 业务因果 ID 只校验安全长度和字符，不强制固定前缀；非法值在边界丢弃。
+- `bkn-event-observed-at` 只有在入站明确提供且为 UTC RFC3339Nano 时标记为可重放；本地为技术日志生成的当前时间不能用于核心事实。
+- 缺失 interaction、operation 或可靠 observed time 时，不生成核心事实。
 
-- `bkn.account.type` is an observability classification only, not an authentication or authorization source.
-- inbound client-provided `bkn.account.type` in `baggage` is not trusted and is dropped during trace context sanitization.
-- outbound `bkn.account.type` is derived from the server-side `AccountAuthContext` produced by header auth or token introspection.
-- downstream services must use account/auth headers and local policy context for access decisions, never `baggage`.
+## 三、下游子调用合同
 
-## Logs
+每次 BKN、ontology、Vega、模型、Operator/MCP 调用必须 fork 新 `operation_id`，并保持直接 `causation_event_id`。派生算法纳入父 operation、稳定操作名、attempt 和显式 `callOrdinal`。
 
-| log type | level | required fields | indexed fields | sensitive fields | example fixture |
-| --- | --- | --- | --- | --- | --- |
-| business | info | `trace_id`、`span_id`、`bkn.request.id`、`bkn.module.name`、`bkn.operation.name`、`bkn.status` | module、operation、status、tool name、object type | source row、full result、signed URL | `fixtures/bkn-trace/positive.json` |
-| error | error | business fields + `error.category`、`error.code`、`error.retryable` | category、code、retryable | raw tool output、raw HTTP body | `fixtures/bkn-trace/sampling.json` |
-| audit | info | actor、policy、decision、resource ref | decision、resource class | raw resource content | 后续权限拒绝 fixture 补齐 |
+- 同一父 operation、同名调用、同一 ordinal 的重放得到相同子 operation。
+- 同一父 operation 下同名多次调用必须递增稳定 ordinal，或显式传入唯一子 operation；禁止全部使用同一 ID。
+- `attempt`、`business_domain` 和可靠 `bkn-event-observed-at` 随可信内部调用传播。
+- 调用不可信第三方前必须剥离 OpenBKN 业务因果、业务域和 observed time。
 
-## Spans
+## 四、事实与引用
 
-| span name | kind | required attributes | parent/link rule | error mapping |
-| --- | --- | --- | --- | --- |
-| `context-loader.request` | server | module、operation、status、request id | HTTP/MCP entry span | HTTP 4xx/5xx maps to validation/authz/dependency/tool |
-| `context-loader.search` | internal/client | kn id、object type、result count、duration | child of request span | search failure maps to schema/data/tool |
-| `context-loader.source.resolve` | internal/client | resource ref、row count、truncated、partial reason | child or linked async span | resolver failure maps to data/dependency |
+`retrieval.completed.payload` 精确为 `query_hash/candidate_count/truncated/version_status/source_refs`。
 
-## Events
+- schema 检索保留受控对象、属性、关系、指标、行动引用。
+- 对象查询只保留请求中的对象类型和业务属性引用，不使用返回行生成 row ref。
+- 子图查询只根据请求的对象类型和关系类型路径形成引用，不从返回节点/边内容推断。
+- 引用只含 `ref_id/ref_type/source_system/validity/version_status/visibility/summary_hash（可选）`，不得含 query、条件值、属性值、名称、物理名或行内容。
 
-| event type | producer | payload summary | partial reason | retention class |
-| --- | --- | --- | --- | --- |
-| `claim.created` | context-loader | schema search result-set finding hash、kn id、query hash、result counts | schema refs unversioned | evidence event |
-| `evidence.refs.created` | context-loader | object/relation/action/metric schema refs、summary hash、visibility、version status | schema ref unversioned | evidence event |
-| `tool.called` | context-loader | tool id/name、args hash、result count、duration | source unavailable / result truncated | business event |
-| `tool.failed` | context-loader | tool id/name、error code、retryable | dependency timeout / validation failed | forced retention on error |
-| `context.refs.resolved` | context-loader | source ref count、classification、truncated | missing version / unauthorized / truncated | business event |
+## 五、事件身份与可靠性
 
-## Phase 2 Evidence Event Rules
+- `event_id = evt_ + sha256(trace_id|operation_id|event_type|attempt)`。
+- `observed_at/emitted_at` 复用调用方 envelope 的稳定时间。
+- 发射函数显式返回真实 event ID；HTTP 对象查询同时返回 `bkn-evidence-event-id`。
+- 上报最多三次，HTTP 非 2xx 判失败；队列满和最终失败记录 warning，不阻塞业务。
+- 当前只有有界内存队列，没有持久 outbox。进程退出可能丢事件；跨进程可靠重放依赖调用方持久并复用完整 envelope。
 
-- `context.search_schema` 在成功返回后发射一组局部 L2 事件：`claim.created` 表示“本次 schema 检索产生了一个候选上下文 finding”，`evidence.refs.created` 记录该 finding 使用的 schema/action/metric refs。
-- `claim.created.payload.claim_type` 固定为 `finding`，`claim_hash` 只基于结果数量、`kn_id`、`query_hash` 等摘要字段计算，不包含原始 query、schema 名称、comment、字段说明或完整结果。
-- `evidence.refs.created.payload.evidence_refs` 只包含 `ref_id`、`ref_type`、`source_system`、`summary_hash`、`validity`、`version_status`、`visibility`、`partial_reason`；`summary_hash` 来自安全摘要，不包含原始 schema 内容。
-- `context.query_object` 在 REST/MCP 成功返回后发射局部 L2 事件：`claim.created` 表示“本次对象实例查询产生了一个数据 finding”，`evidence.refs.created` 记录实例级 `row_ref`；`condition`、`filters`、`properties`、实例 identity 和行内容只能进入 hash，不得原样进入 payload。
-- `context.query_object` 的 `truncated=true` 只来自明确下一页信号：响应存在 `search_after`，或 `total_count > offset + returned_count`；不得用 `len(data) >= limit` 猜测截断。
-- `context.query_instance_subgraph` 在 service 成功返回后发射局部 L2 事件：`claim.created` 表示“本次实例子图查询产生了一个关系上下文 finding”，`evidence.refs.created` 记录相关实例 `row_ref` 和关系类型 `schema_ref`；`relation_type_paths`、实例 identity、路径条件和返回行内容只能进入 hash，不得原样进入 payload。
-- `context.query_instance_subgraph` 的 `evidence_refs` 最多保留 100 条，超过后 `subject_refs.refs_truncated=true` 且 `partial_reason` 包含 `refs_truncated`；关系类型只从 `relation`、`relations`、`relation_path(s)`、`relation_type(s)` 等关系容器提取，不从普通实例字段启发式提取。
-- `version_status` 当前为 `unversioned`，schema refs 必须携带 `partial_reason=["schema_ref_unversioned"]`，row refs 必须携带 `partial_reason=["row_ref_unversioned"]`；后续接入 BKN schema version / snapshot 后才能改为 `versioned`。
-- 证据事件上报由 `BKN_TRACE_EVIDENCE_INGEST_URL` 控制，默认关闭；开启后异步提交，不阻塞 schema 检索主路径。
-- 上报批次的 `trace` 块在调用方传入时携带 `bkn.conversation.id` 与 `bkn.interaction.id`，缺失时整个字段不出现；这两个字段只用于把同一轮分析的多次调用归到一起，不改变 claim/evidence payload 的哈希与引用规则。
-- 上报失败只记录 warning，不改变业务响应；BKN Trace 核心服务负责后续 Evidence Graph 汇聚、查询、快照和 Studio 可视化。
+## 六、验收
 
-## Business Refs
+- fixture：`fixtures/bkn-trace/phase2/*_positive.json`。
+- Given `business_domain != account_id`，When 传播和产出事件，Then 使用真实业务域。
+- Given 同一父 operation 下两次同名调用，When ordinal 分别为 1、2，Then 子 operation 不碰撞；重放 ordinal=1 保持稳定。
+- Given 返回行含 PII，When 生成 source refs，Then 不出现 row ref、属性值或物理字段名。
+- Given 只有 operation 而缺少原始 observed time，When 重建事实，Then 不产出冲突事件。
 
-| ref type | field | resolver | version field | visibility rule |
-| --- | --- | --- | --- | --- |
-| knowledge network | `bkn.kn.id` | BKN/ontology resolver | schema version | account/domain policy |
-| object type | `bkn.object_type.id` | BKN/ontology resolver | schema version | account/domain policy |
-| property | `bkn.property.id` | BKN/ontology resolver | schema version | account/domain policy |
-| relation type | `bkn.relation_type.id` | BKN/ontology resolver | schema version | account/domain policy |
-| resource | `bkn.resource.id` | Vega/data resolver | resource version / snapshot | account/domain policy |
-| tool | `bkn.tool.name` | toolbox registry | tool contract version | account/domain policy |
+## 七、已知限制
 
-## Sensitive Data Rules
-
-- never log: token、authorization、cookie、完整 prompt、完整 SQL、完整工具输入输出、完整 source row、PII、对象存储裸 URL、连接串。
-- hash only: tool args、tool result、query text、large result summary。
-- controlled reference: source refs、row refs、snapshot refs、large result artifacts。
-- redact: unauthorized source detail、PII fields、secret connection metadata。
-- `data.classification`: `public|internal|confidential|pii|secret`。
-- scanner patterns covered: token、authorization、cookie、prompt、SQL、PII、裸 URL、连接串。
-- telemetry span policy: HTTP headers are sanitized before being written to span attributes; request body is not recorded as raw content and is replaced by a redaction marker.
-
-## Sampling
-
-- default: normal success path can use sampled or not sampled based on platform policy.
-- forced sampling: `error`、`timeout`、`denied`、`tool.failed`、source resolver failure must be retained.
-- not sampled behavior: keep required business log and dropped counters.
-- dropped counters: `dropped span/event/log count` must be emitted by later telemetry integration.
-
-## Retention And Alerts
-
-- log retention class: diagnostic/business logs.
-- event retention class: business event; error and denied paths forced retention.
-- audit retention class: policy decision and resource refs only, no raw source data.
-- health metrics: missing request id rate、missing traceparent rate、orphan span rate、event validation failure rate、sensitive field rejection count、dropped count。
-- alert thresholds: configured by deployment; sensitive field rejection and validation failure should alert immediately in CI.
-
-## Fixtures
-
-| fixture | path | purpose | expected result |
-| --- | --- | --- | --- |
-| positive | `fixtures/bkn-trace/positive.json` | schema search success baseline | pass |
-| negative | `fixtures/bkn-trace/negative_baggage.json` | forbidden baggage field | fail |
-| propagation | `fixtures/bkn-trace/propagation.json` | inbound/outbound request context | pass |
-| sampling | `fixtures/bkn-trace/sampling.json` | forced sampled tool error | pass |
-| phase2 positive | `fixtures/bkn-trace/phase2/search_schema_l2_positive.json` | schema search L2 finding and evidence refs | pass |
-| phase2 positive | `fixtures/bkn-trace/phase2/query_object_instance_l2_positive.json` | object query L2 finding and row refs | pass |
-| phase2 positive | `fixtures/bkn-trace/phase2/query_instance_subgraph_l2_positive.json` | instance subgraph L2 finding, row refs and relation schema refs | pass |
-| phase2 negative | `fixtures/bkn-trace/phase2/negative_raw_query_payload.json` | raw query/prompt payload rejection | fail |
-
-## Covered GWT
-
-- GWT-02 可信上游 Trace Context。
-- GWT-05 baggage 违规。
-- GWT-06 MCP/toolbox 工具调用。
-- GWT-08 工具或依赖失败。
-- GWT-10 敏感数据扫描。
-- GWT-13 字段索引分层。
-- GWT-21 Given 合法入站 trace/request/account context，When `search_schema` 成功返回候选对象/关系/行动/指标，Then 模块发射 `claim.created` 和 `evidence.refs.created`，且事件可通过同一 `trace_id`、`span_id`、`bkn.request.id` 关联。
-- GWT-22 Given schema 检索 query 与候选结果含业务名称/comment/字段，When 生成 L2 证据事件，Then payload 只包含 hash/ref/count，不包含原始 query、完整 schema、字段说明或结果行。
-- GWT-23 Given 未配置 `BKN_TRACE_EVIDENCE_INGEST_URL`，When `search_schema` 成功执行，Then 业务响应不受影响且不上报事件。
-- GWT-24 Given Trace 后端暂时不可用，When 异步上报失败，Then 只产生 warning，不改变 `search_schema` 的响应状态。
-- GWT-25 Given 合法入站 trace/request/account context，When `query_object_instance` 成功返回对象实例，Then 模块发射 `claim.created` 和 `evidence.refs.created`，其中实例证据为 `row_ref`。
-- GWT-26 Given 对象实例查询条件、属性列表、实例 identity 或返回行包含用户数据，When 生成 L2 证据事件，Then payload 只包含 condition/properties/identity/row hash，不包含原始过滤值、属性名、实例名或行级数据。
-- GWT-27 Given 合法入站 trace/request/account context，When `query_instance_subgraph` 成功返回关系子图，Then 模块发射 `claim.created` 和 `evidence.refs.created`，其中相关实例为 `row_ref`，关系类型为 `schema_ref`。
-- GWT-28 Given 子图 relation paths、实例 identity 或返回节点/边包含用户数据，When 生成 L2 证据事件，Then payload 只包含 path/identity/entry hash，不包含原始路径条件、实例主键值或行级数据。
-
-## Known Gaps
-
-- runtime L2 emitter currently covers `context.search_schema`、`context.query_object` row refs and `context.query_instance_subgraph` row/schema refs; `run_sql` and resolver-level source refs remain follow-up.
-- cross-module global Evidence Graph assembly is owned by BKN Trace core service, not by context-loader.
-- BKN Trace ingestion does not yet persist or index `bkn.conversation.id` / `bkn.interaction.id`, and no query endpoint groups traces by interaction; until that lands the ids propagate and are submitted but cannot be queried back.
-- full registry validation and indexing policy validation currently rely on `bkn-docs` validator follow-up.
-- audit-grade evidence snapshot, versioned schema refs, source data snapshot refs, and Studio visualization belong to later BKN Trace phases.
-- S3 health metrics are not implemented yet.
-
-## Owner Sign-off
-
-- owner: OpenBKN Foundry / context-loader
-- reviewed at: 2026-07-23
-- reviewer: pending
-- compatibility risk: low; new headers are additive and legacy `x-request-id` remains supported.
+版本化引用、持久 outbox 和快照仍由后续工作承担；`run_sql` 已记录安全查询摘要、结果规模和业务资源引用，全局图与跨 request/trace 的 Interaction 聚合由 BKN Trace Core 承担。

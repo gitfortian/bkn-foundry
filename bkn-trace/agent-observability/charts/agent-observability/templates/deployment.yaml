@@ -43,6 +43,24 @@ spec:
               value: {{ .Values.evidence.index | quote }}
             - name: BKN_TRACE_EVIDENCE_STORE
               value: {{ .Values.evidence.store | quote }}
+            - name: BKN_TRACE_ALLOW_UNAUTHENTICATED_INGEST
+              value: {{ ternary "true" "false" .Values.evidence.ingestAuth.allowUnauthenticated | quote }}
+            - name: BKN_TRACE_ALLOW_RAW_TRACE_QUERY
+              value: {{ ternary "true" "false" .Values.evidence.rawTraceQuery.enabled | quote }}
+            - name: BKN_TRACE_ALLOW_UNAUTHENTICATED_QUERY
+              value: {{ ternary "true" "false" .Values.evidence.queryAuth.allowUnauthenticated | quote }}
+            {{- if .Values.evidence.queryAuth.hydraAdminURL }}
+            - name: BKN_TRACE_HYDRA_ADMIN_URL
+              value: {{ .Values.evidence.queryAuth.hydraAdminURL | quote }}
+            {{- end }}
+            {{- if .Values.businessResolver.enabled }}
+            - name: BKN_TRACE_BKN_RESOLVER_URL
+              value: {{ .Values.businessResolver.bknBaseURL | quote }}
+            - name: BKN_TRACE_VEGA_RESOLVER_URL
+              value: {{ .Values.businessResolver.vegaBaseURL | quote }}
+            - name: BKN_TRACE_RESOLVER_TIMEOUT
+              value: {{ .Values.businessResolver.timeout | quote }}
+            {{- end }}
             - name: OPENSEARCH_AUTH_ENABLED
               value: {{ ternary "true" "false" .Values.opensearch.auth.enabled | quote }}
             {{- if .Values.opensearch.auth.enabled }}
@@ -57,6 +75,13 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.evidence.ingestAuth.existingSecret | quote }}
                   key: {{ .Values.evidence.ingestAuth.secretKey | quote }}
+            {{- end }}
+            {{- if .Values.evidence.queryAuth.existingSecret }}
+            - name: BKN_TRACE_QUERY_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.evidence.queryAuth.existingSecret | quote }}
+                  key: {{ .Values.evidence.queryAuth.secretKey | quote }}
             {{- end }}
           livenessProbe:
             tcpSocket:

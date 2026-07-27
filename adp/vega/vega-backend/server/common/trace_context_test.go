@@ -83,3 +83,86 @@ func TestBuildTraceHeaders(t *testing.T) {
 	require.Equal(t, "00-60616263646566676869707172737475-8081828384858687-01", headers[HeaderTraceparent])
 	require.Equal(t, "bkn.account.type=service", headers[HeaderBaggage])
 }
+
+func TestBusinessCausalityHeadersAreValidatedAndPropagated(t *testing.T) {
+	ctx := SetTraceContextToCtx(context.Background(), TraceContext{
+		RequestID:          "req_01JZVALIDREQUESTID000000024",
+		BusinessDomain:     "domain-finance-001",
+		InteractionID:      "third-party-interaction-0001",
+		OperationID:        "data-query-0001",
+		CausationEventID:   "retrieval-completed-0001",
+		ClaimID:            "agent-answer-0001",
+		Attempt:            3,
+		ObservedAt:         "2026-07-25T08:00:00Z",
+		ObservedAtProvided: true,
+	})
+	headers := BuildTraceHeaders(ctx)
+	require.Equal(t, "domain-finance-001", headers[HeaderBusinessDomain])
+	require.Equal(t, "third-party-interaction-0001", headers[HeaderBKNInteractionID])
+	require.Equal(t, "data-query-0001", headers[HeaderBKNOperationID])
+	require.Equal(t, "retrieval-completed-0001", headers[HeaderBKNCausationEventID])
+	require.Equal(t, "agent-answer-0001", headers[HeaderBKNClaimID])
+	require.Equal(t, "3", headers[HeaderBKNAttempt])
+	require.Contains(t, headers[HeaderBaggage], "business_domain=domain-finance-001")
+
+	invalid := map[string]string{
+		HeaderBKNRequestID:        "req_01JZVALIDREQUESTID000000025",
+		HeaderBKNInteractionID:    "bad interaction",
+		HeaderBKNOperationID:      "../bad-operation",
+		HeaderBKNCausationEventID: "evt<script>",
+		HeaderBKNClaimID:          "claim with spaces",
+		HeaderBKNAttempt:          "0",
+	}
+	traceCtx := TraceContextFromHeaders(func(key string) string { return invalid[key] })
+	require.Empty(t, traceCtx.InteractionID)
+	require.Empty(t, traceCtx.OperationID)
+	require.Empty(t, traceCtx.CausationEventID)
+	require.Empty(t, traceCtx.ClaimID)
+	require.Equal(t, 1, traceCtx.Attempt)
+}
+
+func TestBuildTraceHeadersForChildOperation(t *testing.T) {
+	ctx := SetTraceContextToCtx(context.Background(), TraceContext{
+		RequestID: "req_01JZVALIDREQUESTID000000027", InteractionID: "interaction-1",
+		OperationID: "parent-operation", CausationEventID: "parent-event", Attempt: 2,
+	})
+	first := BuildTraceHeadersForChildOperation(ctx, "model.chat", 1)
+	second := BuildTraceHeadersForChildOperation(ctx, "model.chat", 1)
+	third := BuildTraceHeadersForChildOperation(ctx, "model.chat", 2)
+	require.NotEqual(t, "parent-operation", first[HeaderBKNOperationID])
+	require.Equal(t, first[HeaderBKNOperationID], second[HeaderBKNOperationID])
+	require.NotEqual(t, first[HeaderBKNOperationID], third[HeaderBKNOperationID])
+	require.Equal(t, "parent-event", first[HeaderBKNCausationEventID])
+	require.Equal(t, "2", first[HeaderBKNAttempt])
+}
+
+func TestMergeTraceHeadersForChildOperationKeepsCallerHeaders(t *testing.T) {
+	ctx := SetTraceContextToCtx(context.Background(), TraceContext{
+		RequestID: "req_01JZVALIDREQUESTID000000028", InteractionID: "interaction-1",
+		OperationID: "parent-operation", CausationEventID: "parent-event", Attempt: 2,
+	})
+	headers := MergeTraceHeadersForChildOperation(ctx, map[string]string{"Content-Type": "application/json"}, "permission.resource.check", 2)
+	require.Equal(t, "application/json", headers["Content-Type"])
+	require.NotEqual(t, "parent-operation", headers[HeaderBKNOperationID])
+	require.Equal(t, "parent-event", headers[HeaderBKNCausationEventID])
+}
+
+func TestStripBusinessTraceHeadersAtUntrustedBoundary(t *testing.T) {
+	headers := map[string]string{
+		HeaderTraceparent:         "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		HeaderBKNRequestID:        "req_01JZVALIDREQUESTID000000026",
+		HeaderBKNInteractionID:    "int_business_trace_0001",
+		HeaderBKNOperationID:      "op_data_query_0001",
+		HeaderBKNCausationEventID: "evt_retrieval_completed_0001",
+		HeaderBKNClaimID:          "claim_agent_answer_0001",
+		HeaderBKNAttempt:          "3",
+	}
+	StripBusinessTraceHeaders(headers)
+	require.NotEmpty(t, headers[HeaderTraceparent])
+	require.NotEmpty(t, headers[HeaderBKNRequestID])
+	require.Empty(t, headers[HeaderBKNInteractionID])
+	require.Empty(t, headers[HeaderBKNOperationID])
+	require.Empty(t, headers[HeaderBKNCausationEventID])
+	require.Empty(t, headers[HeaderBKNClaimID])
+	require.Empty(t, headers[HeaderBKNAttempt])
+}

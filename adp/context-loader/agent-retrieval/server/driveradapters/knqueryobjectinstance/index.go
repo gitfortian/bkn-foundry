@@ -98,7 +98,9 @@ func (h *knQueryObjectInstanceHandler) QueryObjectInstance(c *gin.Context) {
 		rest.ReplyError(c, err)
 		return
 	}
-	bkntrace.EmitQueryObjectInstanceEvents(c.Request.Context(), h.Logger, req, resp)
+	if eventID := bkntrace.EmitQueryObjectInstanceEvents(c.Request.Context(), h.Logger, req, resp); eventID != "" {
+		c.Header("bkn-evidence-event-id", eventID)
+	}
 
 	// 纯结构化过滤无相关度评分，剥除恒定的 _score 避免误导调用方；
 	// knn / match 有真实相关度分则保留（#236）。
