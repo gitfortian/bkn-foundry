@@ -21,12 +21,10 @@ func (s *mcpServiceImpl) GetMCPInstanceConfig(ctx context.Context, mcpID string,
 		return nil, oerrors.NewHTTPError(ctx, http.StatusNotFound, oerrors.ErrExtMCPNotFound, "mcp server not exist")
 	}
 
-	// 校验MCP Server是否允许该模式访问
+	// 自定义型MCP只是代理外部服务，平台侧没有实例可服务，app endpoint 无法提供接入
 	if release.CreationType == interfaces.MCPCreationTypeCustom.String() {
-		if release.Mode != mode.String() {
-			// 报错，不支持该连接模式
-			return nil, oerrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.ErrExtMCPNotFound, "mcp server not support this mode")
-		}
+		return nil, oerrors.NewHTTPError(ctx, http.StatusBadRequest, oerrors.ErrExtMCPServerEndpointUnsupported,
+			fmt.Sprintf("mcp server %s is a proxy to an external server, connect to its upstream url directly", mcpID))
 	}
 
 	// 校验执行权限
@@ -39,16 +37,9 @@ func (s *mcpServiceImpl) GetMCPInstanceConfig(ctx context.Context, mcpID string,
 		return nil, err
 	}
 
-	// 组装配置信息
+	// 组装配置信息（custom 型已在上面提前返回，这里只剩工具导入型）
 	var config *interfaces.MCPInstancConfigInfo
 	switch release.CreationType {
-	case interfaces.MCPCreationTypeCustom.String():
-		config = &interfaces.MCPInstancConfigInfo{
-			MCPID:   release.MCPID,
-			Mode:    mode,
-			URL:     release.URL,
-			Headers: utils.JSONToObject[map[string]string](release.Headers),
-		}
 	case interfaces.MCPCreationTypeToolImported.String():
 		config = &interfaces.MCPInstancConfigInfo{
 			MCPID:   release.MCPID,
