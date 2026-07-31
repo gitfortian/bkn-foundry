@@ -1,5 +1,4 @@
 -- Copyright 2026 openbkn.ai
--- Copyright The kweaver.ai Authors.
 --
 -- Licensed under the Apache License, Version 2.0.
 -- See the LICENSE file in the project root for details.
@@ -116,7 +115,6 @@ CREATE TABLE IF NOT EXISTS t_catalog (
     f_metadata                MEDIUMTEXT NOT NULL COMMENT '自动发现的元数据（JSON格式），如数据库版本、schema快照等',
 
     -- 状态管理
-    f_health_check_enabled    BOOLEAN NOT NULL DEFAULT TRUE COMMENT '是否启用健康检查',
     f_health_check_status     VARCHAR(20) NOT NULL DEFAULT 'unchecked' COMMENT '连接状态: unchecked, healthy, degraded, unhealthy, offline',
     f_last_check_time         BIGINT(20) NOT NULL DEFAULT 0 COMMENT '最后健康检查时间',
     f_health_check_result     TEXT NOT NULL COMMENT '健康检查结果',
@@ -492,3 +490,22 @@ CREATE TABLE IF NOT EXISTS t_discover_schedule (
     INDEX idx_next_run (f_next_run),
     INDEX idx_name (f_name)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT='资源发现调度表，记录定时资源发现的配置和执行状态';
+
+-- ==========================================
+-- 11. t_catalog_health_check_schedule Catalog 健康检查调度表
+-- ==========================================
+CREATE TABLE IF NOT EXISTS t_catalog_health_check_schedule (
+    f_catalog_id              VARCHAR(40) NOT NULL COMMENT '所属 Catalog ID，同时为主键',
+    f_mode                    VARCHAR(16) NOT NULL DEFAULT 'inherit' COMMENT '调度模式: inherit, enabled, disabled',
+    f_cron_expr               VARCHAR(100) NOT NULL DEFAULT '' COMMENT '自定义 Cron；enabled 时必填',
+    f_last_run                BIGINT(20) NOT NULL DEFAULT 0 COMMENT '最近一次计划执行时间（Unix 毫秒时间戳）',
+    f_next_run                BIGINT(20) NOT NULL DEFAULT 0 COMMENT '下一次计划执行时间（Unix 毫秒时间戳）',
+    f_creator                 VARCHAR(40) NOT NULL DEFAULT '' COMMENT '创建者 ID',
+    f_creator_type            VARCHAR(20) NOT NULL DEFAULT '' COMMENT '创建者类型',
+    f_create_time             BIGINT(20) NOT NULL DEFAULT 0 COMMENT '创建时间',
+    f_updater                 VARCHAR(40) NOT NULL DEFAULT '' COMMENT '更新者 ID',
+    f_updater_type            VARCHAR(20) NOT NULL DEFAULT '' COMMENT '更新者类型',
+    f_update_time             BIGINT(20) NOT NULL DEFAULT 0 COMMENT '更新时间',
+    PRIMARY KEY (f_catalog_id),
+    INDEX idx_mode_next_run (f_mode, f_next_run)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_bin COMMENT='Catalog 定时健康检查配置与执行元数据';
