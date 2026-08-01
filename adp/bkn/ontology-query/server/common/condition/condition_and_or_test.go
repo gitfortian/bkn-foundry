@@ -267,7 +267,7 @@ func Test_rewriteAndCondition(t *testing.T) {
 			So(len(result.SubConds), ShouldEqual, 2)
 		})
 
-		Convey("失败 - 子条件为空", func() {
+		Convey("success - empty AND rewrites to nil", func() {
 			cfg := &CondCfg{
 				Operation: OperationAnd,
 				SubConds:  []*CondCfg{},
@@ -372,7 +372,7 @@ func Test_newOrCond(t *testing.T) {
 			So(cond, ShouldBeNil)
 		})
 
-		Convey("success - nested empty AND is skipped in OR", func() {
+		Convey("success - nested empty AND makes OR match all", func() {
 			cfg := &CondCfg{
 				Operation: OperationOr,
 				SubConds: []*CondCfg{
@@ -392,9 +392,11 @@ func Test_newOrCond(t *testing.T) {
 			cond, err := newOrCond(ctx, cfg, CUSTOM, fieldsMap)
 			So(err, ShouldBeNil)
 			So(cond, ShouldNotBeNil)
+			So(len(cond.(*OrCond).mSubConds), ShouldEqual, 2)
 			dsl, err := cond.Convert(ctx, nil)
 			So(err, ShouldBeNil)
 			So(dsl, ShouldContainSubstring, `"should"`)
+			So(dsl, ShouldContainSubstring, `"must"`)
 		})
 	})
 }
@@ -530,6 +532,49 @@ func Test_rewriteOrCondition(t *testing.T) {
 			result, err := rewriteOrCondition(ctx, cfg, fieldsMap, vectorizer)
 			So(err, ShouldNotBeNil)
 			So(result, ShouldBeNil)
+		})
+
+		Convey("success - nested empty AND makes OR rewrite to match all", func() {
+			cfg := &CondCfg{
+				Operation: OperationOr,
+				SubConds: []*CondCfg{
+					{
+						Operation: OperationAnd,
+						SubConds:  []*CondCfg{},
+					},
+					{
+						Name:      "name",
+						Operation: OperationEq,
+						ValueOptCfg: ValueOptCfg{
+							Value: "test",
+						},
+					},
+				},
+			}
+			result, err := rewriteOrCondition(ctx, cfg, fieldsMap, vectorizer)
+			So(err, ShouldBeNil)
+			So(result, ShouldBeNil)
+		})
+
+		Convey("success - nil child is skipped during OR rewrite", func() {
+			cfg := &CondCfg{
+				Operation: OperationOr,
+				SubConds: []*CondCfg{
+					nil,
+					{
+						Name:      "name",
+						Operation: OperationEq,
+						ValueOptCfg: ValueOptCfg{
+							Value: "test",
+						},
+					},
+				},
+			}
+			result, err := rewriteOrCondition(ctx, cfg, fieldsMap, vectorizer)
+			So(err, ShouldBeNil)
+			So(result, ShouldNotBeNil)
+			So(len(result.SubConds), ShouldEqual, 1)
+			So(result.SubConds[0].Name, ShouldEqual, "mapped_name")
 		})
 	})
 }
