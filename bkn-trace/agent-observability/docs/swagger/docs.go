@@ -4394,6 +4394,12 @@ const docTemplate = `{
                 "access_scope_fingerprint": {
                     "type": "string"
                 },
+                "allowed_log_categories": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "business_provenance_managed_networks": {
                     "type": "boolean"
                 },
@@ -4401,6 +4407,15 @@ const docTemplate = `{
                     "type": "boolean"
                 },
                 "global_log_search": {
+                    "type": "boolean"
+                },
+                "log_export": {
+                    "type": "boolean"
+                },
+                "log_policy_read": {
+                    "type": "boolean"
+                },
+                "log_sensitive_fields": {
                     "type": "boolean"
                 },
                 "management_audit": {

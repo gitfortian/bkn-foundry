@@ -16,14 +16,18 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/assemblysvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/evidencesvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/ledgersvc"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/logsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/projectionrebuildsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/projectorsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/sessionsvc"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/service/tracesvc"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/domain/valueobject/observabilityvo"
 	mariadbsessionstore "github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/dbaccess/mariadb/sessionstore"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/bknsafeaccess"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/bknsafeaudit"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/businessresolver"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchevidencestore"
+	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchlogaccess"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchprojection"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/httpaccess/opensearchtraceaccess"
 	"github.com/openbkn-ai/bkn-foundry/bkn-trace/agent-observability/src/drivenadapter/memoryaccess/evidencestore"
@@ -52,11 +56,13 @@ type App struct {
 }
 
 const APIBasePath = "/api/agent-observability/v1"
+const ObservabilityAPIBasePath = "/api/observability/v1"
 
 func NewApp() (*App, error) {
 	httpServerConfig := conf.NewHTTPServerConfig()
 	openSearchConfig := conf.NewOpenSearchConfig()
 	evidenceConfig := conf.NewEvidenceConfig()
+	observabilityConfig := conf.NewObservabilityConfig()
 	resolverConfig := conf.NewBusinessResolverConfig()
 	docs.SwaggerInfo.BasePath = APIBasePath
 
@@ -88,6 +94,16 @@ func NewApp() (*App, error) {
 		&http.Client{Timeout: accessScopeConfig.Timeout},
 	)
 	evidenceHandler := httphandler.NewEvidenceHandlerWithAuthorizationScopeResolver(evidenceService, accessScopeResolver)
+	logHandler := httphandler.NewLogHandler(logsvc.NewWithCursorKey([]logsvc.Source{
+		opensearchlogaccess.New(openSearchClient, openSearchConfig.LogIndex),
+		bknsafeaudit.New(accessScopeConfig.BKNBaseURL, &http.Client{Timeout: accessScopeConfig.Timeout}),
+		logsvc.NewNotIntegratedSource("bkn-safe-access", []string{
+			observabilityvo.CategoryAccessUser,
+		}, []string{"BKN Safe OAuth"}),
+		logsvc.NewNotIntegratedSource("bkn-safe-security", []string{
+			observabilityvo.CategoryAuditSecurity,
+		}, []string{"BKN Safe Authorization"}),
+	}, observabilityConfig.CursorSigningKey), evidenceHandler)
 	coreConfig := conf.NewCoreConfig()
 	metrics := coremetrics.New()
 	sessionStore, ledgerStore, closeDatabase, err := newCoreStores(coreConfig)
@@ -109,7 +125,7 @@ func NewApp() (*App, error) {
 	)
 	ledgerHandler := httphandler.NewConfiguredLedgerHandler(ledgersvc.NewWithMetrics(ledgerStore, metrics))
 
-	app := newApp(httpServerConfig, traceHandler, evidenceHandler, sessionHandler, ledgerHandler, metrics)
+	app := newApp(httpServerConfig, traceHandler, evidenceHandler, logHandler, sessionHandler, ledgerHandler, metrics)
 	app.closeDatabase = closeDatabase
 	workerContext, stopWorkers := context.WithCancel(context.Background())
 	app.stopWorkers = stopWorkers
@@ -285,6 +301,7 @@ func newApp(
 	httpServerConfig conf.HTTPServerConfig,
 	traceHandler *httphandler.TraceHandler,
 	evidenceHandler *httphandler.EvidenceHandler,
+	logHandler *httphandler.LogHandler,
 	sessionHandler *httphandler.SessionHandler,
 	ledgerHandler *httphandler.LedgerHandler,
 	metrics http.Handler,
@@ -330,6 +347,11 @@ func newApp(
 	mux.HandleFunc(APIBasePath+"/business-provenance/interactions", readAuth(evidenceHandler.ListBusinessProvenanceInteractions))
 	mux.HandleFunc(APIBasePath+"/trace-executions", readAuth(evidenceHandler.ListTraceExecutions))
 	mux.HandleFunc(APIBasePath+"/access-profile", readAuth(evidenceHandler.GetAccessProfile))
+	mux.HandleFunc(ObservabilityAPIBasePath+"/logs", readAuth(logHandler.ListLogs))
+	mux.HandleFunc(ObservabilityAPIBasePath+"/logs/", readAuth(logHandler.GetLog))
+	mux.HandleFunc(ObservabilityAPIBasePath+"/log-facets", readAuth(logHandler.GetLogFacets))
+	mux.HandleFunc(ObservabilityAPIBasePath+"/log-sources", readAuth(logHandler.ListLogSources))
+	mux.HandleFunc(ObservabilityAPIBasePath+"/log-policies", readAuth(logHandler.ListLogPolicies))
 	httphandler.RegisterSessionRoutes(
 		mux, APIBasePath, sessionHandler, evidenceHandler.RequireTrustedLifecycleIdentity,
 	)
