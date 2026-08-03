@@ -149,7 +149,7 @@ func TestEvidenceHandlerBuildsQueryScopeFromCurrentSafeAccessProfile(t *testing.
 	request.Header.Set("X-BKN-Application-Principal-ID", "app-a")
 	response := httptest.NewRecorder()
 
-	scope, ok := handler.queryScopeFromRequest(response, request)
+	scope, ok := handler.queryScopeFromRequest(response, request, false)
 	if !ok || scope.AccessProfile == nil || scope.AccessProfile.Fingerprint != "sha256:profile-a" {
 		t.Fatalf("expected current access profile, scope=%+v response=%d %s", scope, response.Code, response.Body.String())
 	}
@@ -306,7 +306,7 @@ func TestTrustedQueryMiddlewareSharesIdentityAndCachesResolvedScope(t *testing.T
 		if !handler.authorizeQueryGateway(w, r) {
 			return
 		}
-		scope, ok := handler.queryScopeFromRequest(w, r)
+		scope, ok := handler.queryScopeFromRequest(w, r, false)
 		if !ok || scope.AccessProfile == nil || scope.AccessProfile.Fingerprint != "sha256:scope" {
 			http.Error(w, "trusted access scope was not cached", http.StatusInternalServerError)
 			return
@@ -489,6 +489,65 @@ func TestLifecycleIdentityRejectsIncompleteOwnerTupleAtGatewayBoundary(t *testin
 			"incomplete owner tuple must be rejected at the gateway boundary: %d %s",
 			response.Code, response.Body.String(),
 		)
+	}
+}
+
+func TestLifecycleIdentityAcceptsTrustedGatewayProducerWithoutOAuthScope(t *testing.T) {
+	resolver := &fakeAccessScopeResolver{err: io.ErrUnexpectedEOF}
+	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{
+		IngestToken:                "producer-ingest-token",
+		QueryGatewayToken:          "gateway-query-token",
+		AuthorizationScopeResolver: resolver,
+	})
+	nextCalled := false
+	next := handler.RequireTrustedLifecycleIdentity(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/agent-observability/v1/evidence/events", nil)
+	request.Header.Set("X-BKN-Trace-Query-Token", "gateway-query-token")
+	request.Header.Set("x-account-id", "acct_e2e_demo")
+	request.Header.Set("x-account-type", "user")
+	request.Header.Set("x-tenant-id", "tenant-e2e")
+	request.Header.Set("x-business-domain", "domain-e2e")
+	request.Header.Set("X-BKN-Application-Principal-ID", "bkn-backend")
+	request.Header.Set("X-BKN-Effective-Subject-Type", "user")
+	request.Header.Set("X-BKN-Effective-Subject-ID", "acct_e2e_demo")
+	response := httptest.NewRecorder()
+
+	next(response, request)
+
+	if response.Code != http.StatusNoContent || !nextCalled {
+		t.Fatalf("trusted gateway producer must bypass OAuth scope resolver: %d %s", response.Code, response.Body.String())
+	}
+	if resolver.calls != 0 {
+		t.Fatalf("OAuth scope resolver must not run for trusted gateway producer delivery")
+	}
+}
+
+func TestQueryScopeWithGatewayTokenStillRunsResolverForReadPaths(t *testing.T) {
+	resolver := &fakeAccessScopeResolver{profile: evidencevo.AccessProfile{
+		TenantID: "tenant-a", BusinessDomain: "domain-a", ActorID: "actor-a",
+		EffectiveSubjectID: "user-a", AccountActive: true, TenantActive: true,
+	}}
+	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{
+		QueryGatewayToken:          "gateway-query-token",
+		AuthorizationScopeResolver: resolver,
+	})
+	request := authenticatedQueryRequest(http.MethodGet, "/api/agent-observability/v1/traces/by-request", nil)
+	request.Header.Set("X-BKN-Trace-Query-Token", "gateway-query-token")
+	request.Header.Set("x-account-id", "actor-a")
+	request.Header.Set("x-account-type", "user")
+	request.Header.Set("x-tenant-id", "tenant-a")
+	request.Header.Set("x-business-domain", "domain-a")
+	response := httptest.NewRecorder()
+
+	scope, ok := handler.queryScopeFromRequest(response, request, false)
+	if !ok || scope.AccessProfile == nil {
+		t.Fatalf("read paths must still resolve record scope with gateway token: ok=%t scope=%+v body=%s", ok, scope, response.Body.String())
+	}
+	if resolver.trustedIdentity.ActorID != "actor-a" {
+		t.Fatalf("OAuth scope resolver must run for read paths even with gateway token: identity=%+v", resolver.trustedIdentity)
 	}
 }
 

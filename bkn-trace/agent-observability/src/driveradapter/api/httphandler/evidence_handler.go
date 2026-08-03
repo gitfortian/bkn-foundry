@@ -793,7 +793,7 @@ func (h *EvidenceHandler) evidenceQueryOptionsFromRequest(w http.ResponseWriter,
 	if !h.authorizeQueryGateway(w, r) {
 		return evidencevo.EvidenceQueryOptions{}, false
 	}
-	scope, ok := h.queryScopeFromRequest(w, r)
+	scope, ok := h.queryScopeFromRequest(w, r, false)
 	if !ok {
 		return evidencevo.EvidenceQueryOptions{}, false
 	}
@@ -812,7 +812,7 @@ func (h *EvidenceHandler) evidenceQueryOptionsFromRequest(w http.ResponseWriter,
 	return evidencevo.EvidenceQueryOptions{Limit: limit, Scope: scope}, true
 }
 
-func (h *EvidenceHandler) queryScopeFromRequest(w http.ResponseWriter, r *http.Request) (evidencevo.QueryScope, bool) {
+func (h *EvidenceHandler) queryScopeFromRequest(w http.ResponseWriter, r *http.Request, skipSubjectAuthorization bool) (evidencevo.QueryScope, bool) {
 	if scope, ok := trustedQueryScopeFromContext(r.Context()); ok {
 		return scope, true
 	}
@@ -840,6 +840,9 @@ func (h *EvidenceHandler) queryScopeFromRequest(w http.ResponseWriter, r *http.R
 		// Evidence and assembly queries retain the business view. Technical view is
 		// selected only by the unified log service after record-scope authorization.
 		View: evidencevo.AccessViewBusiness,
+	}
+	if skipSubjectAuthorization {
+		return scope, true
 	}
 	if h.authorizationScopeResolver != nil {
 		effectiveSubjectID := strings.TrimSpace(r.Header.Get("X-BKN-Effective-Subject-ID"))
@@ -873,7 +876,7 @@ func (h *EvidenceHandler) RequireTrustedQueryIdentity(next http.HandlerFunc) htt
 		if !h.authorizeQueryGateway(w, r) {
 			return
 		}
-		scope, ok := h.queryScopeFromRequest(w, r)
+		scope, ok := h.queryScopeFromRequest(w, r, false)
 		if !ok {
 			return
 		}
@@ -893,35 +896,9 @@ func (h *EvidenceHandler) RequireTrustedLifecycleIdentity(next http.HandlerFunc)
 			)
 			return
 		}
-		accountID := strings.TrimSpace(r.Header.Get("x-account-id"))
-		accountType := strings.TrimSpace(r.Header.Get("x-account-type"))
-		tenantID := strings.TrimSpace(r.Header.Get("x-tenant-id"))
-		if tenantID == "" {
-			tenantID = strings.TrimSpace(r.Header.Get("x-bkn-tenant-id"))
-		}
-		if h.deploymentTenantID != "" {
-			if tenantID != "" && tenantID != h.deploymentTenantID {
-				writeLifecycleError(
-					w, r, http.StatusUnauthorized, "permission_denied",
-					"request tenant does not match the deployment tenant",
-				)
-				return
-			}
-			tenantID = h.deploymentTenantID
-		}
-		businessDomain := strings.TrimSpace(r.Header.Get("x-business-domain"))
-		if accountID == "" || accountType == "" || strings.EqualFold(accountType, "anonymous") ||
-			tenantID == "" || businessDomain == "" {
-			writeLifecycleError(
-				w, r, http.StatusUnauthorized, "permission_denied",
-				"trusted account, tenant and business domain context is required",
-			)
+		scope, ok := h.queryScopeFromRequest(w, r, true)
+		if !ok {
 			return
-		}
-		scope := evidencevo.QueryScope{
-			TenantID: tenantID, BusinessDomain: businessDomain,
-			AccountID: accountID, AccountType: accountType,
-			View: evidencevo.AccessViewBusiness,
 		}
 		if scope.TenantID == "" || scope.BusinessDomain == "" {
 			writeLifecycleError(
