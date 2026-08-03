@@ -30,7 +30,7 @@ if ! command -v "$MYSQL_BIN" >/dev/null 2>&1; then
 fi
 command -v "$MYSQL_BIN" >/dev/null 2>&1 || { echo "Error: mysql client not found. macOS: brew install mysql-client | Ubuntu: sudo apt install -y mysql-client"; exit 1; }
 
-jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('$1','') if isinstance(d,dict) else '')" 2>/dev/null || true; }
+jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print((d.get('$1') or '') if isinstance(d,dict) else '')" 2>/dev/null || true; }
 
 TIMESTAMP=$(date +%s)
 CAT_NAME="csv_cat_${TIMESTAMP}"
@@ -39,6 +39,13 @@ CAT_ID=""; KN_ID=""
 
 cleanup() {
     [ -z "$KN_ID" ] && [ -z "$CAT_ID" ] && return 0
+    if [ "${CLEANUP:-0}" != "1" ]; then
+        echo ""
+        echo "=== Resources kept (set CLEANUP=1 to delete on exit) ==="
+        [ -n "$KN_ID" ]  && echo "  KN      $KN_ID   (openbkn bkn delete $KN_ID -y)" || true
+        [ -n "$CAT_ID" ] && echo "  Catalog $CAT_ID  (openbkn call /api/vega-backend/v1/catalogs/$CAT_ID -X DELETE)" || true
+        return 0
+    fi
     echo ""; echo "=== Cleanup ==="
     [ -n "$KN_ID" ]  && openbkn bkn delete "$KN_ID" -y 2>/dev/null && echo "  Deleted KN $KN_ID"
     [ -n "$CAT_ID" ] && openbkn call "/api/vega-backend/v1/catalogs/$CAT_ID" -X DELETE 2>/dev/null && echo "  Deleted catalog $CAT_ID"
@@ -98,8 +105,12 @@ for r in json.load(sys.stdin).get('entries',[]):
 # ── Step 3: Build Knowledge Network (object types bound to resources) ────────
 echo ""
 echo "=== Step 3: Build Knowledge Network ==="
-KN_ID=$(openbkn --json bkn create "$KN_NAME" 2>/dev/null | jget kn_id)
-[ -z "$KN_ID" ] && KN_ID=$(openbkn --json bkn create "${KN_NAME}_b" 2>/dev/null | jget id)
+# One create, then read the id out of that same response: the CLI has returned
+# `id` rather than `kn_id`, and calling create a second time to "retry" left a
+# stray empty KN behind on every run.
+KN_JSON=$(openbkn --json bkn create "$KN_NAME" 2>/dev/null || true)
+KN_ID=$(printf '%s' "$KN_JSON" | jget kn_id)
+[ -n "$KN_ID" ] || KN_ID=$(printf '%s' "$KN_JSON" | jget id)
 [ -z "$KN_ID" ] && { echo "Error: KN create failed." >&2; exit 1; }
 echo "  Knowledge Network: $KN_ID"
 # Build the object-type create body ({"entries":[entry]}) for a resource-bound

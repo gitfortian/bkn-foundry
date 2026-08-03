@@ -71,7 +71,7 @@ if ! command -v "$MYSQL_BIN" >/dev/null 2>&1; then
 fi
 
 # ── JSON helper: read a top-level field from stdin ───────────────────────────
-jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('$1','') if isinstance(d,dict) else '')" 2>/dev/null || true; }
+jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print((d.get('$1') or '') if isinstance(d,dict) else '')" 2>/dev/null || true; }
 
 TIMESTAMP=$(date +%s)
 CAT_NAME="example_cat_${TIMESTAMP}"
@@ -82,6 +82,13 @@ KN_ID=""
 
 cleanup() {
     [ -z "$KN_ID" ] && [ -z "$CAT_ID" ] && return 0
+    if [ "${CLEANUP:-0}" != "1" ]; then
+        echo ""
+        echo "=== Resources kept (set CLEANUP=1 to delete on exit) ==="
+        [ -n "$KN_ID" ]  && echo "  KN      $KN_ID   (openbkn bkn delete $KN_ID -y)" || true
+        [ -n "$CAT_ID" ] && echo "  Catalog $CAT_ID  (openbkn call /api/vega-backend/v1/catalogs/$CAT_ID -X DELETE)" || true
+        return 0
+    fi
     echo ""
     echo "=== Cleanup ==="
     [ -n "$KN_ID" ]  && openbkn bkn delete "$KN_ID" -y 2>/dev/null && echo "  Deleted KN $KN_ID"
@@ -150,8 +157,12 @@ PO_RES=$(res_id "erp_purchase_order")
 # ── Step 2: Create Knowledge Network + object types (resource binding) ───────
 echo ""
 echo "=== Step 2: Create Knowledge Network ==="
-KN_ID=$(openbkn --json bkn create "$KN_NAME" 2>/dev/null | jget kn_id)
-[ -z "$KN_ID" ] && KN_ID=$(openbkn --json bkn create "${KN_NAME}_b" 2>/dev/null | jget id)
+# One create, then read the id out of that same response: the CLI has returned
+# `id` rather than `kn_id`, and calling create a second time to "retry" left a
+# stray empty KN behind on every run.
+KN_JSON=$(openbkn --json bkn create "$KN_NAME" 2>/dev/null || true)
+KN_ID=$(printf '%s' "$KN_JSON" | jget kn_id)
+[ -n "$KN_ID" ] || KN_ID=$(printf '%s' "$KN_JSON" | jget id)
 if [ -z "$KN_ID" ]; then
     echo "Error: could not create knowledge network." >&2; exit 1
 fi

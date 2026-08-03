@@ -105,7 +105,7 @@ if ! command -v "$MYSQL_BIN" >/dev/null 2>&1; then
     done
 fi
 command -v "$MYSQL_BIN" >/dev/null 2>&1 || { echo "Error: mysql client not found. Ubuntu: sudo apt install -y mysql-client"; exit 1; }
-jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('$1','') if isinstance(d,dict) else '')" 2>/dev/null || true; }
+jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print((d.get('$1') or '') if isinstance(d,dict) else '')" 2>/dev/null || true; }
 
 TIMESTAMP=$(date +%s)
 CAT_NAME="example_action_cat_${TIMESTAMP}"
@@ -119,8 +119,9 @@ AT_ID=""
 SCHED_ID=""
 
 cleanup() {
-    if [ "${KEEP_RESOURCES:-0}" = "1" ]; then
-        echo ""; echo "=== Cleanup skipped (KEEP_RESOURCES=1) ==="
+    if [ "${CLEANUP:-0}" != "1" ]; then
+        echo ""; echo "=== Resources kept (set CLEANUP=1 to delete on exit) ==="
+        echo "  KN=$KN_ID  CAT=$CAT_ID  TOOLBOX=$BOX_ID  ACTION_TYPE=$AT_ID  SCHEDULE=$SCHED_ID"
         echo "  Inspect: openbkn toolbox list | grep eval_action_toolbox ; openbkn bkn action-log list $KN_ID"
         return 0
     fi
@@ -183,8 +184,12 @@ echo "  Catalog: $CAT_ID ($RES_N table resources)"
 # ── Step 2: Build Knowledge Network (object types bound to Vega resources) ───
 echo ""
 echo "=== Step 2: Build Knowledge Network ==="
-KN_ID=$(openbkn --json bkn create "$KN_NAME" 2>/dev/null | jget kn_id)
-[ -z "$KN_ID" ] && KN_ID=$(openbkn --json bkn create "${KN_NAME}_b" 2>/dev/null | jget id)
+# One create, then read the id out of that same response: the CLI has returned
+# `id` rather than `kn_id`, and calling create a second time to "retry" left a
+# stray empty KN behind on every run.
+KN_JSON=$(openbkn --json bkn create "$KN_NAME" 2>/dev/null || true)
+KN_ID=$(printf '%s' "$KN_JSON" | jget kn_id)
+[ -n "$KN_ID" ] || KN_ID=$(printf '%s' "$KN_JSON" | jget id)
 [ -z "$KN_ID" ] && { echo "Error: no kn_id in response" >&2; exit 1; }
 echo "  Knowledge Network: $KN_ID"
 INV_RES=$(res_id "eval_inventory"); PO_RES=$(res_id "eval_production_orders")

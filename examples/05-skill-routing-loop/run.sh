@@ -61,10 +61,11 @@ if ! command -v "$MYSQL_BIN" >/dev/null 2>&1; then
     done
 fi
 command -v "$MYSQL_BIN" >/dev/null 2>&1 || { echo "Error: mysql client not found (Ubuntu: sudo apt install -y mysql-client)"; exit 1; }
-jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('$1','') if isinstance(d,dict) else '')" 2>/dev/null || true; }
+jget() { python3 -c "import json,sys;d=json.load(sys.stdin);print((d.get('$1') or '') if isinstance(d,dict) else '')" 2>/dev/null || true; }
 
 # Track resources for cleanup
 CAT_ID="" TMP_KN_ID="" MCP_ID=""
+KN_PUSHED=""   # set once bkn push lands; KN_ID is a fixed literal, not proof it exists
 SKILL_IDS=()
 TOOL_BACKEND_PID=""
 STANDARD_REPLENISH_ID=""
@@ -73,6 +74,20 @@ SUPPLIER_EXPEDITE_ID=""
 RENDERED_SKILLS=""
 
 cleanup() {
+    if [ "${CLEANUP:-0}" != "1" ]; then
+        echo ""
+        echo "=== Resources kept (set CLEANUP=1 to delete on exit) ==="
+        echo "  KN=${KN_PUSHED:+$KN_ID}  TMP_KN=$TMP_KN_ID  CAT=$CAT_ID  MCP=$MCP_ID"
+        echo "  SKILLS=${SKILL_IDS[*]:-}"
+        # The mock tool backend is a local process holding a port — stop it anyway,
+        # unless DEBUG_KEEP=1 asks for the whole loop to stay callable.
+        if [ -n "$TOOL_BACKEND_PID" ] && [ "${DEBUG_KEEP:-0}" != "1" ]; then
+            kill "$TOOL_BACKEND_PID" 2>/dev/null && echo "  ✓ stopped mock backend pid $TOOL_BACKEND_PID"
+        elif [ -n "$TOOL_BACKEND_PID" ]; then
+            echo "  mock backend still running (pid $TOOL_BACKEND_PID) — kill $TOOL_BACKEND_PID when done"
+        fi
+        return 0
+    fi
     echo ""
     echo "=== Cleanup ==="
     [ -n "$MCP_ID" ] && {
@@ -86,7 +101,7 @@ cleanup() {
         openbkn skill set-status "$sid" offline >/dev/null 2>&1 || true
         echo y | openbkn skill delete "$sid" >/dev/null 2>&1 && echo "  ✓ skill $sid" || true
     done
-    openbkn bkn delete "$KN_ID" -y >/dev/null 2>&1 && echo "  ✓ kn $KN_ID" || true
+    [ -n "$KN_PUSHED" ] && openbkn bkn delete "$KN_ID" -y >/dev/null 2>&1 && echo "  ✓ kn $KN_ID" || true
     [ -n "$TMP_KN_ID" ] && openbkn bkn delete "$TMP_KN_ID" -y >/dev/null 2>&1 && echo "  ✓ tmp kn $TMP_KN_ID" || true
     [ -n "$CAT_ID" ] && openbkn call "/api/vega-backend/v1/catalogs/$CAT_ID" -X DELETE >/dev/null 2>&1 && echo "  ✓ catalog $CAT_ID" || true
     [ -n "$TOOL_BACKEND_PID" ] && kill "$TOOL_BACKEND_PID" 2>/dev/null && echo "  ✓ mock backend pid $TOOL_BACKEND_PID" || true
@@ -134,8 +149,15 @@ for skill_dir in "$SCRIPT_DIR"/skills/*/; do
     skill_name=$(basename "$skill_dir")
     rendered_skill_dir="$RENDERED_SKILLS/$skill_name"
     cp -R "$skill_dir" "$rendered_skill_dir"
+    # Suffix the registered name with the run timestamp. Registration itself
+    # allows duplicate names, but publishing rejects a name already held by a
+    # published Skill — so a second run over the Skills this one leaves behind
+    # would fail at set-status. The KN binds Skills by id, and the routing
+    # assertions map ids back through the directory name, so the suffix stays
+    # contained to the Skill registry.
     find "$rendered_skill_dir" -type f -name 'SKILL.md' -exec sed -i.bak \
-        -e "s|{{TOOL_BACKEND_PUBLIC_URL}}|$TOOL_BACKEND_PUBLIC_URL|g" {} \;
+        -e "s|{{TOOL_BACKEND_PUBLIC_URL}}|$TOOL_BACKEND_PUBLIC_URL|g" \
+        -e "1,10s|^name: \(.*\)$|name: \1_${TIMESTAMP}|" {} \;
     find "$rendered_skill_dir" -name '*.bak' -delete
     # openbkn skill register zips the directory itself.
     REG_RAW=$(openbkn --json skill register "$rendered_skill_dir" 2>&1)
@@ -295,6 +317,7 @@ PUSH_RAW=$(openbkn --json bkn push "$RENDERED_BKN" 2>&1)
 echo "$PUSH_RAW" | tail -3
 # kn_id is fixed (network.bkn frontmatter id) — just confirm push succeeded
 echo "$PUSH_RAW" | grep -q "\"kn_id\"" || { echo "ERROR: bkn push failed" >&2; exit 1; }
+KN_PUSHED=1
 echo "  ✓ KN: $KN_ID"
 
 # ── Step 7: Build KN ─────────────────────────────────────────────────────────
@@ -374,9 +397,8 @@ echo "  ✓ MCP $MCP_ID (published, X-Kn-ID=$KN_ID)"
 echo ""
 echo "=== Step 10: Route 3 alerts via find_skills (one per material) ==="
 if [ "${DEBUG_KEEP:-0}" = "1" ]; then
-    trap - EXIT
     set +e
-    echo "[DEBUG_KEEP=1] cleanup disabled; kn/skill/catalog/mcp will persist for debugging"
+    echo "[DEBUG_KEEP=1] keep going on error; mock tool backend also stays up for debugging"
     echo "  KN_ID=$KN_ID"
     echo "  CAT_ID=$CAT_ID"
     echo "  MCP_ID=$MCP_ID"
