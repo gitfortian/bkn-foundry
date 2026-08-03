@@ -65,56 +65,100 @@ func guardBusinessToolCall(
 	ensure ensureOperationFunc,
 	next func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error),
 ) func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
-	return guardBusinessToolCallWithCompletion(ensure, nil, next)
+	return guardBusinessToolCallWithCompletion(ensure, nil, nil, next)
 }
 
 func guardBusinessToolCallWithCompletion(
 	ensure ensureOperationFunc,
 	complete completeOperationFunc,
+	autoClient *bkntrace.LifecycleClient,
 	next func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error),
 ) func(context.Context, mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 	return func(ctx context.Context, req mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		arguments := req.GetArguments()
 		rawContext, _ := arguments["bkn_context"].(map[string]any)
 		conversationID, _ := rawContext["conversation_id"].(string)
-		if conversationID == "" {
-			return lifecycleToolError(lifecycleError{
-				Code:           "conversation_required",
-				Message:        "conversation_id is required",
-				RequiredAction: "create_conversation",
-			}), nil
-		}
 		interactionID, _ := rawContext["interaction_id"].(string)
-		if interactionID == "" {
-			return lifecycleToolError(lifecycleError{
-				Code:           "interaction_required",
-				Message:        "interaction_id is required",
-				RequiredAction: "start_interaction",
-			}), nil
-		}
 		operationKey, _ := rawContext["operation_key"].(string)
-		if operationKey == "" {
-			return lifecycleToolError(lifecycleError{
-				Code:           "operation_required",
-				Message:        "operation_key is required",
-				RequiredAction: "ensure_operation",
-			}), nil
-		}
 		if ensure == nil {
 			return nil, fmt.Errorf("lifecycle operation client is not configured")
 		}
-		intent := operationIntent{
-			Context: bknContext{
+		var businessContext bknContext
+		autoSession := conversationID == "" && interactionID == "" && operationKey == ""
+		if autoSession {
+			resolved, lifecycleErr, err := resolveAutoSession(ctx, autoClient, req, arguments, autoSessionRetry{})
+			if err != nil {
+				return lifecycleToolError(lifecycleAvailabilityError(err)), nil
+			}
+			if lifecycleErr != nil {
+				return lifecycleToolError(*lifecycleErr), nil
+			}
+			businessContext = resolved
+		} else {
+			// A half-filled context is still an error: the missing field would have
+			// to be invented, and an invented parent turns the receipt into a claim
+			// about causality that never happened.
+			switch {
+			case conversationID == "":
+				return lifecycleToolError(lifecycleError{
+					Code:           "conversation_required",
+					Message:        "conversation_id is required",
+					RequiredAction: "create_conversation",
+				}), nil
+			case interactionID == "":
+				return lifecycleToolError(lifecycleError{
+					Code:           "interaction_required",
+					Message:        "interaction_id is required",
+					RequiredAction: "start_interaction",
+				}), nil
+			case operationKey == "":
+				return lifecycleToolError(lifecycleError{
+					Code:           "operation_required",
+					Message:        "operation_key is required",
+					RequiredAction: "ensure_operation",
+				}), nil
+			}
+			businessContext = bknContext{
 				ConversationID:    conversationID,
 				InteractionID:     interactionID,
 				OperationKey:      operationKey,
 				ParentOperationID: stringValue(rawContext["parent_operation_id"]),
 				CausationEventIDs: stringSliceValue(rawContext["causation_event_ids"]),
-			},
+			}
+		}
+		intent := operationIntent{
+			Context:  businessContext,
 			ToolName: req.Params.Name,
 			Input:    arguments,
 		}
 		ensured, lifecycleErr, err := ensure(ctx, intent)
+		// An auto session outlives any single call, so it can go stale between
+		// calls in ways the client cannot see or fix: Core declares the
+		// interaction terminal once its lease lapses, and caps one interaction at
+		// 128 operations. Both surface here, from operations:ensure — not from
+		// resolving the session — so the rebuild has to wrap this call.
+		// Each idle gap leaves one more dead interaction behind, and the walk has
+		// to start from the one that just failed rather than from a fixed point:
+		// the base start key keeps resolving to the connection's first
+		// interaction, so a salt pinned to it would never reach past generation
+		// two. Bounded, because a walk that never ends is a worse failure than a
+		// call that reports it could not recover.
+		for attempt := 0; autoSession && err == nil && isStaleAutoSession(lifecycleErr) &&
+			attempt < autoSessionMaxRebuilds; attempt++ {
+			rebuilt, rebuildErr, resolveErr := resolveAutoSession(
+				ctx, autoClient, req, arguments,
+				autoSessionRetry{afterInteractionID: businessContext.InteractionID},
+			)
+			if resolveErr != nil || rebuildErr != nil {
+				break
+			}
+			if rebuilt.InteractionID == businessContext.InteractionID {
+				break
+			}
+			businessContext = rebuilt
+			intent.Context = rebuilt
+			ensured, lifecycleErr, err = ensure(ctx, intent)
+		}
 		if err != nil {
 			return lifecycleToolError(lifecycleAvailabilityError(err)), nil
 		} else if lifecycleErr != nil {
@@ -139,8 +183,13 @@ func guardBusinessToolCallWithCompletion(
 			}
 			operationID, attempt := operationIdentity(ensured.Operation)
 			traceContext, _ := common.GetTraceContextFromCtx(ctx)
-			traceContext.ConversationID = conversationID
-			traceContext.InteractionID = interactionID
+			// Must come from the resolved context, not the raw arguments: under the
+			// session fallback the arguments carry no ids, and writing them back
+			// would blank out what Guard.Begin just established. Evidence events
+			// with an empty interaction_id are rejected by Core in bulk, and the
+			// rejection only warns — the whole evidence trail would vanish silently.
+			traceContext.ConversationID = businessContext.ConversationID
+			traceContext.InteractionID = businessContext.InteractionID
 			traceContext.OperationID = operationID
 			traceContext.Attempt = attempt
 			ctx = common.SetTraceContextToCtx(ctx, traceContext)

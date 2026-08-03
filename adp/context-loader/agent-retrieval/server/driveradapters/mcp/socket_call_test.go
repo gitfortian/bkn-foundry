@@ -85,7 +85,10 @@ func TestLicensedEnterpriseToolCallReachesTheLifecycleGuard(t *testing.T) {
 	if strings.Contains(got, "not found") {
 		t.Fatalf("a licensed tool must not be refused as unknown: %s", got)
 	}
-	if !strings.Contains(got, "conversation") {
+	// A call with no bkn_context now falls back to the MCP session, so the guard
+	// answers about the Core it needs rather than the conversation the client
+	// omitted. Either wording proves the gate handed the call on.
+	if !strings.Contains(got, "conversation") && !strings.Contains(got, "BKN Trace Core") {
 		t.Fatalf("expected the lifecycle guard to answer, got %s", got)
 	}
 }
@@ -123,7 +126,7 @@ func TestInfoAndToolsListAgreeOnEnterpriseSchemas(t *testing.T) {
 	mcptool.Register(extraTool("probe_context", "probe_context"))
 
 	// 企业工具那一半与 locale 无关：两侧用的都是 ee 自带的 t.Input，各自过一次
-	// requireBKNContext。这条断言在任何 locale 下都必须成立，所以不钉环境。
+	// offerBKNContext。这条断言在任何 locale 下都必须成立，所以不钉环境。
 	listed := listVisible(t)
 	info, err := BuildMCPInfo("https://example.invalid/mcp")
 	if err != nil {

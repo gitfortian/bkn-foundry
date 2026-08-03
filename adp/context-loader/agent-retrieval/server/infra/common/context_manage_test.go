@@ -255,6 +255,74 @@ func TestTraceContextUsesConfiguredTenantOnlyWhenInboundTenantIsMissing(t *testi
 	}
 }
 
+func TestTraceContextUsesConfiguredBusinessDomainOnlyWhenInboundDomainIsMissing(t *testing.T) {
+	t.Setenv("BKN_TRACE_DEFAULT_TENANT_ID", "openbkn-local")
+	t.Setenv("BKN_TRACE_DEFAULT_BUSINESS_DOMAIN", "bd_public")
+
+	bare := SetTraceContextToCtx(context.Background(), TraceContextFromHeaders(func(string) string { return "" }))
+	traceContext, ok := GetTraceContextFromCtx(bare)
+	if !ok || traceContext.BusinessDomain != "bd_public" {
+		t.Fatalf("default business domain = %q, want bd_public", traceContext.BusinessDomain)
+	}
+	if traceContext.Baggage["business_domain"] != "bd_public" {
+		t.Fatalf("default business domain must reach outbound baggage: %v", traceContext.Baggage)
+	}
+
+	trusted := TraceContextFromHeaders(func(key string) string {
+		if key == HeaderBusinessDomain {
+			return "bd_from_gateway"
+		}
+		return ""
+	})
+	if trusted.BusinessDomain != "bd_from_gateway" {
+		t.Fatalf("inbound business domain was overwritten: %q", trusted.BusinessDomain)
+	}
+
+	baggageOnly := TraceContextFromHeaders(func(key string) string {
+		if key == HeaderBaggage {
+			return "business_domain=bd_from_baggage"
+		}
+		return ""
+	})
+	if baggageOnly.BusinessDomain != "bd_from_baggage" {
+		t.Fatalf("baggage business domain must outrank the deployment default: %q", baggageOnly.BusinessDomain)
+	}
+}
+
+func TestCopyRequestScopedValuesKeepsTheTargetContextIntact(t *testing.T) {
+	type transportKey struct{}
+	// Stands in for the MCP client session the transport puts on the context
+	// before this service sees it. Replacing that context instead of copying
+	// onto it is what made the session-level fallback see every call as
+	// sessionless while the unit tests stayed green.
+	transport := context.WithValue(context.Background(), transportKey{}, "session-1")
+
+	request := SetTraceContextToCtx(context.Background(), TraceContext{
+		TenantID: "tenant-1", BusinessDomain: "bd_public",
+	})
+	request = SetAccountAuthContextToCtx(request, &interfaces.AccountAuthContext{
+		AccountID: "user-1", AccountType: interfaces.AccessorTypeUser,
+	})
+	request = SetPublicAPIToCtx(request, true)
+
+	merged := CopyRequestScopedValues(request, transport)
+
+	if merged.Value(transportKey{}) != "session-1" {
+		t.Fatal("the transport's own context values were dropped")
+	}
+	traceContext, ok := GetTraceContextFromCtx(merged)
+	if !ok || traceContext.BusinessDomain != "bd_public" {
+		t.Fatalf("request trace context did not survive the copy: %#v", traceContext)
+	}
+	auth, ok := GetAccountAuthContextFromCtx(merged)
+	if !ok || auth.AccountID != "user-1" {
+		t.Fatalf("request auth context did not survive the copy: %#v", auth)
+	}
+	if !IsPublicAPIFromCtx(merged) {
+		t.Fatal("public API marker did not survive the copy")
+	}
+}
+
 func TestCallerCorrelationIDsAreValidatedWithoutGeneration(t *testing.T) {
 	convey.Convey("valid caller ids are propagated and invalid ids are dropped", t, func() {
 		headers := map[string]string{

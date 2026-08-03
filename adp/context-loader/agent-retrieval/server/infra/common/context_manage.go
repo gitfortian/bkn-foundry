@@ -40,6 +40,7 @@ const (
 	HeaderBusinessDomain      = "x-business-domain"
 	HeaderBKNEventObservedAt  = "bkn-event-observed-at"
 	envDefaultTenantID        = "BKN_TRACE_DEFAULT_TENANT_ID"
+	envDefaultBusinessDomain  = "BKN_TRACE_DEFAULT_BUSINESS_DOMAIN"
 )
 
 type traceContextKey string
@@ -160,6 +161,35 @@ func GetTraceContextFromCtx(ctx context.Context) (TraceContext, bool) {
 	return traceContext, ok
 }
 
+// CopyRequestScopedValues carries this service's per-request values from the
+// HTTP request context onto another context, keeping that context's own values
+// intact. The MCP transport builds a context holding the client session before
+// it hands control to this service; replacing that context wholesale would drop
+// the session, so the values move in this direction instead.
+func CopyRequestScopedValues(from, onto context.Context) context.Context {
+	if from == nil {
+		return onto
+	}
+	if onto == nil {
+		return from
+	}
+	for _, key := range []any{
+		keyTraceContext,
+		XLangKey,
+		interfaces.KeyAccountAuthContext,
+		interfaces.KeyResponseFormat,
+		interfaces.IsPublic,
+	} {
+		if value := from.Value(key); value != nil {
+			onto = context.WithValue(onto, key, value)
+		}
+	}
+	if spanContext := trace.SpanContextFromContext(from); spanContext.IsValid() {
+		onto = trace.ContextWithSpanContext(onto, spanContext)
+	}
+	return onto
+}
+
 func TraceContextFromHeaders(getHeader func(string) string) TraceContext {
 	requestID := strings.TrimSpace(getHeader(HeaderBKNRequestID))
 	if requestID == "" {
@@ -172,9 +202,15 @@ func TraceContextFromHeaders(getHeader func(string) string) TraceContext {
 	observedAt := strings.TrimSpace(getHeader(HeaderBKNEventObservedAt))
 	_, observedAtErr := time.Parse(time.RFC3339Nano, observedAt)
 	return TraceContext{
-		RequestID:          requestID,
-		TenantID:           sanitizeBusinessTraceID(firstNonEmpty(getHeader(HeaderTenantID), os.Getenv(envDefaultTenantID))),
-		BusinessDomain:     firstNonEmpty(getHeader(HeaderBusinessDomain), parseBaggage(getHeader(HeaderBaggage))["business_domain"]),
+		RequestID: requestID,
+		TenantID:  sanitizeBusinessTraceID(firstNonEmpty(getHeader(HeaderTenantID), os.Getenv(envDefaultTenantID))),
+		// A trusted inbound domain always wins; the deployment default only keeps
+		// single-domain installs working for clients that carry no domain at all.
+		BusinessDomain: firstNonEmpty(
+			getHeader(HeaderBusinessDomain),
+			parseBaggage(getHeader(HeaderBaggage))["business_domain"],
+			os.Getenv(envDefaultBusinessDomain),
+		),
 		Baggage:            parseBaggage(getHeader(HeaderBaggage)),
 		ConversationID:     sanitizeBusinessTraceID(getHeader(HeaderBKNConversationID)),
 		InteractionID:      sanitizeBusinessTraceID(getHeader(HeaderBKNInteractionID)),
