@@ -10,7 +10,9 @@
 // routes and never mounts the write routes at all, so a probe of
 // POST /admin/roles in a community build gets 404 — the endpoint does not
 // exist, rather than existing-but-refusing. The enterprise binary mounts the
-// write routes in its Setup, behind RequireFeature("rbac_basic").
+// write routes in its Setup and the socket hides them per request when the
+// licence does not carry the feature — so an unlicensed enterprise binary
+// answers a probe exactly as the community one does.
 //
 // Why a typed Services surface instead of moving the raw handlers: the write
 // handlers carry security invariants — a custom role is forced to source
@@ -28,8 +30,12 @@ package adminwrite
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/extension"
 )
 
 // Sentinel errors returned by Services. ee maps these to HTTP status; anything
@@ -71,7 +77,10 @@ type RolePatch struct {
 type Services interface {
 	// RequirePermission returns core's RBAC middleware for a resource/op, so ee
 	// write routes keep the same per-caller permission checks community reads
-	// use. This is the RBAC layer; the license layer (RequireFeature) is ee's.
+	// use. This is the RBAC layer. The licence layer is the socket's (Gate) and
+	// the caller is responsible for ordering it first — an unlicensed request
+	// must not reach any authorization check, including authentication, or the
+	// 401/403 discloses that the endpoint exists in this binary.
 	RequirePermission(resourceType, op string) gin.HandlerFunc
 
 	// CreateRole creates a custom role and returns its id.
@@ -125,18 +134,42 @@ func requireAnyPermission(svc Services, points ...PermissionPoint) gin.HandlerFu
 // provides one; the community build leaves it nil, so the routes never exist.
 type Mounter func(g *gin.RouterGroup, svc Services)
 
-var mounter Mounter
+var (
+	mounter Mounter
+	// gatedOn is the feature the socket itself enforces per request. Empty
+	// means the caller used the legacy RegisterMounter and is gating inside
+	// its own mounter.
+	gatedOn extension.Feature
+)
 
-// RegisterMounter installs the write-route mounter. The ee assembly calls it
-// once, before Freeze. A second call, or a call after the socket is frozen,
-// panics — both are assembly bugs (see extension.Claim for the same rule on the
-// capability sockets).
+// RegisterMounterGated installs the write-route mounter and tells the socket
+// which feature to enforce. This is the form to use.
 //
-// It is intentionally not license-checked here: ee gates each route with
-// RequireFeature inside the mounter, so a professional-only cluster still
-// mounts the routes and lets RequireFeature refuse the enterprise ones. The
-// community binary simply never calls this.
-func RegisterMounter(m Mounter) {
+// The socket owns the refusal, not the caller. That is the whole point of the
+// signature: an entitlement gap has to be indistinguishable from the route not
+// existing (ee-design.md §4.4/§4.5 — 缺证书 → 装作没有；缺权限 → 明确拒绝),
+// and leaving that decision to each caller means each caller can get it wrong
+// independently. One of them did, and shipped a 403 carrying the feature name.
+//
+// The ee assembly calls this once, before Freeze. A second call, or a call
+// after the socket is frozen, panics — both are assembly bugs.
+func RegisterMounterGated(f extension.Feature, m Mounter) {
+	if f == "" {
+		panic("adminwrite: RegisterMounterGated with an empty feature")
+	}
+	registerMounter(m)
+	gatedOn = f
+}
+
+// RegisterMounter installs a mounter that gates itself.
+//
+// Deprecated: use RegisterMounterGated so the socket enforces the tier and
+// produces the refusal. This form is kept only so the enterprise code line can
+// switch over in its own commit rather than breaking the moment core changes;
+// it will be removed once it has no callers.
+func RegisterMounter(m Mounter) { registerMounter(m) }
+
+func registerMounter(m Mounter) {
 	if m == nil {
 		panic("adminwrite: RegisterMounter(nil)")
 	}
@@ -149,6 +182,53 @@ func RegisterMounter(m Mounter) {
 	mounter = m
 }
 
+// requireFeature hides the routes when the licence does not carry the feature.
+//
+// 404 with no body, which is byte-for-byte what an unmounted route answers:
+// gin has no NoRoute handler here, so a community build replies "404 page not
+// found" as text/plain. Anything richer — a JSON body, an error code, the
+// feature name — is a fingerprint that tells a prober the paid surface exists
+// in this binary, which is exactly what the two-binary split is meant to deny.
+//
+// The reason still gets recorded, just not to the caller: the log is where an
+// operator finds out this was an entitlement gap rather than a missing route
+// (ee-design.md §7.5 requires the two to be distinguishable server-side).
+func Gate() gin.HandlerFunc {
+	f := gatedOn
+	if f == "" {
+		// Legacy RegisterMounter: the caller gates inside its own mounter, so
+		// the socket has nothing to enforce. Never nil — a caller that wires
+		// Gate() unconditionally must not have to branch on it.
+		return func(c *gin.Context) { c.Next() }
+	}
+	return func(c *gin.Context) {
+		if extension.Enabled(f) {
+			c.Next()
+			return
+		}
+		// The reason goes to the log, never to the caller. §7.5 requires an
+		// operator to be able to tell an entitlement gap from a missing route;
+		// the caller must not be able to tell them apart at all.
+		slog.Info("adminwrite: route hidden, feature not licensed",
+			"feature", string(f), "method", c.Request.Method, "path", c.Request.URL.Path)
+
+		// gin's own answer for an unmounted route, byte for byte: status 404,
+		// Content-Type "text/plain" (gin.MIMEPlain), body "404 page not found"
+		// with no trailing newline and no other header.
+		//
+		// Reproduced here rather than delegated, because there is nothing to
+		// delegate to: gin only runs its not-found handler when no route
+		// matched, and this route did match. Both obvious shortcuts are wrong
+		// and were tried — writing the header by hand yields
+		// "text/plain; charset=utf-8", and net/http's NotFound adds a trailing
+		// newline plus X-Content-Type-Options: nosniff. Each is a fingerprint
+		// even though the status and body look right, which is why the test
+		// compares the whole response rather than the status code.
+		c.Abort()
+		c.Data(http.StatusNotFound, gin.MIMEPlain, []byte("404 page not found"))
+	}
+}
+
 var frozen bool
 
 // Freeze closes the socket. Call once, after assembly. The router's Mount is
@@ -159,6 +239,13 @@ func Freeze() { frozen = true }
 // socket. In a community build no mounter was registered, so this is a no-op
 // and the write routes stay absent (404). Returns whether routes were mounted,
 // for the startup log.
+// Mount does NOT apply Gate() itself. gin appends group middleware to the
+// parent chain, so a gate added here would run after whatever the caller
+// already put on the group — in bkn-safe that is RequireAdmin, and an
+// unauthenticated probe would then get 401 from an enterprise binary where the
+// community one answers 404. Ordering is the caller's to get right, and
+// router.go puts Gate() first; TestGateRunsBeforeAuthentication is what checks
+// that it stays that way.
 func Mount(g *gin.RouterGroup, svc Services) bool {
 	frozen = true
 	if mounter == nil {
@@ -176,5 +263,6 @@ func Mounted() bool { return mounter != nil }
 // the exported wrapper.
 func resetForTest() {
 	mounter = nil
+	gatedOn = ""
 	frozen = false
 }
