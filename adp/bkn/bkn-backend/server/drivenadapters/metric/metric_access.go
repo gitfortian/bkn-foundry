@@ -389,8 +389,10 @@ func processMetricQueryCondition(query interfaces.MetricsListQueryParams, subBui
 	if query.ScopeType != "" {
 		subBuilder = subBuilder.Where(sq.Eq{"f_scope_type": query.ScopeType})
 	}
-	// 统计主体id
-	if query.ScopeRef != "" {
+	// 统计主体id：多值走 IN（OT-first 场景一次枚举多个对象类的指标），单值保持等值
+	if len(query.ScopeRefs) > 0 {
+		subBuilder = subBuilder.Where(sq.Eq{"f_scope_ref": query.ScopeRefs})
+	} else if query.ScopeRef != "" {
 		subBuilder = subBuilder.Where(sq.Eq{"f_scope_ref": query.ScopeRef})
 	}
 	if query.Tag != "" {
@@ -411,7 +413,9 @@ func (ma *metricAccess) ListMetrics(ctx context.Context, query interfaces.Metric
 		if dir == "" {
 			dir = interfaces.DESC_DIRECTION
 		}
-		builder = builder.OrderBy(fmt.Sprintf("%s %s", sortCol, dir))
+		// f_id 兜底：默认按 f_update_time 排序，同批导入的指标时间戳完全相同，
+		// 没有 tiebreaker 时跨页边界的行序不保证稳定（同一行可能翻两次或被跳过）。
+		builder = builder.OrderBy(fmt.Sprintf("%s %s", sortCol, dir), "f_id ASC")
 	}
 
 	sqlStr, vals, err := builder.ToSql()

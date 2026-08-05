@@ -51,6 +51,13 @@ const (
 	listActionExecutionsURI = "/in/v1/knowledge-networks/%s/action-logs"
 	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/subgraph
 	queryInstanceSubgraphURI = "/in/v1/knowledge-networks/%s/subgraph"
+	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/metrics/:metric_id/data
+	//
+	// Both ids are escaped at call time: metric_id arrives straight from an agent
+	// (the tool schema constrains it to a string and nothing more), and an
+	// unescaped one carrying "?" or "&" would smuggle query parameters — branch
+	// and fill_null among them — into the downstream request.
+	queryMetricDataURI = "/in/v1/knowledge-networks/%s/metrics/%s/data"
 )
 
 // NewOntologyQueryAccess 创建OntologyQueryAccess
@@ -429,5 +436,38 @@ func (o *ontologyQueryClient) QueryInstanceSubgraph(ctx context.Context, req *in
 	respJSON, _ := json.Marshal(resp)
 	o.logger.WithContext(ctx).Debugf("[OntologyQuery#QueryInstanceSubgraph] Response: %s", string(respJSON))
 
+	return resp, nil
+}
+
+// QueryMetricData 按指标自身口径计算取数（OT-first 路径第 3 步）。
+//
+// 走 ontology-query 内部路由，与 QueryLogicProperties 同一姿势：账户信息随 header
+// 透传，授权在下游判定。
+func (o *ontologyQueryClient) QueryMetricData(ctx context.Context, knID, metricID string, fillNull bool,
+	req *interfaces.MetricQueryDownstreamReq) (resp *interfaces.MetricQueryDownstreamResp, err error) {
+	uri := fmt.Sprintf(queryMetricDataURI, url.PathEscape(knID), url.PathEscape(metricID))
+	query := url.Values{}
+	query.Set("fill_null", strconv.FormatBool(fillNull))
+	target := fmt.Sprintf("%s%s?%s", o.baseURL, uri, query.Encode())
+
+	header := common.GetHeaderForChildOperation(ctx, "ontology.metric.query", 1)
+	header[rest.ContentTypeKey] = rest.ContentTypeJSON
+
+	if req == nil {
+		req = &interfaces.MetricQueryDownstreamReq{}
+	}
+	_, respBody, err := o.httpClient.Post(ctx, target, header, req)
+	if err != nil {
+		o.logger.WithContext(ctx).Warnf("[OntologyQuery#QueryMetricData] kn=%s metric=%s failed: %v", knID, metricID, err)
+		// 指标不存在 / 参数不合法是调用方的错，别混进依赖故障。
+		return nil, classifyQueryError(ctx, err)
+	}
+
+	resp = &interfaces.MetricQueryDownstreamResp{}
+	resultByt := utils.ObjectToByte(respBody)
+	if err = json.Unmarshal(resultByt, resp); err != nil {
+		o.logger.WithContext(ctx).Errorf("[OntologyQuery#QueryMetricData] Unmarshal %s err:%v", string(resultByt), err)
+		return nil, infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, err.Error())
+	}
 	return resp, nil
 }
