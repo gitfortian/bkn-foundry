@@ -51,8 +51,11 @@ MySQL 数据库
 > Step 3 其余参数：`EMBEDDING_MODEL_NAME=`（置空）只建全文索引；
 > `INDEX_TIMEOUT`（默认 300 秒）为单个资源的等待上限。
 >
-> 另需注意：建好的索引目前还接不到知识网络的语义层——对象类属性不会暴露 `match` / `knn`
-> 操作，`bkn search` 仍停留在 Schema 概念匹配，详见 PR 中关于 `f_index_available` 的说明。
+> 另需注意：建好的索引目前还没接进知识网络的语义层。对象类的 `index_available` 至今没有任何
+> 代码路径会置为 true，属性的可用操作符只能按属性类型推导：本示例建出的 `string` 属性只会拿到
+> 等值类操作，没有 `match`、也没有 `knn`。（`text` 属性即便在该标志为 false 时仍会拿到 `match`，
+> `vector` 属性在小模型开启时仍会拿到 `knn`。）因此 `bkn search` 停留在 Schema 概念匹配。索引
+> 本身对 Vega 侧的查询仍然生效，受限的只是知识网络层面的语义检索。
 
 ## 前置条件
 
