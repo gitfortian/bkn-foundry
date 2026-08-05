@@ -270,6 +270,36 @@ _sync_ingress_ports_from_access_address() {
     esac
 }
 
+_sync_and_upsert_access_address() {
+    local host="$1"
+    local port="$2"
+    local path="$3"
+    local scheme="$4"
+
+    # The interactive prompt may have changed port or scheme after the
+    # initial defaults were synchronized.  Keep the ingress install inputs
+    # aligned with the address that is ultimately persisted.
+    _sync_ingress_ports_from_access_address "${port}" "${scheme}"
+    _upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
+}
+
+_port_after_interactive_protocol_selection() {
+    local current_port="$1"
+    local current_scheme="$2"
+    local input_port="$3"
+    local input_scheme="$4"
+    local selected_scheme="${input_scheme:-${current_scheme}}"
+
+    if [[ -n "${input_port}" ]]; then
+        printf '%s' "${input_port}"
+    elif [[ -n "${input_scheme}" ]] \
+        && [[ "${selected_scheme,,}" != "${current_scheme,,}" ]]; then
+        _default_access_port_for_scheme "${selected_scheme}"
+    else
+        printf '%s' "${current_port}"
+    fi
+}
+
 _default_access_port_for_scheme() {
     local scheme="${1:-https}"
     case "${scheme,,}" in
@@ -342,7 +372,7 @@ confirm_access_address_before_install() {
 
         if [[ -n "${OPENBKN_ACCESS_ADDRESS:-}" ]]; then
             log_info "Using accessAddress from --access_address: ${url}"
-            _upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
+            _sync_and_upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
         fi
         return 0
     fi
@@ -356,7 +386,7 @@ confirm_access_address_before_install() {
             generate_config_yaml
         fi
         # Then upsert the confirmed accessAddress into full config.
-        _upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
+        _sync_and_upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
         return 0
     fi
 
@@ -385,7 +415,7 @@ confirm_access_address_before_install() {
         read -r -p "  Protocol [${scheme}]: " input_scheme
 
         host="${input_host:-${host}}"
-        port="${input_port:-${port}}"
+        port="$(_port_after_interactive_protocol_selection "${port}" "${scheme}" "${input_port}" "${input_scheme}")"
         path="${input_path:-${path}}"
         scheme="${input_scheme:-${scheme}}"
     else
@@ -399,7 +429,7 @@ confirm_access_address_before_install() {
     fi
 
     # Then upsert the confirmed accessAddress into full config.
-    _upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
+    _sync_and_upsert_access_address "${host}" "${port}" "${path}" "${scheme}"
     log_info "accessAddress written to ${CONFIG_YAML_PATH}: ${scheme}://${host}:${port}${path}"
 }
 
@@ -808,4 +838,6 @@ main() {
     exit 1
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
