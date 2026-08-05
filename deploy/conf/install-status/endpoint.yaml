@@ -21,8 +21,8 @@
 # read only — NO secrets, NO helm). The expected release list still comes from
 # the publish-time snapshot, mounted read-only from the data ConfigMap.
 #
-# Placeholders __NAMESPACE__ / __INGRESS_CLASS__ / __KUBECTL_IMAGE__ are
-# substituted by status.sh.
+# Placeholders __NAMESPACE__ / __INGRESS_CLASS__ / __KUBECTL_IMAGE__ /
+# __NGINX_IMAGE__ are substituted by status.sh.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -123,7 +123,7 @@ spec:
               mountPath: /scripts
               readOnly: true
         - name: nginx
-          image: swr.cn-east-3.myhuaweicloud.com/openbkn-ai/library/nginx:1.27-alpine
+          image: __NGINX_IMAGE__
           ports:
             - containerPort: 80
           readinessProbe:
