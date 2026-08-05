@@ -22,7 +22,7 @@ from app.interfaces import logics
 from app.logs.stand_log import StandLogger
 from app.utils.bkntrace import evidence as bkntrace_evidence
 from app.utils.observability.observability_log import get_logger
-from app.utils import openai_error
+from app.utils import log_redact, openai_error
 
 from app.utils.str_util import generate_random_string, has_common_substring
 
@@ -631,8 +631,7 @@ class BaiduTianchenClient(BKNTraceModelMixin):
         self.OperationCode = OperationCode
 
     async def chat_completion(self, messages, user_id, cache=False):
-        StandLogger.info_log("messages: " + json.dumps(messages, ensure_ascii=False))
-        messages_json = json.dumps(messages, ensure_ascii=False)
+        StandLogger.info_log(f"request={log_redact.messages_digest(messages)}")
         system = None
         prompt_str = ""
         new_messages = []
@@ -704,9 +703,8 @@ class BaiduTianchenClient(BKNTraceModelMixin):
                         openai_error.retry_after_seconds(resp.status, resp.headers))
 
     async def chat_completion_stream_openai(self, messages, user_id, return_info, cache=False):
-        StandLogger.info_log("messages: " + json.dumps(messages, ensure_ascii=False))
+        StandLogger.info_log(f"request={log_redact.messages_digest(messages)}")
         token_yield = False
-        messages_json = json.dumps(messages, ensure_ascii=False)
         retry_time = 3
         try:
             while retry_time > 0:
@@ -860,7 +858,7 @@ class BaiduTianchenClient(BKNTraceModelMixin):
             raise e
 
     async def chat_completion_stream(self, messages, user_id, return_info, cache=False):
-        StandLogger.info_log("messages: " + json.dumps(messages, ensure_ascii=False))
+        StandLogger.info_log(f"request={log_redact.messages_digest(messages)}")
         retry_time = 3
         while retry_time > 0:
             prompt_str = ""
@@ -974,7 +972,6 @@ class BaiduClient(BKNTraceModelMixin):
         self.top_p = top_p
 
     async def chat_completion(self, messages, user_id, func_module, cache=False):
-        messages_json = json.dumps(messages, ensure_ascii=False)
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json'
@@ -1069,7 +1066,6 @@ class BaiduClient(BKNTraceModelMixin):
 
     async def chat_completion_stream_openai(self, messages, user_id, return_info, func_module, cache=False):
         token_yield = False
-        messages_json = json.dumps(messages, ensure_ascii=False)
         retry_time = 3
         while retry_time > 0:
             retry_time -= 1
@@ -1254,7 +1250,6 @@ class BaiduClient(BKNTraceModelMixin):
                 return
 
     async def chat_completion_stream(self, messages, user_id, return_info, cache=False):
-        messages_json = json.dumps(messages, ensure_ascii=False)
         retry_time = 3
         while retry_time > 0:
             retry_time -= 1
@@ -1546,7 +1541,11 @@ class OtherClient(BKNTraceModelMixin):
                         response.encoding = 'utf-8'
                         if response.status != 200:
                             info = await response.text()
-                            StandLogger.error(f"error:{info},headers={headers},api_url={self.api_url},payload={params}")
+                            StandLogger.error(
+                                f"upstream {response.status} error:{info},"
+                                f"headers={log_redact.safe_headers(headers)},"
+                                f"api_url={log_redact.safe_url(self.api_url)},"
+                                f"request={log_redact.request_digest(params)}")
                             if openai_error.is_retryable(response.status) and retry_time > 0:
                                 StandLogger.warn(
                                     f"upstream {response.status} retryable, "
@@ -1753,7 +1752,9 @@ class OtherClient(BKNTraceModelMixin):
                         return
             except aiohttp.ClientError as e:
                 StandLogger.error(
-                    f"call llmModelError {self.api_model} error payload={params},headers={headers},error={e}")
+                    f"call llmModelError {self.api_model} error "
+                    f"request={log_redact.request_digest(params)},"
+                    f"headers={log_redact.safe_headers(headers)},error={e}")
                 if retry_time <= 0:
                     log_info = logics.AddModelUsedAudit(
                         model_id=self.model_id, user_id=user_id, input_tokens=0,
@@ -1776,7 +1777,9 @@ class OtherClient(BKNTraceModelMixin):
                     await asyncio.sleep(1)
             except Exception as e:
                 StandLogger.error(
-                    f"call llmModelError {self.api_model} error payload={params},headers={headers},error={e}")
+                    f"call llmModelError {self.api_model} error "
+                    f"request={log_redact.request_digest(params)},"
+                    f"headers={log_redact.safe_headers(headers)},error={e}")
                 log_info = logics.AddModelUsedAudit(
                     model_id=self.model_id, user_id=user_id, input_tokens=0,
                     output_tokens=0, first_time=0.0, total_time=0.0,
@@ -1975,7 +1978,6 @@ class ClaudeClient(BKNTraceModelMixin):
             self.tool_choice = {"type": "tool", "name": self.tool_choice["function"]["name"]}
 
     async def chat_completion(self, messages, user_id, func_module, cache=False):
-        messages_json = json.dumps(messages, ensure_ascii=False)
         system = None
         for i in range(0, len(messages)):
 
@@ -2135,7 +2137,6 @@ class ClaudeClient(BKNTraceModelMixin):
 
     async def chat_completion_stream_openai(self, messages, user_id, func_module, cache=False):
         system = None
-        messages_json = json.dumps(messages, ensure_ascii=False)
         for i in range(0, len(messages)):
 
             if messages[i]["role"] == "system":
@@ -2385,7 +2386,6 @@ class ClaudeClient(BKNTraceModelMixin):
                         f'"total_tokens":{prompt_tokens + completion_tokens},"func_module":{func_module},"status":"success"}}')
 
     async def chat_completion_stream(self, messages, user_id, return_info, cache=False):
-        messages_json = json.dumps(messages, ensure_ascii=False)
         start_time = time.time()
         system = None
         new_messages = []
