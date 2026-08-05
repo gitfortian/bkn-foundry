@@ -9,7 +9,9 @@ package mariadb
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	sq "github.com/Masterminds/squirrel"
 
@@ -33,16 +35,89 @@ func normalizeTimestampValue(value any) any {
 		return int64(v)
 	case uint32:
 		return int64(v)
+	case time.Time:
+		return v
+	case string:
+		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(v)); err == nil {
+			return parsed
+		}
+		return value
 	default:
 		return value
 	}
 }
 
-func mariaDBDateCompareExpr(columnName, op string, value any) sq.Sqlizer {
+func mariaDBDateValueExpr(field *interfaces.Property, value any) string {
+	if field.Type == interfaces.DataType_Time {
+		return "?"
+	}
+	if _, ok := value.(time.Time); ok {
+		return "?"
+	}
+	if value, ok := value.(string); ok {
+		if _, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
+			return "?"
+		}
+	}
+	return "FROM_UNIXTIME(?/1000)"
+}
+
+func validateMariaDBDateValue(field *interfaces.Property, value any) error {
+	if value == nil {
+		return nil
+	}
+	if field.Type == interfaces.DataType_Time {
+		if _, ok := value.(string); !ok {
+			return fmt.Errorf("MariaDB time field %q requires a time string, got %T", field.Name, value)
+		}
+		return nil
+	}
+
+	switch value := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if _, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return nil
+		}
+		if _, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+			return nil
+		}
+		return fmt.Errorf("MariaDB date field %q requires epoch milliseconds, got %q", field.Name, value)
+	case time.Time:
+		return nil
+	case float32, float64,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64:
+		return nil
+	default:
+		return fmt.Errorf("MariaDB date field %q requires epoch milliseconds, got %T", field.Name, value)
+	}
+}
+
+func mariaDBDateCompareExpr(field *interfaces.Property, op string, value any) (sq.Sqlizer, error) {
+	if err := validateMariaDBDateValue(field, value); err != nil {
+		return nil, err
+	}
 	return sq.Expr(
-		quoteColumnName(columnName)+" "+op+" FROM_UNIXTIME(?/1000)",
+		quoteColumnName(field.OriginalName)+" "+op+" "+mariaDBDateValueExpr(field, value),
 		normalizeTimestampValue(value),
-	)
+	), nil
+}
+
+func mariaDBDateSetExpr(field *interfaces.Property, op string, values []any) (sq.Sqlizer, error) {
+	valueExprs := make([]string, len(values))
+	args := make([]any, len(values))
+	for i, value := range values {
+		if err := validateMariaDBDateValue(field, value); err != nil {
+			return nil, err
+		}
+		valueExprs[i] = mariaDBDateValueExpr(field, value)
+		args[i] = normalizeTimestampValue(value)
+	}
+	return sq.Expr(
+		quoteColumnName(field.OriginalName)+" "+op+" ("+strings.Join(valueExprs, ", ")+")",
+		args...,
+	), nil
 }
 
 // quoteColumnName 将列名转为 SQL 标识符；支持 "alias.col" -> "`alias`.`col`"
@@ -188,6 +263,9 @@ func (c *MariaDBConnector) ConvertFilterConditionEqual(ctx context.Context, cond
 
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
+		if interfaces.DataType_IsDate(cond.Lfield.Type) {
+			return mariaDBDateCompareExpr(cond.Lfield, "=", cond.Value)
+		}
 		return sq.Eq{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 	case interfaces.ValueFrom_Field:
 		return sq.Expr(quoteColumnName(cond.Lfield.OriginalName) + " = " + quoteColumnName(cond.Rfield.OriginalName)), nil
@@ -206,6 +284,9 @@ func (c *MariaDBConnector) ConvertFilterConditionNotEqual(ctx context.Context, c
 
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
+		if interfaces.DataType_IsDate(cond.Lfield.Type) {
+			return mariaDBDateCompareExpr(cond.Lfield, "<>", cond.Value)
+		}
 		return sq.NotEq{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 	case interfaces.ValueFrom_Field:
 		return sq.Expr(quoteColumnName(cond.Lfield.OriginalName) + " <> " + quoteColumnName(cond.Rfield.OriginalName)), nil
@@ -225,7 +306,7 @@ func (c *MariaDBConnector) ConvertFilterConditionGt(ctx context.Context, conditi
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
 		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return mariaDBDateCompareExpr(cond.Lfield.OriginalName, ">", cond.Value), nil
+			return mariaDBDateCompareExpr(cond.Lfield, ">", cond.Value)
 		}
 		return sq.Gt{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 	case interfaces.ValueFrom_Field:
@@ -246,7 +327,7 @@ func (c *MariaDBConnector) ConvertFilterConditionGte(ctx context.Context, condit
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
 		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return mariaDBDateCompareExpr(cond.Lfield.OriginalName, ">=", cond.Value), nil
+			return mariaDBDateCompareExpr(cond.Lfield, ">=", cond.Value)
 		}
 		return sq.GtOrEq{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 	case interfaces.ValueFrom_Field:
@@ -267,7 +348,7 @@ func (c *MariaDBConnector) ConvertFilterConditionLt(ctx context.Context, conditi
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
 		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return mariaDBDateCompareExpr(cond.Lfield.OriginalName, "<", cond.Value), nil
+			return mariaDBDateCompareExpr(cond.Lfield, "<", cond.Value)
 		}
 		return sq.Lt{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 	case interfaces.ValueFrom_Field:
@@ -288,7 +369,7 @@ func (c *MariaDBConnector) ConvertFilterConditionLte(ctx context.Context, condit
 	switch cond.Cfg.ValueFrom {
 	case interfaces.ValueFrom_Const:
 		if interfaces.DataType_IsDate(cond.Lfield.Type) {
-			return mariaDBDateCompareExpr(cond.Lfield.OriginalName, "<=", cond.Value), nil
+			return mariaDBDateCompareExpr(cond.Lfield, "<=", cond.Value)
 		}
 		return sq.LtOrEq{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 	case interfaces.ValueFrom_Field:
@@ -309,6 +390,9 @@ func (c *MariaDBConnector) ConvertFilterConditionIn(ctx context.Context, conditi
 	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
 		return nil, fmt.Errorf("condition [in] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
 	}
+	if interfaces.DataType_IsDate(cond.Lfield.Type) {
+		return mariaDBDateSetExpr(cond.Lfield, "IN", cond.Value)
+	}
 
 	return sq.Eq{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
 }
@@ -323,6 +407,9 @@ func (c *MariaDBConnector) ConvertFilterConditionNotIn(ctx context.Context, cond
 
 	if cond.Cfg.ValueFrom != interfaces.ValueFrom_Const {
 		return nil, fmt.Errorf("condition [not_in] only supports ValueFrom_Const, got %s", cond.Cfg.ValueFrom)
+	}
+	if interfaces.DataType_IsDate(cond.Lfield.Type) {
+		return mariaDBDateSetExpr(cond.Lfield, "NOT IN", cond.Value)
 	}
 
 	return sq.NotEq{quoteColumnName(cond.Lfield.OriginalName): cond.Value}, nil
@@ -418,10 +505,15 @@ func (c *MariaDBConnector) ConvertFilterConditionRange(ctx context.Context, cond
 	}
 
 	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		return sq.And{
-			mariaDBDateCompareExpr(cond.Lfield.OriginalName, ">=", values[0]),
-			mariaDBDateCompareExpr(cond.Lfield.OriginalName, "<=", values[1]),
-		}, nil
+		lower, err := mariaDBDateCompareExpr(cond.Lfield, ">=", values[0])
+		if err != nil {
+			return nil, err
+		}
+		upper, err := mariaDBDateCompareExpr(cond.Lfield, "<=", values[1])
+		if err != nil {
+			return nil, err
+		}
+		return sq.And{lower, upper}, nil
 	}
 
 	return sq.And{
@@ -448,10 +540,15 @@ func (c *MariaDBConnector) ConvertFilterConditionOutRange(ctx context.Context, c
 	}
 
 	if interfaces.DataType_IsDate(cond.Lfield.Type) {
-		return sq.Or{
-			mariaDBDateCompareExpr(cond.Lfield.OriginalName, "<", values[0]),
-			mariaDBDateCompareExpr(cond.Lfield.OriginalName, ">", values[1]),
-		}, nil
+		lower, err := mariaDBDateCompareExpr(cond.Lfield, "<", values[0])
+		if err != nil {
+			return nil, err
+		}
+		upper, err := mariaDBDateCompareExpr(cond.Lfield, ">", values[1])
+		if err != nil {
+			return nil, err
+		}
+		return sq.Or{lower, upper}, nil
 	}
 
 	return sq.Or{
@@ -554,10 +651,15 @@ func (c *MariaDBConnector) ConvertFilterConditionBetween(ctx context.Context, co
 	isDateType := interfaces.DataType_IsDate(fieldType)
 
 	if isDateType {
-		return sq.And{
-			mariaDBDateCompareExpr(cond.Lfield.OriginalName, ">=", values[0]),
-			mariaDBDateCompareExpr(cond.Lfield.OriginalName, "<=", values[1]),
-		}, nil
+		lower, err := mariaDBDateCompareExpr(cond.Lfield, ">=", values[0])
+		if err != nil {
+			return nil, err
+		}
+		upper, err := mariaDBDateCompareExpr(cond.Lfield, "<=", values[1])
+		if err != nil {
+			return nil, err
+		}
+		return sq.And{lower, upper}, nil
 	}
 
 	// 非时间类型字段，直接使用参数化查询
