@@ -51,6 +51,9 @@ evidence:
   ingestAuth:
     existingSecret: ""
     secretKey: token
+    # Bundle installers may enable this explicitly. Standalone upgrades keep
+    # externally managed Secrets outside Helm ownership by default.
+    createSecret: false
     allowUnauthenticated: false
   rawTraceQuery:
     enabled: false
