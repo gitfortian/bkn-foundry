@@ -34,6 +34,9 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            - name: internal-http
+              containerPort: 8081
+              protocol: TCP
           env:
             - name: OPENSEARCH_ENDPOINT
               value: {{ .Values.opensearch.endpoint | quote }}
@@ -110,13 +113,6 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.evidence.ingestAuth.existingSecret | quote }}
                   key: {{ .Values.evidence.ingestAuth.secretKey | quote }}
-            {{- end }}
-            {{- if .Values.evidence.queryAuth.existingSecret }}
-            - name: BKN_TRACE_QUERY_GATEWAY_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.evidence.queryAuth.existingSecret | quote }}
-                  key: {{ .Values.evidence.queryAuth.secretKey | quote }}
             {{- end }}
             {{- if .Values.observability.cursorSigning.existingSecret }}
             - name: BKN_OBSERVABILITY_CURSOR_SIGNING_KEY

@@ -24,6 +24,7 @@ spec:
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
       labels:
         app: {{ .Release.Name }}
+        app.kubernetes.io/name: agent-retrieval
     spec:
       {{- with .Values.nodeSelector }}
       nodeSelector:
@@ -92,13 +93,6 @@ spec:
             {{- if .Values.observability.lifecycle.default_business_domain }}
               - name: BKN_TRACE_DEFAULT_BUSINESS_DOMAIN
                 value: {{ .Values.observability.lifecycle.default_business_domain | quote }}
-            {{- end}}
-            {{- if .Values.observability.lifecycle.gateway_token_secret_name }}
-              - name: BKN_TRACE_QUERY_GATEWAY_TOKEN
-                valueFrom:
-                  secretKeyRef:
-                    name: {{ .Values.observability.lifecycle.gateway_token_secret_name | quote }}
-                    key: {{ .Values.observability.lifecycle.gateway_token_secret_key | quote }}
             {{- end}}
             {{- if .Values.observability.evidence.ingest_url }}
               - name: BKN_TRACE_EVIDENCE_INGEST_URL

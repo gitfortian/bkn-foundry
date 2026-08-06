@@ -434,6 +434,130 @@ _bkn_safe_usable_instance_id() {
 CORE_RELEASE_EXTRA_SETS=()
 CORE_RELEASE_EXTRA_SET_STRINGS=()
 
+OPENBKN_TRACE_CORE_SECRET="${OPENBKN_TRACE_CORE_SECRET:-bkn-trace-core-mariadb}"
+OPENBKN_TRACE_DATABASE="bkn_trace"
+OPENBKN_TRACE_INGEST_SECRET="${OPENBKN_TRACE_INGEST_SECRET:-bkn-trace-evidence-ingest}"
+
+# The chart defaults keep standalone development lightweight. A complete
+# OpenBKN installation, however, must make managed Agent conversations durable
+# and queryable after agent-observability restarts.
+_openbkn_trace_profile_sets() {
+    local release_name="$1"
+    case "${release_name}" in
+        agent-observability)
+            CORE_RELEASE_EXTRA_SETS+=(
+                "core.store=mariadb"
+                "core.mariadb.existingSecret=${OPENBKN_TRACE_CORE_SECRET}"
+                "core.projection.enabled=true"
+                "evidence.store=opensearch"
+                "evidence.indexManagement.enabled=true"
+                "evidence.indexManagement.createJob.enabled=true"
+                "evidence.ingestAuth.existingSecret=${OPENBKN_TRACE_INGEST_SECRET}"
+                "evidence.ingestAuth.secretKey=token"
+            )
+            ;;
+        agent-retrieval)
+            CORE_RELEASE_EXTRA_SETS+=(
+                "observability.trace.enabled=true"
+                "observability.lifecycle.core_url=http://agent-observability-internal:8081"
+                "observability.evidence.ingest_url=http://agent-observability:8080/api/agent-observability/v1/evidence/events"
+                "observability.evidence.ingest_token_secret_name=${OPENBKN_TRACE_INGEST_SECRET}"
+                "observability.evidence.ingest_token_secret_key=token"
+            )
+            ;;
+    esac
+}
+
+_openbkn_release_list_contains() {
+    local expected="$1"
+    shift
+    local release_name
+    for release_name in "$@"; do
+        [[ "${release_name}" == "${expected}" ]] && return 0
+    done
+    return 1
+}
+
+_openbkn_prepare_trace_ingest_secret() {
+    local namespace="$1"
+    if kubectl get secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" >/dev/null 2>&1; then
+        local encoded_token
+        encoded_token="$(kubectl get secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" -o jsonpath='{.data.token}' 2>/dev/null)"
+        if [[ -z "${encoded_token}" ]]; then
+            log_error "BKN Trace Evidence ingest Secret ${OPENBKN_TRACE_INGEST_SECRET} must contain key token"
+            return 1
+        fi
+        return 0
+    fi
+
+    if ! generate_random_password 48 | kubectl create secret generic "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" \
+        --from-file=token=/dev/stdin --dry-run=client -o yaml | kubectl apply -f - >/dev/null; then
+        log_error "BKN Trace cannot create Evidence ingest Secret ${OPENBKN_TRACE_INGEST_SECRET}"
+        return 1
+    fi
+}
+
+# A standard OpenBKN install owns the Trace database but never writes its DSN
+# to a values file. External MariaDB remains operator-owned and must provide
+# the Secret explicitly before the release is installed.
+_openbkn_prepare_trace_profile() {
+    local namespace="$1"
+    local source_type
+    source_type="$(config_yaml_dep_field rds source_type)"
+    if [[ -z "${source_type}" ]]; then
+        log_error "BKN Trace requires depServices.rds.source_type in ${CONFIG_YAML_PATH}; set it to internal or external"
+        return 1
+    fi
+    if [[ "${source_type}" == "external" ]]; then
+        if ! kubectl get secret "${OPENBKN_TRACE_CORE_SECRET}" -n "${namespace}" >/dev/null 2>&1; then
+            log_error "BKN Trace requires Secret ${OPENBKN_TRACE_CORE_SECRET} with key dsn when depServices.rds.source_type is external"
+            return 1
+        fi
+        local encoded_dsn external_dsn database_segment
+        encoded_dsn="$(kubectl get secret "${OPENBKN_TRACE_CORE_SECRET}" -n "${namespace}" -o jsonpath='{.data.dsn}' 2>/dev/null)"
+        if [[ -z "${encoded_dsn}" ]]; then
+            log_error "BKN Trace Core Secret ${OPENBKN_TRACE_CORE_SECRET} must contain key dsn"
+            return 1
+        fi
+        external_dsn="$(printf '%s' "${encoded_dsn}" | base64 --decode 2>/dev/null)" || {
+            log_error "BKN Trace Core Secret ${OPENBKN_TRACE_CORE_SECRET} contains an invalid base64 dsn"
+            return 1
+        }
+        database_segment="${external_dsn##*/}"
+        database_segment="${database_segment%%\?*}"
+        if [[ "${database_segment}" != "${OPENBKN_TRACE_DATABASE}" ]]; then
+            log_error "External BKN Trace DSN must target the fixed ${OPENBKN_TRACE_DATABASE} database; create that database before installation and update Secret ${OPENBKN_TRACE_CORE_SECRET}"
+            return 1
+        fi
+    elif [[ "${source_type}" == "internal" ]]; then
+        local host port user password dsn
+        host="$(config_yaml_dep_field rds host)"
+        port="$(config_yaml_dep_field rds port)"
+        user="$(config_yaml_dep_field rds user)"
+        password="$(config_yaml_dep_field rds password)"
+        port="${port:-3306}"
+        if [[ -z "${host}" || -z "${user}" || -z "${password}" ]]; then
+            log_error "BKN Trace cannot create its Core DSN: depServices.rds host, user and password are required"
+            return 1
+        fi
+        if [[ "${user}" == *":"* ]]; then
+            log_error "BKN Trace cannot create its Core DSN: internal RDS user must not contain ':'"
+            return 1
+        fi
+        dsn="${user}:${password}@tcp(${host}:${port})/${OPENBKN_TRACE_DATABASE}?charset=utf8mb4&parseTime=true&loc=UTC"
+        if ! printf '%s' "${dsn}" | kubectl create secret generic "${OPENBKN_TRACE_CORE_SECRET}" -n "${namespace}" \
+            --from-file=dsn=/dev/stdin --dry-run=client -o yaml | kubectl apply -f - >/dev/null; then
+            log_error "BKN Trace cannot update Core DSN Secret ${OPENBKN_TRACE_CORE_SECRET}"
+            return 1
+        fi
+    else
+        log_error "BKN Trace depServices.rds.source_type must be internal or external; got ${source_type}"
+        return 1
+    fi
+
+    _openbkn_prepare_trace_ingest_secret "${namespace}"
+}
+
 _secret_is_owned_by_release() {
     local secret_name="$1"
     local namespace="$2"
@@ -451,19 +575,19 @@ _openbkn_release_extra_sets() {
     CORE_RELEASE_EXTRA_SETS=()
     CORE_RELEASE_EXTRA_SET_STRINGS=()
     if [[ "${release_name}" == "agent-observability" ]]; then
-        CORE_RELEASE_EXTRA_SETS+=(
-            "evidence.ingestAuth.existingSecret=bkn-trace-evidence-ingest"
-            "evidence.ingestAuth.secretKey=token"
-        )
-        if ! kubectl get secret bkn-trace-evidence-ingest -n "${namespace}" >/dev/null 2>&1; then
+        _openbkn_trace_profile_sets "${release_name}"
+        if ! kubectl get secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" >/dev/null 2>&1; then
             CORE_RELEASE_EXTRA_SETS+=("evidence.ingestAuth.createSecret=true")
-        elif _secret_is_owned_by_release bkn-trace-evidence-ingest "${namespace}" "${release_name}"; then
-            # Keep a Secret already managed by this release in the rendered
-            # manifest; otherwise Helm treats the upgrade as a deletion.
+        elif _secret_is_owned_by_release "${OPENBKN_TRACE_INGEST_SECRET}" "${namespace}" "${release_name}"; then
             CORE_RELEASE_EXTRA_SETS+=("evidence.ingestAuth.createSecret=true")
         else
             CORE_RELEASE_EXTRA_SETS+=("evidence.ingestAuth.createSecret=false")
         fi
+    elif [[ "${release_name}" == "agent-retrieval" ]]; then
+        _openbkn_trace_profile_sets "${release_name}"
+        # This chart renders metadata.namespace from values; keep it aligned
+        # with Helm's target namespace so the private lifecycle policy matches.
+        CORE_RELEASE_EXTRA_SETS+=("namespace=${namespace}")
     elif [[ "${release_name}" == "bkn-safe" ]]; then
         local initial_pwd
         initial_pwd="$(config_yaml_top_field bknSafe initialPassword)"
@@ -668,8 +792,11 @@ _openbkn_apply_default_set_values() {
         local _reg_resolved
         _reg_resolved="$(_openbkn_resolve_registry "offline")"
         CORE_SET_VALUES+=("image.registry=${_reg_resolved}")
+        if ! get_set_value "evidence.indexManagement.createJob.image.registry" "${CORE_SET_VALUES[@]-}" >/dev/null 2>&1; then
+            CORE_SET_VALUES+=("evidence.indexManagement.createJob.image.registry=${_reg_resolved}")
+        fi
         log_info "Offline mode: Forcing image.registry=${_reg_resolved} via --set (overrides config.yaml)"
-    elif get_set_value "image.registry" "${CORE_SET_VALUES[@]}" >/dev/null 2>&1; then
+    elif get_set_value "image.registry" "${CORE_SET_VALUES[@]-}" >/dev/null 2>&1; then
         : # user passed --set image.registry=… explicitly; do not override
     elif [[ -n "${CORE_IMAGE_REGISTRY}" ]]; then
         local _reg_resolved
@@ -685,7 +812,7 @@ _openbkn_apply_default_set_values() {
         log_info "Image registry default applied: --set image.registry=${_reg_resolved} (override with --registry=ghcr or --set image.registry=...)."
     fi
 
-    if ! get_set_value "businessDomain.enabled" "${CORE_SET_VALUES[@]}" >/dev/null 2>&1; then
+    if ! get_set_value "businessDomain.enabled" "${CORE_SET_VALUES[@]-}" >/dev/null 2>&1; then
         CORE_SET_VALUES+=("businessDomain.enabled=false")
         log_info "Default applied: --set businessDomain.enabled=false (override with --set businessDomain.enabled=true)"
     fi
@@ -898,6 +1025,13 @@ install_openbkn() {
 
     local -a release_names=()
     bkn_mapfile_compat release_names _openbkn_release_names
+
+    if _openbkn_release_list_contains "agent-observability" "${release_names[@]}"; then
+        if ! _openbkn_prepare_trace_profile "${namespace}"; then
+            log_error "BKN Trace installation profile is not ready"
+            return 1
+        fi
+    fi
 
     local release_version
     for release_name in "${release_names[@]}"; do

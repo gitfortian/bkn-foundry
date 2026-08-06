@@ -83,9 +83,49 @@ func TestEvidenceHandlerFailsClosedWhenIngestTokenIsUnconfigured(t *testing.T) {
 	}
 }
 
+func TestInternalLifecycleIdentityRequiresInternalListenerNotSharedToken(t *testing.T) {
+	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{})
+	next := handler.RequireTrustedLifecycleIdentity(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	request := authenticatedQueryRequest(http.MethodPost, "/api/agent-observability/v1/conversations", nil)
+	request.Header.Set("x-tenant-id", "tenant_demo")
+	request.Header.Set("X-BKN-Trace-Query-Token", "legacy-shared-token")
+	request.Header.Set("X-BKN-Application-Principal-ID", "agent-retrieval")
+	request.Header.Set("X-BKN-Effective-Subject-Type", "user")
+	request.Header.Set("X-BKN-Effective-Subject-ID", "acct_demo")
+	recorder := httptest.NewRecorder()
+	next(recorder, request)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("public request with legacy shared token = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+
+	trusted := httptest.NewRecorder()
+	handler.InternalLifecycle(handler.RequireTrustedLifecycleIdentity(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))(trusted, request)
+	if trusted.Code != http.StatusNoContent {
+		t.Fatalf("internal lifecycle request = %d, want %d: %s", trusted.Code, http.StatusNoContent, trusted.Body.String())
+	}
+}
+
+func TestInternalLifecycleMarkerDoesNotBypassEvidenceIngestToken(t *testing.T) {
+	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{
+		IngestToken: "evidence-token",
+	})
+	request := httptest.NewRequest(http.MethodPost, "/api/agent-observability/v1/evidence/artifacts", strings.NewReader(validHandlerArtifact()))
+	response := httptest.NewRecorder()
+
+	handler.InternalLifecycle(handler.IngestEvidenceArtifact)(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("internal marker without evidence token = %d, want %d: %s", response.Code, http.StatusUnauthorized, response.Body.String())
+	}
+}
+
 func TestEvidenceHandlerDevelopmentBypassesDefaultToDisabled(t *testing.T) {
 	t.Setenv(evidenceIngestTokenEnv, "")
-	t.Setenv(evidenceQueryGatewayTokenEnv, "")
 	t.Setenv(evidenceAllowUnauthenticatedIngestEnv, "")
 	t.Setenv(evidenceAllowUnauthenticatedQueryEnv, "")
 	handler := NewEvidenceHandler(evidencesvc.New(evidencestore.New()))
@@ -224,9 +264,9 @@ func TestEvidenceHandlerAccessProfileFailsClosedWithoutScopeResolver(t *testing.
 	}
 }
 
-func TestEvidenceHandlerRejectsForgedIdentityWithoutGatewayToken(t *testing.T) {
+func TestEvidenceHandlerRejectsForgedIdentityWithoutOAuth(t *testing.T) {
 	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{
-		IngestToken: "producer-ingest-token", QueryGatewayToken: "gateway-query-token",
+		IngestToken: "producer-ingest-token",
 	})
 	req := authenticatedQueryRequest(http.MethodGet, "/api/agent-observability/v1/traces/missing/evidence-chain", nil)
 	req.Header.Set("X-BKN-Trace-Ingest-Token", "producer-ingest-token")
@@ -234,7 +274,7 @@ func TestEvidenceHandlerRejectsForgedIdentityWithoutGatewayToken(t *testing.T) {
 
 	handler.GetEvidenceChainByTraceID(rec, req)
 
-	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "QUERY_GATEWAY_AUTH_REQUIRED") {
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "QUERY_AUTH_NOT_CONFIGURED") {
 		t.Fatalf("producer token and forged identity must not authorize query, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
@@ -319,7 +359,7 @@ func TestTrustedQueryMiddlewareSharesIdentityAndCachesResolvedScope(t *testing.T
 	request.Header.Set("x-business-domain", "bd_demo")
 	response := httptest.NewRecorder()
 
-	next(response, request)
+	handler.InternalLifecycle(next)(response, request)
 
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("trusted OAuth query must reach the protected handler: %d %s", response.Code, response.Body.String())
@@ -356,7 +396,7 @@ func TestTrustedQueryMiddlewareInjectsDeploymentTenant(t *testing.T) {
 	request.Header.Set("x-business-domain", "bd_demo")
 	response := httptest.NewRecorder()
 
-	next(response, request)
+	handler.InternalLifecycle(next)(response, request)
 
 	if response.Code != http.StatusNoContent {
 		t.Fatalf("deployment tenant must complete the trusted scope: %d %s", response.Code, response.Body.String())
@@ -462,20 +502,19 @@ func TestLifecycleIdentityRejectsAnonymousQueryCompatibilityMode(t *testing.T) {
 func TestLifecycleIdentityRejectsIncompleteOwnerTupleAtGatewayBoundary(t *testing.T) {
 	handler := NewEvidenceHandlerWithSecurityConfig(
 		evidencesvc.New(evidencestore.New()),
-		EvidenceHandlerSecurityConfig{QueryGatewayToken: "trusted-gateway-token"},
+		EvidenceHandlerSecurityConfig{},
 	)
 	nextCalled := false
-	next := handler.RequireTrustedLifecycleIdentity(func(
+	next := handler.InternalLifecycle(handler.RequireTrustedLifecycleIdentity(func(
 		http.ResponseWriter, *http.Request,
 	) {
 		nextCalled = true
-	})
+	}))
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/agent-observability/v1/conversations:ensure-current",
 		nil,
 	)
-	request.Header.Set("X-BKN-Trace-Query-Token", "trusted-gateway-token")
 	request.Header.Set("x-account-id", "subject-1")
 	request.Header.Set("x-account-type", "service")
 	request.Header.Set("x-business-domain", "domain-1")
@@ -484,7 +523,8 @@ func TestLifecycleIdentityRejectsIncompleteOwnerTupleAtGatewayBoundary(t *testin
 
 	next(response, request)
 
-	if response.Code != http.StatusUnauthorized || nextCalled {
+	if response.Code != http.StatusUnauthorized || nextCalled ||
+		!strings.Contains(response.Body.String(), "complete lifecycle owner identity") {
 		t.Fatalf(
 			"incomplete owner tuple must be rejected at the gateway boundary: %d %s",
 			response.Code, response.Body.String(),
@@ -496,7 +536,6 @@ func TestLifecycleIdentityAcceptsTrustedGatewayProducerWithoutOAuthScope(t *test
 	resolver := &fakeAccessScopeResolver{err: io.ErrUnexpectedEOF}
 	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{
 		IngestToken:                "producer-ingest-token",
-		QueryGatewayToken:          "gateway-query-token",
 		AuthorizationScopeResolver: resolver,
 	})
 	nextCalled := false
@@ -515,7 +554,7 @@ func TestLifecycleIdentityAcceptsTrustedGatewayProducerWithoutOAuthScope(t *test
 	request.Header.Set("X-BKN-Effective-Subject-ID", "acct_e2e_demo")
 	response := httptest.NewRecorder()
 
-	next(response, request)
+	handler.InternalLifecycle(next)(response, request)
 
 	if response.Code != http.StatusNoContent || !nextCalled {
 		t.Fatalf("trusted gateway producer must bypass OAuth scope resolver: %d %s", response.Code, response.Body.String())
@@ -531,7 +570,6 @@ func TestQueryScopeWithGatewayTokenStillRunsResolverForReadPaths(t *testing.T) {
 		EffectiveSubjectID: "user-a", AccountActive: true, TenantActive: true,
 	}}
 	handler := NewEvidenceHandlerWithSecurityConfig(evidencesvc.New(evidencestore.New()), EvidenceHandlerSecurityConfig{
-		QueryGatewayToken:          "gateway-query-token",
 		AuthorizationScopeResolver: resolver,
 	})
 	request := authenticatedQueryRequest(http.MethodGet, "/api/agent-observability/v1/traces/by-request", nil)
@@ -559,7 +597,7 @@ func TestLifecycleIdentityTrustsGatewayOwnerWithoutReadAuthorizationLookup(t *te
 	handler := NewEvidenceHandlerWithSecurityConfig(
 		evidencesvc.New(evidencestore.New()),
 		EvidenceHandlerSecurityConfig{
-			QueryGatewayToken: "trusted-gateway-token", AuthorizationScopeResolver: resolver,
+			AuthorizationScopeResolver: resolver,
 		},
 	)
 	nextCalled := false
@@ -578,13 +616,13 @@ func TestLifecycleIdentityTrustsGatewayOwnerWithoutReadAuthorizationLookup(t *te
 	request.Header.Set("X-BKN-Effective-Subject-ID", "subject-1")
 	response := httptest.NewRecorder()
 
-	handler.RequireTrustedLifecycleIdentity(func(w http.ResponseWriter, r *http.Request) {
+	handler.InternalLifecycle(handler.RequireTrustedLifecycleIdentity(func(w http.ResponseWriter, r *http.Request) {
 		nextCalled = true
 		if _, ok := trustedQueryScopeFromContext(r.Context()); !ok {
 			t.Fatal("trusted lifecycle scope was not attached to the request")
 		}
 		w.WriteHeader(http.StatusNoContent)
-	})(response, request)
+	}))(response, request)
 
 	if response.Code != http.StatusNoContent || !nextCalled {
 		t.Fatalf("trusted gateway lifecycle write was rejected: %d %s", response.Code, response.Body.String())
