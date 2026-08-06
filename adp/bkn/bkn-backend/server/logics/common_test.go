@@ -114,3 +114,85 @@ func Test_BuildDslQuery(t *testing.T) {
 		})
 	})
 }
+
+func Test_VegaResourceIndexCaps(t *testing.T) {
+	Convey("Test VegaResourceIndexCaps\n", t, func() {
+		fulltextAndVector := &interfaces.Property{
+			Name: "material_name",
+			Type: "string",
+			Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.FieldFeatureType_Fulltext},
+				{FeatureType: interfaces.FieldFeatureType_Vector},
+			},
+		}
+		keywordOnly := &interfaces.Property{
+			Name: "material_number",
+			Type: "string",
+			Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.FieldFeatureType_Keyword},
+			},
+		}
+		plain := &interfaces.Property{Name: "qty", Type: "decimal"}
+
+		Convey("Nil resource returns nil\n", func() {
+			So(VegaResourceIndexCaps(nil), ShouldBeNil)
+		})
+
+		Convey("Resource without a local index returns nil even when features exist\n", func() {
+			res := &interfaces.VegaResource{
+				SchemaDefinition: []*interfaces.Property{fulltextAndVector},
+			}
+			So(VegaResourceIndexCaps(res), ShouldBeNil)
+		})
+
+		Convey("Indexed resource derives caps per field\n", func() {
+			res := &interfaces.VegaResource{
+				LocalIndexName:   "vega-build-res-task",
+				SchemaDefinition: []*interfaces.Property{fulltextAndVector, keywordOnly, plain, nil},
+			}
+
+			caps := VegaResourceIndexCaps(res)
+			So(len(caps), ShouldEqual, 2)
+			So(caps["material_name"].Fulltext, ShouldBeTrue)
+			So(caps["material_name"].Vector, ShouldBeTrue)
+			So(caps["material_name"].Keyword, ShouldBeFalse)
+			So(caps["material_number"].Keyword, ShouldBeTrue)
+			So(caps["material_number"].Fulltext, ShouldBeFalse)
+
+			// 没有任何 feature 的字段不进结果，取到的是零值
+			_, exists := caps["qty"]
+			So(exists, ShouldBeFalse)
+			So(caps["qty"].Fulltext, ShouldBeFalse)
+		})
+	})
+}
+
+func TestVegaResourceIndexCaps_RefPropertyRedirectsCapability(t *testing.T) {
+	res := &interfaces.VegaResource{
+		LocalIndexName: "vega-build-abc",
+		SchemaDefinition: []*interfaces.Property{
+			{
+				Name: "fulltext_summary",
+				Features: []interfaces.PropertyFeature{
+					{FeatureType: interfaces.FieldFeatureType_Fulltext, RefProperty: "summary"},
+				},
+			},
+			{
+				Name: "summary",
+				Features: []interfaces.PropertyFeature{
+					{FeatureType: interfaces.FieldFeatureType_Keyword},
+				},
+			},
+		},
+	}
+
+	caps := VegaResourceIndexCaps(res)
+
+	if _, exists := caps["fulltext_summary"]; exists {
+		t.Fatalf("capability must land on the referenced field, not the declaring property")
+	}
+	got := caps["summary"]
+	if !got.Fulltext || !got.Keyword {
+		t.Fatalf("summary should carry both the redirected fulltext and its own keyword, got %+v", got)
+	}
+}

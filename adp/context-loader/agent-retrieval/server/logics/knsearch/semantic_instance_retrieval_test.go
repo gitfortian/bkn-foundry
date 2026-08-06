@@ -210,7 +210,7 @@ func TestBuildSemanticSearchConditionStruct(t *testing.T) {
 	}
 	// 无可搜字段时返回 nil（与 Python 一致，无 "*" 回退）
 	objTypeEmpty := &interfaces.KnSearchObjectType{ConceptID: "ot1"}
-	condEmpty := svc.buildSemanticSearchConditionStruct("query", objTypeEmpty, config)
+	condEmpty := svc.buildSemanticSearchConditionStruct("query", findSemanticSearchableFields(objTypeEmpty), config)
 	if condEmpty != nil {
 		t.Errorf("Expected nil when no searchable fields (align with Python), got %v", condEmpty)
 	}
@@ -222,7 +222,7 @@ func TestBuildSemanticSearchConditionStruct(t *testing.T) {
 			{Name: "title", Type: "text", ConditionOperations: []interfaces.KnOperationType{interfaces.KnOperationTypeKnn, interfaces.KnOperationTypeMatch}},
 		},
 	}
-	cond := svc.buildSemanticSearchConditionStruct("query", objTypeWithProps, config)
+	cond := svc.buildSemanticSearchConditionStruct("query", findSemanticSearchableFields(objTypeWithProps), config)
 	if cond == nil {
 		t.Fatal("Expected non-nil condition when searchable fields present")
 	}
@@ -281,7 +281,7 @@ func TestScoreNodes(t *testing.T) {
 		{InstanceName: "Existing", Score: 0.9},  // Existing score
 	}
 
-	svc.scoreNodes("Target", nodes, config)
+	svc.scoreNodes("Target", nodes, nil, config)
 
 	if nodes[0].Score != 0.85 {
 		t.Errorf("Exact match score mismatch: %f", nodes[0].Score)
@@ -354,5 +354,43 @@ func DefaultRetrievalConfig() *interfaces.KnSearchRetrievalConfig {
 		ConceptRetrieval:          DefaultConceptRetrievalConfig(),
 		SemanticInstanceRetrieval: DefaultSemanticInstanceRetrievalConfig(),
 		PropertyFilter:            DefaultPropertyFilterConfig(),
+	}
+}
+
+// 字段只支持等值时拼不出子条件，必须返回 nil：空 OR 条件会被 ontology-query 判 400。
+func TestBuildSemanticSearchConditionStruct_ExactOnlyFieldsYieldNoCondition(t *testing.T) {
+	svc := &localSearchImpl{}
+	config := &interfaces.KnSearchSemanticInstanceRetrievalConfig{
+		MaxSemanticSubConditions: 5,
+		PerTypeInstanceLimit:     5,
+	}
+	searchable := []searchableField{
+		{Name: "player_id", HasExactMatch: true},
+		{Name: "team_id", HasExactMatch: true},
+	}
+
+	if cond := svc.buildSemanticSearchConditionStruct("Brazil", searchable, config); cond != nil {
+		t.Fatalf("expected nil condition for exact-only fields, got %+v", cond)
+	}
+}
+
+func TestBuildSemanticSearchConditionStruct_MatchFieldYieldsCondition(t *testing.T) {
+	svc := &localSearchImpl{}
+	config := &interfaces.KnSearchSemanticInstanceRetrievalConfig{
+		MaxSemanticSubConditions: 5,
+		PerTypeInstanceLimit:     5,
+	}
+	searchable := []searchableField{
+		{Name: "player_id", HasExactMatch: true},
+		{Name: "team_name", HasExactMatch: true, HasMatch: true},
+	}
+
+	cond := svc.buildSemanticSearchConditionStruct("Brazil", searchable, config)
+	if cond == nil || len(cond.SubConditions) != 1 {
+		t.Fatalf("expected exactly one match sub-condition, got %+v", cond)
+	}
+	if cond.SubConditions[0].Field != "team_name" ||
+		cond.SubConditions[0].Operation != interfaces.KnOperationTypeMatch {
+		t.Fatalf("unexpected sub-condition: %+v", cond.SubConditions[0])
 	}
 }
