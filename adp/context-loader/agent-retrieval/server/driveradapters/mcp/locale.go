@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 )
 
 const defaultMCPLocale = "zh-CN"
@@ -22,8 +23,24 @@ type mcpLocaleBundle struct {
 	schemaDescriptions map[string]map[string]string
 }
 
+// localeBundles memoises the parsed bundles.
+//
+// /mcp/info builds one per request, and each build re-reads and re-decodes
+// three embedded files. A bundle is immutable once constructed and the set of
+// locales is closed, so caching them is free of the usual staleness risk.
+var localeBundles sync.Map // normalised locale -> *mcpLocaleBundle
+
 func loadMCPLocaleBundle(locale string) *mcpLocaleBundle {
 	normalized := normalizeMCPLocale(locale)
+	if cached, ok := localeBundles.Load(normalized); ok {
+		return cached.(*mcpLocaleBundle)
+	}
+	bundle := buildMCPLocaleBundle(normalized)
+	localeBundles.Store(normalized, bundle)
+	return bundle
+}
+
+func buildMCPLocaleBundle(normalized string) *mcpLocaleBundle {
 	bundle := &mcpLocaleBundle{
 		locale:       normalized,
 		instructions: serverInstructions,
@@ -79,18 +96,61 @@ func (b *mcpLocaleBundle) ServerInstructions() string {
 	return b.instructions
 }
 
-func (b *mcpLocaleBundle) ToolMeta(toolKey string) (name, description string) {
-	if b.toolMeta != nil {
-		if meta, ok := b.toolMeta[toolKey]; ok {
-			return meta.Name, meta.Description
-		}
+// ToolMeta returns the tool's metadata for the bundle's locale.
+//
+// A locale file translates; it does not re-model. So the localized entry
+// overlays only the fields it actually carries and everything else falls back
+// to the base file — a translator who adds a title but no group must not drop
+// the tool out of its group, and Order is a layout decision that has no reason
+// to differ between languages at all.
+//
+// Name is deliberately not overlayable. It is the identifier a tools/call
+// carries, and a locale file that renamed it would give the same tool two
+// different names depending on the deployment's language — every client
+// integration written against one would break on the other. Before Title
+// existed a locale file could set it, which was the only way to localise how a
+// tool reads; now that Title is where display names live, that door closes.
+func (b *mcpLocaleBundle) ToolMeta(toolKey string) ToolMeta {
+	meta := loadToolMeta(toolKey)
+	if b.toolMeta == nil {
+		return meta
 	}
-	return loadToolMeta(toolKey)
+	localized, ok := b.toolMeta[toolKey]
+	if !ok {
+		return meta
+	}
+	if localized.Title != "" {
+		meta.Title = localized.Title
+	}
+	if localized.Group != "" {
+		meta.Group = localized.Group
+	}
+	if localized.GroupTitle != "" {
+		meta.GroupTitle = localized.GroupTitle
+	}
+	if localized.Order != 0 {
+		meta.Order = localized.Order
+	}
+	if localized.Description != "" {
+		meta.Description = localized.Description
+	}
+	return meta
 }
 
 func (b *mcpLocaleBundle) ToolSchemas(toolKey string) (input, output json.RawMessage) {
 	input, output = loadToolSchemas(toolKey)
-	if b.schemaDescriptions == nil {
+	return b.OverlaySchemas(toolKey, input, output)
+}
+
+// OverlaySchemas applies the locale's description overlay to schemas the caller
+// already has. Split out of ToolSchemas for /mcp/info, which loads its schemas
+// its own way (nil instead of a panic when a file is missing) but has to end up
+// with the same text tools/list serves.
+func (b *mcpLocaleBundle) OverlaySchemas(
+	toolKey string,
+	input, output json.RawMessage,
+) (json.RawMessage, json.RawMessage) {
+	if b == nil || b.schemaDescriptions == nil {
 		return input, output
 	}
 	replacements := b.schemaDescriptions[toolKey]

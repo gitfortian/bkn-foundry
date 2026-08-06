@@ -10,19 +10,47 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"sync"
 )
 
 //go:embed schemas/*.json schemas/locales/*/*.json schemas/locales/*/*.txt
 var schemasFS embed.FS
 
-// ToolMeta defines tool metadata (name, description).
+// ToolMeta defines tool metadata: the wire identity (name, description) plus
+// the presentation hints a UI needs to render a catalogue — a display name, a
+// group, and a position within it.
+//
+// Name is what a call carries and never changes for cosmetic reasons; Title is
+// free to. The two are separate fields in the MCP protocol itself since the
+// 2025-06-18 revision, and that is where Title is published. Group/GroupTitle/
+// Order have no protocol field, so they travel in the tool's `_meta` under an
+// openbkn.ai/ prefix — a client that does not know them ignores them, which is
+// what `_meta` is for.
 type ToolMeta struct {
 	Name        string `json:"name"`
-	Description string `json:"description"`
+	Title       string `json:"title,omitempty"`
+	Group       string `json:"group,omitempty"`
+	GroupTitle  string `json:"group_title,omitempty"`
+	Order       int    `json:"order,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
-// loadToolMeta loads tool metadata (name, description) from schemas/tools_meta.json.
-func loadToolMeta(toolKey string) (name, description string) {
+// loadToolMeta loads a tool's metadata from schemas/tools_meta.json.
+func loadToolMeta(toolKey string) ToolMeta {
+	t, ok := allToolMeta()[toolKey]
+	if !ok {
+		panic("tool meta not found: " + toolKey)
+	}
+	return t
+}
+
+// allToolMeta returns the decoded tools_meta.json.
+//
+// Decoded once: the file is embedded and immutable, while /mcp/info resolves
+// every tool's metadata on every request — without this, one request re-parses
+// the whole file once per tool. The returned map is shared, so callers must
+// treat it as read-only.
+var allToolMeta = sync.OnceValue(func() map[string]ToolMeta {
 	data, err := schemasFS.ReadFile("schemas/tools_meta.json")
 	if err != nil {
 		panic("cannot read tools_meta.json: " + err.Error())
@@ -31,12 +59,8 @@ func loadToolMeta(toolKey string) (name, description string) {
 	if err := json.Unmarshal(data, &meta); err != nil {
 		panic("invalid tools_meta.json: " + err.Error())
 	}
-	t, ok := meta[toolKey]
-	if !ok {
-		panic("tool meta not found: " + toolKey)
-	}
-	return t.Name, t.Description
-}
+	return meta
+})
 
 // toolSchemaFile defines the structure of a merged tool schema JSON file.
 type toolSchemaFile struct {
