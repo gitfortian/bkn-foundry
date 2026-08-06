@@ -230,7 +230,7 @@ jobs:
           if paths:
               shards.append({
                   "key": "contract",
-                  "label": "跨模块契约 / 配置与部署面 / 数据面",
+                  "label": "cross-module contracts / config & deployment / data plane",
                   "kind": "contract",
                   "files": "",
               })
@@ -249,6 +249,12 @@ jobs:
         env:
           SHARDS: ${{ steps.plan.outputs.shards }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # 转圈图标。自己存在仓里而不是复用 claude-code-action 那个 user-attachment：
+          # 那是别人项目的资产，删掉就成裂图。本仓是 public，raw 链接可被 GitHub 的
+          # 图片代理取到；私有仓则不行，届时要换成上传到 user-attachments。
+          # 分支取默认分支而不是写死 main：改名或迁移资产后这里会静默变成裂图，
+          # workflow 侧看不出任何异常，只有渲染出来的评论里才看得见。
+          SPINNER: ${{ github.server_url }}/${{ github.repository }}/raw/${{ github.event.repository.default_branch || 'main' }}/.github/assets/review-spinner.gif
         run: |
           set -euo pipefail
           MARKER='<!-- claude-review-progress -->'
@@ -256,13 +262,16 @@ jobs:
           import json, os
           shards = json.loads(os.environ["SHARDS"])
           lines = ["<!-- claude-review-progress -->",
-                   "### 评审进行中",
+                   '### <img src="%s" width="16" height="16" /> Review in progress'
+                   % os.environ["SPINNER"],
                    "",
-                   "按模块分 %d 片并行，逐片完成后统一给出一次结论。" % len(shards),
+                   "Running %d shards in parallel; a single verdict lands once "
+                   "they all report." % len(shards),
                    ""]
-          lines += ["- `%s`" % s["label"] for s in shards]
-          lines += ["", "[查看运行日志](%s)" % os.environ["RUN_URL"],
-                    "", "_结论落地后这条会自动消失。_"]
+          # 复选框由各分片跑完后回来打勾（review job 的 Tick progress 步骤）。
+          lines += ["- [ ] `%s`" % s["label"] for s in shards]
+          lines += ["", "[View run](%s)" % os.environ["RUN_URL"],
+                    "", "_This comment disappears once the verdict is posted._"]
           print("\n".join(lines))
           PY
           )
@@ -476,20 +485,15 @@ jobs:
 
             两件事，缺一不可：
 
-            **语言跟随 PR**：PR 标题与描述用哪种语言，评审就用哪种语言，inline comment
-            与 JSON 里的文字都一样。判据是 PR 本身，不是 diff 里的注释语言，也不是仓库的
-            默认语言——本仓多数 PR 是中文，但外部协作者提的 PR 用英文时，回中文等于让对方
-            读不懂自己的评审。混合语言时按标题与描述的主体语言走。代码标识符、错误信息、
-            命令、路径一律保持原样，不翻译。
+            **一律用英文**写 inline comment 与 findings JSON 里的所有文字，不论 PR
+            本身是什么语言——本仓的 PR 标题、正文与评审输出统一用英文。代码标识符、
+            错误信息、命令、路径保持原样。
 
-            **一、inline comment 只贴改进建议与待确认项**（贴到对应行，说明
-            「问题是什么 + 怎么改」），**不要贴阻塞项**。阻塞项一律只写进下面的 JSON，
-            经独立的 verify 环节复核后才会出现在 PR 上——本仓的评审历史上出现过一批
-            高危项事后核实几乎全是误报，未经复核就贴到行上，作者要为假问题付出真时间。
-            不复述 diff，不为凑数提格式化/命名类琐碎意见。
-
-            **二、写 `${{ github.workspace }}/findings/${{ matrix.shard.key }}.json`**（绝对路径），
-            严格用下面的结构：
+            **一、先写 `${{ github.workspace }}/findings/${{ matrix.shard.key }}.json`**
+            （绝对路径）。**这一步排在最前面是有意的**：它是你这片唯一会进入最终结论的
+            产出，inline comment 不进。实测出过分片贴完 inline 就收尾、没写这个文件的
+            情况，结果是整轮评审在 PR 上零反馈——比漏一条意见糟得多。所以：先落文件，
+            后贴 inline；结论有更新就重写一遍文件。严格用下面的结构：
 
             ```json
             {
@@ -503,14 +507,9 @@ jobs:
                  "evidence": ["comm-go/x/y.go:88-95 这几行里读到的、支撑这条结论的事实"]}
               ],
               "unconfirmed": [{"file": "...", "what": "待确认项，不阻断放行"}],
-              "not_covered": "本轮没来得及核的面，没有就写空串",
-              "lang": "zh"
+              "not_covered": "本轮没来得及核的面，没有就写空串"
             }
             ```
-
-            `lang` 填 `zh` 或 `en`，取你按上面规则判定的 PR 主体语言。verdict 的正文
-            骨架（各级标题）按它来选，不填则默认中文——正文骨架和你写的内容语言不一致
-            会读成两份东西。
 
             **blockers 的门槛**：你已经读过源码核实，能说清具体的失效场景，并且自评
             把握 ≥ 90 分。说不清、或失效场景里有任何一环没在代码里核实过，都不算阻塞
@@ -519,6 +518,12 @@ jobs:
             `evidence` 必填且必须是你**这一轮真读过的** file:line。写不出具体位置，
             说明这条是从 diff 表面推出来的，不是核实出来的——那它就不是阻塞项。
             复核环节会照着 evidence 去原地验，编造的位置一验就穿。
+
+            **二、inline comment 只贴改进建议与待确认项**（贴到对应行，说明「问题是什么
+            + 怎么改」），**不要贴阻塞项**。阻塞项一律只进上面的 JSON，经独立的 verify
+            环节复核后才会出现在 PR 上——本仓的评审历史上出现过一批高危项事后核实几乎
+            全是误报，未经复核就贴到行上，作者要为假问题付出真时间。不复述 diff，不为
+            凑数提格式化/命名类琐碎意见。
 
             **你不要调用 `gh pr review`。** 表态由 verdict 环节统一落一次；N 个分片各自
             表态会在 PR 上挂出 N 条互相打架的评审状态。你的 JSON 就是你的表态。
@@ -544,6 +549,93 @@ jobs:
 
       # if: always()——分片撞上限时 action 以失败退出，但它此前可能已经写了 JSON；
       # 更重要的是没写也要让 verdict 知道这片跑挂了（靠 artifact 缺失判定）。
+      # 分片跑完却没写 findings 的情况实测发生过（#671 首轮三片全没写，整轮零反馈）。
+      # 补一个占位，让 verdict 能把「跑了但没落结论」与「job 整个挂掉」区分开，也保证
+      # 至少有一个 artifact 存在。
+      - name: Backfill missing findings
+        if: always() && steps.prbranch.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # 不依赖 Prepare findings dir：那步是隐式 success()，前面任一步失败就会被跳过，
+          # 而本步是 always()——目录不存在时重定向会直接失败，安全网反而变成第二处报错。
+          mkdir -p findings
+          f="findings/${SHARD_KEY}.json"
+          if [ ! -s "$f" ]; then
+            echo "::warning::分片 ${SHARD_KEY} 未写出 findings，回填占位。"
+            printf '{"shard":"%s","status":"no_output","summary":"","impact":"","blockers":[],"unconfirmed":[],"not_covered":"Shard finished without writing a conclusion; its files were not reviewed."}\n' \
+              "${SHARD_KEY}" > "$f"
+          fi
+
+      # 每片跑完回来把自己那行打勾，让那条唯一的进度评论真的动起来。
+      # 粒度是「每片一次」，不是 track_progress 那种每步一更——后者在分片下会变成
+      # N 条评论各自转圈，把 PR 刷满。
+      # 并发写同一条评论：两片几乎同时结束时可能丢一次更新，纯显示问题，重试三次即可。
+      # continue-on-error：进度显示挂了不该影响评审产出。
+      - name: Tick progress
+        if: always() && steps.prbranch.outputs.skip != 'true'
+        continue-on-error: true
+        env:
+          # 这两个必须显式给：本文件没有 workflow 级 env，review job 的 env 里也没有，
+          # 只有 Prefetch 那步自带。缺了会在本步第一条语句就 KeyError，而
+          # continue-on-error 把它咽成绿色——本地手测时它们来自开发者自己的 shell，
+          # 这类缺失测不出来。
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHARD_LABEL: ${{ matrix.shard.label }}
+          SHARD_KEY: ${{ matrix.shard.key }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, time
+
+          MARKER = "<!-- claude-review-progress -->"
+          repo, pr = os.environ["GH_REPO"], os.environ["PR_NUMBER"]
+          label = os.environ["SHARD_LABEL"]
+
+          # 判据取 findings 文件本身，不取 job.status。`Claude review` 那步在缺凭据时是
+          # **被跳过**的，跳过不影响 job 绿——用 job.status 会让一次没人审过的运行把每
+          # 一片都打上勾，正是这一步要防的事。回填保证了文件必然存在。
+          try:
+              data = json.loads(
+                  (pathlib.Path("findings") / (os.environ["SHARD_KEY"] + ".json"))
+                  .read_text(encoding="utf-8"))
+              reviewed = isinstance(data, dict) and data.get("status") != "no_output"
+          except Exception:
+              reviewed = False
+
+          done = "- [x] `%s`" % label
+          if not reviewed:
+              done += " — no conclusion produced; these files were not reviewed"
+          todo = "- [ ] `%s`" % label
+
+          def gh(*args):
+              return subprocess.run(["gh", "api", *args], capture_output=True,
+                                    text=True, check=True).stdout
+
+          for attempt in range(3):
+              try:
+                  # `--paginate` 不带 `--jq` 会把每页各输出一个数组、首尾相接，不是合法
+                  # JSON（本文件在预取那处已经踩过并记下了这个坑）。`--jq '.[]'` 逐页
+                  # 展开成一行一个对象，跨页拼接后仍可逐行解析。
+                  raw = gh("repos/%s/issues/%s/comments" % (repo, pr),
+                           "--paginate", "--jq", ".[]")
+                  comments = [json.loads(l) for l in raw.splitlines() if l.strip()]
+                  target = next((c for c in reversed(comments)
+                                 if MARKER in (c.get("body") or "")), None)
+                  if target is None:
+                      break
+                  body = target["body"]
+                  if todo not in body:
+                      break
+                  gh("-X", "PATCH", "repos/%s/issues/comments/%s" % (repo, target["id"]),
+                     "-f", "body=" + body.replace(todo, done, 1))
+                  break
+              except (subprocess.CalledProcessError, ValueError):
+                  if attempt == 2:
+                      raise
+                  time.sleep(2)
+          PY
+
       - name: Upload findings
         if: always()
         uses: actions/upload-artifact@v4
@@ -706,7 +798,7 @@ jobs:
             {
               "verdicts": [
                 {"id": "adp-bkn#0", "refuted": true,
-                 "reason": "驳回或确认的理由，指明你读了哪个文件的哪几行"}
+                 "reason": "why it was refuted or confirmed, naming the file and lines you read"}
               ],
               "notes": "复核过程中顺带发现的、但不属于本次阻塞项的事情，可以为空串"
             }
@@ -715,8 +807,8 @@ jobs:
             `reason` 里必须出现你**这一轮真读过的** file:line。这是复核结论本身的
             evidence，写不出来的结论和它要驳回的东西是同一种毛病。
 
-            `reason` 的语言跟随 PR 标题与描述的主体语言——它会原样进 verdict 正文，
-            与分片给的文字并排显示，语言不一致会读成两份东西。
+            `reason` **一律用英文**。它会原样进 verdict 正文，夹在英文骨架
+            （`Refuted because:` 与折叠区标题）之间，写中文就又成了一份混排文档。
           claude_args: |
             --model claude-opus-5
             --effort xhigh
@@ -789,12 +881,22 @@ jobs:
           for s in shards:
               path = root / (s["key"] + ".json")
               if not path.exists():
-                  missing.append(s)
+                  missing.append((s, "absent"))
                   continue
+              # 防御要罩住整个循环体，不能只罩 json.loads：文件解析成顶层数组时
+              # data.get() 抛 AttributeError，同样会让 Assemble 非零退出。
               try:
                   data = json.loads(path.read_text(encoding="utf-8"))
-              except (ValueError, OSError):
-                  missing.append(s)
+                  if not isinstance(data, dict):
+                      raise ValueError("not an object")
+                  # 回填的占位不算「产出过结论」：否则全片静默失败会变成 approve 一个
+                  # 从没被审过的 PR——比不表态糟得多。
+                  status = data.get("status")
+              except (ValueError, OSError, AttributeError):
+                  missing.append((s, "malformed"))
+                  continue
+              if status == "no_output":
+                  missing.append((s, "no_output"))
                   continue
               done.append((s, data))
               # findings 是模型写的，属于不可信输入：JSON 合法但结构不对（元素是字符串
@@ -830,36 +932,23 @@ jobs:
               except (ValueError, OSError):
                   verdicts = {}
 
-          # 正文骨架跟着分片判定的 PR 语言走，否则「语言跟随 PR」只作用于模型写的字，
-          # 标题仍是硬编码中文，英文 PR 上会中英混排。多数派优先，平票落中文。
-          votes = {}
-          for _s, data in done:
-              lang = (data.get("lang") or "").strip().lower()
-              if lang in ("zh", "en"):
-                  votes[lang] = votes.get(lang, 0) + 1
-          lang = "en" if votes.get("en", 0) > votes.get("zh", 0) else "zh"
-          T = {
-              "zh": {"block": "阻塞项", "verified": "以下每一条都经过一轮独立复核（默认驳回，核实通过才保留）。",
-                     "unrev": "（**未复核**，复核环节未产出结论）", "scen": "失效场景：",
-                     "dropped": "复核未通过、已丢弃的 %d 条", "why": "驳回理由：",
-                     "byshard": "各分片结论", "impact": "影响范围：", "notcov": "未覆盖：",
-                     "unconf": "待确认项（不阻断放行）", "missing": "未覆盖的分片",
-                     "missing_body": "下面这些分片没有产出结论（撞轮次上限、超时或运行失败），**这些文件本轮未经评审**：",
-                     "trunc": "文件清单被截断",
-                     "trunc_body": "本 PR 共 %s 个改动文件，分片只拿到 %s 个（`gh pr view --json files` 单次上限 100），**其余 %d 个未进入任何分片、本轮未经评审**。",
-                     "footer": "改完请推新提交，或回复 `/review` 要一轮复评。",
-                     "footer_ok": "有异议或想再评一轮，请回复 `/review`——普通回帖不会触发复评，且回帖人需为本仓 OWNER/MEMBER/COLLABORATOR。"},
-              "en": {"block": "Blockers", "verified": "Each item below survived an independent verification pass (refuted by default; kept only when confirmed against the source).",
-                     "unrev": " (**unverified** — the verification stage produced no result)", "scen": "Failure scenario: ",
-                     "dropped": "%d item(s) dropped by verification", "why": "Refuted because: ",
-                     "byshard": "Per-shard findings", "impact": "Blast radius: ", "notcov": "Not covered: ",
-                     "unconf": "Open questions (non-blocking)", "missing": "Shards with no result",
-                     "missing_body": "These shards produced no findings (turn limit, timeout, or job failure) — **their files were not reviewed this round**:",
-                     "trunc": "File list truncated",
-                     "trunc_body": "This PR changes %s files but only %s reached the planner (`gh pr view --json files` caps at 100) — **the remaining %d were not assigned to any shard and were not reviewed**.",
-                     "footer": "Push a new commit when addressed, or reply `/review` for another round.",
-                     "footer_ok": "Disagree, or want another pass? Reply `/review` — a plain comment does not trigger one, and the replier must be an OWNER/MEMBER/COLLABORATOR of this repo."},
-          }[lang]
+          # 所有面向 PR 的文字一律英文（PR 标题/正文/评审输出的既定口径）。此前这里
+          # 按分片投票在 zh/en 之间切换，结果是英文 PR 上仍会混进中文骨架与中文分片名。
+          T = {"block": "Blockers",
+               "verified": "Each item below survived an independent verification pass (refuted by default; kept only when confirmed against the source).",
+               "unrev": " (**unverified** — the verification stage produced no result)",
+               "scen": "Failure scenario: ",
+               "dropped": "%d item(s) dropped by verification", "why": "Refuted because: ",
+               "byshard": "Per-shard findings", "impact": "Blast radius: ", "notcov": "Not covered: ",
+               "unconf": "Open questions (non-blocking)", "missing": "Shards with no result",
+               "missing_body": "These shards produced no findings — **their files were not reviewed this round**:",
+               "reason_no_output": "ran, but wrote no conclusion (most likely the turn limit, or it wrapped up early)",
+               "reason_absent": "never ran, or died partway through",
+               "reason_malformed": "wrote a conclusion file that could not be parsed",
+               "trunc": "File list truncated",
+               "trunc_body": "This PR changes %s files but only %s reached the planner (`gh pr view --json files` caps at 100) — **the remaining %d were not assigned to any shard and were not reviewed**.",
+               "footer": "Push a new commit when addressed, or reply `/review` for another round.",
+               "footer_ok": "Disagree, or want another pass? Reply `/review` — a plain comment does not trigger one, and the replier must be an OWNER/MEMBER/COLLABORATOR of this repo."}
 
           survived, refuted, unreviewed = [], [], []
           for s_, b in blockers:
@@ -920,8 +1009,10 @@ jobs:
           if missing:
               lines.append("## %s\n" % T["missing"])
               lines.append(T["missing_body"] + "\n")
-              for s in missing:
-                  lines.append("- %s" % s["label"])
+              # 两种原因指向完全不同的修法（轮次预算 vs job 失败），所以要分开写，
+              # 不能都渲染成一行「未覆盖」。
+              for s, reason in missing:
+                  lines.append("- %s — %s" % (s["label"], T["reason_" + reason]))
               lines.append("")
 
           dropped = int(os.environ.get("FILE_TOTAL") or 0) - int(os.environ.get("FILE_LISTED") or 0)
@@ -945,6 +1036,7 @@ jobs:
       # 合进去的东西有阻塞项。job if 里的 state == 'open' 是在事件到达时求值的，拦不住
       # 跑到一半才发生的合并，只能在落地前再查一次。
       - name: Post review
+        id: post
         if: steps.assemble.outputs.action != 'none'
         run: |
           set -euo pipefail
@@ -974,7 +1066,44 @@ jobs:
               gh api -X DELETE "repos/${GH_REPO}/issues/comments/${id}" >/dev/null
             done
 
-      - name: Warn when nothing was produced
-        if: steps.assemble.outputs.action == 'none'
+      # 静默是最坏的结果：PR 上什么都没有，与「压根没触发」无法区分——#671 首轮就是
+      # 这样被当成没触发的。这里不落评审状态（没审过就不该 request-changes，也不该
+      # approve），但必须留一条普通评论说明这轮空转了。
+      # 这一轮真落了表态，就把上一轮的空转通告删掉——否则作者会在第 4 轮的结论旁边
+      # 读到第 3 轮的「本轮评审空转」。
+      - name: Clear stale empty-round notice
+        if: steps.post.outcome == 'success'
+        continue-on-error: true
         run: |
-          echo "::warning::所有分片均无产出，未落评审表态。检查 CLAUDE_CODE_OAUTH_TOKEN 与各分片日志。"
+          set -euo pipefail
+          MARKER='<!-- claude-review-empty -->'
+          gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\")) | .id] | .[]" \
+          | while read -r id; do
+              gh api -X DELETE "repos/${GH_REPO}/issues/comments/${id}" >/dev/null
+            done
+
+      # 判据取 Post review 的**实际结果**，不取 Assemble 的意图：Assemble 崩掉时
+      # output 没写出来、Post review 被跳过；gh pr review 自己失败时意图是 approve
+      # 但 PR 上什么都没有。两种都必须通告，否则进度评论被删、原地不留任何东西。
+      - name: Report empty round
+        if: always() && steps.post.outcome != 'success'
+        continue-on-error: true
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "::warning::本轮未落评审表态。"
+          state=$(gh pr view "$PR_NUMBER" --json state --jq .state)
+          [ "$state" = "OPEN" ] || exit 0
+          MARKER='<!-- claude-review-empty -->'
+          body=$(printf '%s\n### Review round produced nothing\n\nNo shard produced a conclusion, so **these changes were not reviewed this round**. No verdict was recorded because there is nothing to vote on — neither `request-changes` nor `approve` would be honest.\n\nUsual causes: a shard hit the turn limit, the model never wrote its conclusion file, the assembly step failed, or the credential is missing. [View run](%s)\n\nReply `/review` to ask for another round. This notice disappears as soon as a round lands a verdict.' "$MARKER" "$RUN_URL")
+          # 复用同一条：synchronize 每次推送跑一轮，凭据缺失这类持续故障否则会在 PR 上
+          # 堆出一串一模一样的通告，正是进度评论当初特意避开的噪声。
+          existing=$(gh api "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\")) | .id] | last // empty")
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/${GH_REPO}/issues/comments/${existing}" -f body="$body" >/dev/null
+          else
+            gh api -X POST "repos/${GH_REPO}/issues/${PR_NUMBER}/comments" -f body="$body" >/dev/null
+          fi
