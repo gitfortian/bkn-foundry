@@ -144,6 +144,7 @@ jobs:
       pr_number: ${{ steps.meta.outputs.pr_number }}
       shards: ${{ steps.plan.outputs.shards }}
       has_shards: ${{ steps.plan.outputs.has_shards }}
+      prior_rounds: ${{ steps.plan.outputs.prior_rounds }}
       file_total: ${{ steps.plan.outputs.file_total }}
       file_listed: ${{ steps.plan.outputs.file_listed }}
     env:
@@ -287,6 +288,14 @@ jobs:
 
           print("shards=" + json.dumps(shards, ensure_ascii=False))
           print("has_shards=" + ("true" if shards else "false"))
+          # 已有过几轮结论。分片与 verdict 共用这一个数来收紧配额，免得各自从评论历史
+          # 里推断「这是第几轮」还推出不同结果。
+          prior = subprocess.run(
+              ["gh", "api", "repos/%s/pulls/%s/reviews" % (os.environ["GH_REPO"], pr),
+               "--paginate", "--jq", '[.[] | select((.body // "") != "")] | length'],
+              capture_output=True, text=True)
+          print("prior_rounds=%s"
+                % ((prior.stdout.split() or ["0"])[0] if prior.returncode == 0 else "0"))
           print("file_total=%d" % total)
           print("file_listed=%d" % len(paths))
           PY
@@ -418,8 +427,14 @@ jobs:
             echo ',"review_comments":'
             fetch "pulls/${PR_NUMBER}/comments" \
               '{path, line, user: .user.login, created_at, body}' || echo '[]'
+            # 上一轮的结论正文在 /pulls/N/reviews，与 inline 评论是两个端点。待确认项
+            # 只存在于正文里，不取就等于每轮从零开始——实测 #683 连续三轮各报十条互不
+            # 重叠的待确认项，正是因为看不见自己上一轮说过什么。
+            echo ',"prior_verdicts":'
+            fetch "pulls/${PR_NUMBER}/reviews" \
+              '{user: .user.login, state, submitted_at, body}' || echo '[]'
             echo '}'
-          } > prior-comments.json || echo '{"issue_comments":[],"review_comments":[]}' \
+          } > prior-comments.json || echo '{"issue_comments":[],"review_comments":[],"prior_verdicts":[]}' \
             > prior-comments.json
 
       - name: Claude review
@@ -512,11 +527,18 @@ jobs:
             - 先读回上一轮的评论：已经预取到 `${{ github.workspace }}/prior-comments.json`（绝对
               路径），直接读文件，不要自己去调 API。里面两个来源都有：`issue_comments`
               是顶层评论——作者的处理说明（哪条采纳、哪条不采纳）多半发在这里，
-              `review_comments` 是 inline 评论及其回复。inline 那部分只看落在你这片
-              文件上的；顶层那部分全看。
+              `review_comments` 是 inline 评论及其回复，`prior_verdicts` 是此前每一轮
+              的结论正文——**待确认项只出现在那里**，不读就会把上一轮说过的话换个说法
+              再说一遍。inline 那部分只看落在你这片文件上的；顶层与结论正文全看。
             - **作者明确表示不采纳的建议，记一次就够，本轮不要再列**——包括写进
               unconfirmed。他已经做过判断，再列一遍只是在告诉他你没读他的回复。只有
               出现新证据推翻他的理由时才重提，并在 what 里说清新证据是什么。
+            - **待确认项必须收敛。** 只要 `prior_verdicts` 非空（即此前已有过结论），
+              这一轮的 unconfirmed **每片至多 1 条，且只能是本轮新增提交引入的问题**。
+              此前任何一轮结论正文里出现过的，无论作者有没有处理，都不再提。
+              「换个角度再说一遍同一个文件」也算重提。
+              评审的目标是让 PR 能走，不是每轮都证明自己还能找出东西——一份挑不完
+              毛病的清单，作者第三轮就不看了。
             - 已经提过的问题，作者改了、或给出对得上疑点的解释，就算过。不必追求措辞
               完美，更不要凭「可能」把同一条追问第二遍。
             - 上面的触发式深挖只在首轮做；复评的范围限定在上一轮之后新增的提交与文件。
@@ -540,6 +562,13 @@ jobs:
 
             **一律用中文**写 inline comment 与 findings JSON 里的所有文字。代码标识符、
             错误信息、命令、路径保持原样，不翻译。
+
+            **inline comment 的配额**：此前已有 ${{ needs.plan.outputs.prior_rounds }}
+            轮结论。为 0 时本片最多贴 3 条；不为 0 时最多 1 条，且只针对本轮新增提交。
+            每条 inline 都是一次通知和一个要人去关掉的会话，堆在 Files 视图里不会自己
+            消失——实测出现过 31 个文件的 PR 一轮贴 15 条、1 个文件的 PR 贴 5 条。
+            同一个问题**不要既贴 inline 又写进 unconfirmed**：位置明确、作者照着改就行
+            的贴 inline；需要他判断的写 unconfirmed。
 
             **一、先写 `${{ github.workspace }}/findings/${{ matrix.shard.key }}.json`**
             （绝对路径）。**这一步排在最前面是有意的**：它是你这片唯一会进入最终结论的
@@ -957,6 +986,7 @@ jobs:
     env:
       PR_NUMBER: ${{ needs.plan.outputs.pr_number }}
       SHARDS: ${{ needs.plan.outputs.shards }}
+      PRIOR_ROUNDS: ${{ needs.plan.outputs.prior_rounds }}
       FILE_TOTAL: ${{ needs.plan.outputs.file_total }}
       FILE_LISTED: ${{ needs.plan.outputs.file_listed }}
       GH_TOKEN: ${{ github.token }}
@@ -991,12 +1021,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, pathlib
+          import collections, json, os, pathlib, subprocess
 
+          repo, pr = os.environ["GH_REPO"], os.environ["PR_NUMBER"]
           shards = json.loads(os.environ["SHARDS"])
           root = pathlib.Path("findings")
-
-          import collections
 
           done, missing, blockers, unconfirmed, lines = [], [], [], [], []
           for s in shards:
@@ -1143,7 +1172,15 @@ jobs:
               lines += detail
               lines.append("</details>\n")
 
-          # 每片至多 3 条，且整体封顶——各片各写各的，不封顶就会线性膨胀。
+          # 复评轮的配额要衰减。待确认项不阻断、成本低，模型每轮都会把配额填满，于是
+          # 「每轮十条互不重叠的新问题」可以无限持续——实测 #683 连续三轮如此，而后两轮
+          # 本身已经是 approve。收敛规则写进了 prompt，但那靠自觉，这里再挡一道。
+          # 轮次由 plan 一次算好传下来，分片与这里共用同一个数，避免两处各查一次、
+          # 也避免它们对「这是第几轮」得出不同结论。
+          prior_rounds = int(os.environ.get("PRIOR_ROUNDS") or 0)
+          per_shard_cap, total_cap = (1, 2) if prior_rounds else (2, 6)
+
+          # 首轮每片至多 2 条、总共 6 条；复评轮收到 1 条 / 2 条。
           if unconfirmed:
               lines.append("## %s\n" % T["unconf"])
               # 轮转取，不是先到先得：contract 片固定排在最后，先到先得会让多模块 PR
@@ -1152,9 +1189,9 @@ jobs:
               for s, u in unconfirmed:
                   by_shard.setdefault(s["key"], []).append((s, u))
               shown = 0
-              for rnd in range(2):
+              for rnd in range(per_shard_cap):
                   for k, items in by_shard.items():
-                      if len(items) <= rnd or shown >= 6:
+                      if len(items) <= rnd or shown >= total_cap:
                           continue
                       s, u = items[rnd]
                       shown += 1
