@@ -1,5 +1,4 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
 // Licensed under the Apache License, Version 2.0.
 // See the LICENSE file in the project root for details.
@@ -11,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os/exec"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -24,7 +24,6 @@ import (
 	verrors "vega-backend/errors"
 	"vega-backend/interfaces"
 	mock_interfaces "vega-backend/interfaces/mock"
-	"vega-backend/logics/connector/factory"
 	opensearchconnector "vega-backend/logics/connector/local/index/opensearch"
 	"vega-backend/logics/query/querypolicy"
 	"vega-backend/logics/query/sqlglot"
@@ -48,8 +47,9 @@ type deadlineInspectingPolicy struct {
 }
 
 type recordingPolicy struct {
-	dialects    []string
-	resourceIDs []string
+	dialects        []string
+	derivedDialects []string
+	resourceIDs     []string
 }
 
 func (p *recordingPolicy) ExtractTableResourceIDs(context.Context, string, string) ([]string, error) {
@@ -58,6 +58,11 @@ func (p *recordingPolicy) ExtractTableResourceIDs(context.Context, string, strin
 
 func (p *recordingPolicy) ValidateSQL(_ context.Context, _ string, dialect string) error {
 	p.dialects = append(p.dialects, dialect)
+	return nil
+}
+
+func (p *recordingPolicy) ValidateDerivedTable(_ context.Context, _ string, dialect string) error {
+	p.derivedDialects = append(p.derivedDialects, dialect)
 	return nil
 }
 
@@ -70,6 +75,11 @@ func (p *recordingPolicy) ValidateTableReferences(context.Context, string, strin
 }
 
 func (p *deadlineInspectingPolicy) ValidateSQL(ctx context.Context, _ string, _ string) error {
+	_, p.sawDeadline = ctx.Deadline()
+	return errors.New("stop after inspecting policy context")
+}
+
+func (p *deadlineInspectingPolicy) ValidateDerivedTable(ctx context.Context, _ string, _ string) error {
 	_, p.sawDeadline = ctx.Deadline()
 	return errors.New("stop after inspecting policy context")
 }
@@ -97,6 +107,75 @@ func TestRawQueryServiceExecute(t *testing.T) {
 		})
 		assertCatalogDisabledError(t, err)
 	})
+	rejectedTSQLTests := []struct {
+		name              string
+		sql               string
+		hasTableReference bool
+		needTotal         bool
+	}{
+		{name: "exec", sql: "EXEC('SELECT * FROM {{resource-1}}')"},
+		{name: "select into", sql: "SELECT * INTO archived_orders FROM {{resource-1}}", hasTableReference: true},
+		{name: "ddl", sql: "DROP TABLE {{resource-1}}", hasTableReference: true},
+		{name: "dml", sql: "UPDATE {{resource-1}} SET status = 'closed'", hasTableReference: true},
+		{name: "multiple statements", sql: "SELECT * FROM {{resource-1}}; DELETE FROM {{resource-1}}", hasTableReference: true},
+		{name: "top with ties", sql: "SELECT TOP (10) WITH TIES id FROM {{resource-1}} ORDER BY score", hasTableReference: true},
+		{name: "top percent", sql: "SELECT TOP (10) PERCENT id FROM {{resource-1}} ORDER BY score", hasTableReference: true},
+		{name: "for json", sql: "SELECT id FROM {{resource-1}} ORDER BY id FOR JSON PATH", hasTableReference: true},
+		{name: "for xml", sql: "SELECT id FROM {{resource-1}} FOR XML PATH", hasTableReference: true},
+		{name: "next sequence value", sql: "SELECT NEXT VALUE FOR dbo.order_seq OVER (ORDER BY id), id FROM {{resource-1}} ORDER BY id", hasTableReference: true},
+		{name: "offset fetch", sql: "SELECT id FROM {{resource-1}} ORDER BY id OFFSET 10 ROWS FETCH NEXT 20 ROWS ONLY", hasTableReference: true},
+		{name: "table lock hint", sql: "SELECT id FROM {{resource-1}} WITH (TABLOCKX)", hasTableReference: true},
+		{name: "non-literal top", sql: "SELECT TOP (5 + 5) id FROM {{resource-1}} ORDER BY id", hasTableReference: true},
+		{name: "unnamed aggregate with total", sql: "SELECT COUNT(*) FROM {{resource-1}}", hasTableReference: true, needTotal: true},
+	}
+	for _, test := range rejectedTSQLTests {
+		t.Run("rejects tsql before connector creation: "+test.name, func(t *testing.T) {
+			requireRawQuerySQLGlotRuntime(t)
+
+			ctrl := gomock.NewController(t)
+			var connectorCreations atomic.Int64
+			connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+			connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), gomock.Any(), gomock.Any()).
+				DoAndReturn(func(context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
+					connectorCreations.Add(1)
+					return nil, errors.New("connector must not be created")
+				}).AnyTimes()
+
+			previousPolicy := rawQueryPolicy
+			rawQueryPolicy = querypolicy.NewSQLGlotAdapter()
+			t.Cleanup(func() { rawQueryPolicy = previousPolicy })
+
+			catalogService := mock_interfaces.NewMockCatalogService(ctrl)
+			resourceService := mock_interfaces.NewMockResourceService(ctrl)
+			svc := &rawQueryService{cs: catalogService, rs: resourceService, cf: connectorFactory}
+			if test.hasTableReference {
+				resource := &interfaces.Resource{
+					ID:               "resource-1",
+					CatalogID:        "catalog-1",
+					SourceIdentifier: "dbo.orders",
+					Status:           interfaces.ResourceStatusActive,
+				}
+				resourceService.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).
+					Return([]*interfaces.Resource{resource}, nil)
+				catalogService.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{
+					ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeSQLServer,
+				}, nil)
+				resourceService.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil).Times(2)
+			}
+
+			result, err := svc.Execute(context.Background(), &interfaces.RawQueryRequest{
+				Query:        test.sql,
+				QueryFormat:  interfaces.QueryFormatSQL,
+				InputDialect: "tsql",
+				Paging:       interfaces.PagingRequest{Mode: interfaces.PagingModeSingle, Limit: 10},
+				NeedTotal:    test.needTotal,
+			})
+
+			assertHTTPError(t, err, http.StatusBadRequest)
+			assert.Nil(t, result)
+			assert.Zero(t, connectorCreations.Load())
+		})
+	}
 }
 
 func assertCatalogDisabledError(t *testing.T, err error) {
@@ -110,45 +189,55 @@ func assertCatalogDisabledError(t *testing.T, err error) {
 }
 
 func TestRawQueryValidationError(t *testing.T) {
-	err := rawQueryValidationError(context.Background(), &querypolicy.ReadOnlySQLValidationError{
-		Reason: "READ_ONLY_SQL_REJECTED: invalid SQL SELECT * FROM accounts WHERE password = 'secret'",
+	t.Run("sanitizes read-only validation errors", func(t *testing.T) {
+		err := rawQueryValidationError(context.Background(), &querypolicy.ReadOnlySQLValidationError{
+			Reason: "READ_ONLY_SQL_REJECTED: invalid SQL SELECT * FROM accounts WHERE password = 'secret'",
+		})
+
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Equal(t, verrors.VegaBackend_Query_InvalidParameter, httpErr.BaseError.ErrorCode)
+		assert.NotContains(t, httpErr.Error(), "secret")
 	})
-
-	var httpErr *rest.HTTPError
-	require.ErrorAs(t, err, &httpErr)
-	assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-	assert.Equal(t, verrors.VegaBackend_Query_InvalidParameter, httpErr.BaseError.ErrorCode)
-	assert.NotContains(t, httpErr.Error(), "secret")
-
-	assert.NoError(t, rawQueryValidationError(context.Background(), errors.New("unexpected error")))
+	t.Run("ignores unrelated errors", func(t *testing.T) {
+		assert.NoError(t, rawQueryValidationError(context.Background(), errors.New("unexpected error")))
+	})
 }
 
 func TestRawQueryTotalCount(t *testing.T) {
-	count, err := rawQueryTotalCount(&interfaces.RawQueryResponse{
-		Entries: []map[string]any{{rawQueryTotalCountColumn: int64(42)}},
+	t.Run("returns total count", func(t *testing.T) {
+		count, err := rawQueryTotalCount(&interfaces.RawQueryResponse{
+			Entries: []map[string]any{{rawQueryTotalCountColumn: int64(42)}},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, int64(42), count)
 	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(42), count)
-
-	_, err = rawQueryTotalCount(&interfaces.RawQueryResponse{Entries: []map[string]any{{rawQueryTotalCountColumn: "invalid"}}})
-	require.Error(t, err)
+	t.Run("rejects invalid total count", func(t *testing.T) {
+		_, err := rawQueryTotalCount(&interfaces.RawQueryResponse{
+			Entries: []map[string]any{{rawQueryTotalCountColumn: "invalid"}},
+		})
+		require.Error(t, err)
+	})
 }
 
-func TestWithExecutedResourceIDsCarriesInternalEvidenceBindings(t *testing.T) {
-	result := &interfaces.RawQueryResponse{
-		Entries: []map[string]any{{"order_id": "PO-2024-001"}},
-	}
-	resourceIDs := []string{"res_purchase_order", "res_supplier"}
+func TestWithExecutedResourceIDs(t *testing.T) {
+	t.Run("copies internal resource IDs without serializing them", func(t *testing.T) {
+		result := &interfaces.RawQueryResponse{
+			Entries: []map[string]any{{"order_id": "PO-2024-001"}},
+		}
+		resourceIDs := []string{"res_purchase_order", "res_supplier"}
 
-	got := withExecutedResourceIDs(result, resourceIDs)
-	resourceIDs[0] = "mutated"
+		got := withExecutedResourceIDs(result, resourceIDs)
+		resourceIDs[0] = "mutated"
 
-	require.Same(t, result, got)
-	assert.Equal(t, []string{"res_purchase_order", "res_supplier"}, got.ResourceIDs)
-	raw, err := json.Marshal(got)
-	require.NoError(t, err)
-	assert.NotContains(t, string(raw), "ResourceIDs")
-	assert.NotContains(t, string(raw), "res_purchase_order")
+		require.Same(t, result, got)
+		assert.Equal(t, []string{"res_purchase_order", "res_supplier"}, got.ResourceIDs)
+		raw, err := json.Marshal(got)
+		require.NoError(t, err)
+		assert.NotContains(t, string(raw), "ResourceIDs")
+		assert.NotContains(t, string(raw), "res_purchase_order")
+	})
 }
 
 func TestRawQueryServiceValidateRequest(t *testing.T) {
@@ -213,42 +302,30 @@ func TestRawQueryServiceValidateRequest(t *testing.T) {
 			require.NoError(t, svc.validateRequest(context.Background(), tt.req))
 		})
 	}
-}
+	t.Run("rejects incompatible input dialect", func(t *testing.T) {
+		svc := &rawQueryService{}
+		err := svc.validateRequest(context.Background(), &interfaces.RawQueryRequest{
+			Query:        "select 1",
+			QueryFormat:  interfaces.QueryFormatSQL,
+			InputDialect: "opensearch",
+		})
 
-func TestRawQueryServiceValidateRequestNewContract(t *testing.T) {
-	svc := &rawQueryService{}
-	err := svc.validateRequest(context.Background(), &interfaces.RawQueryRequest{
-		Query:        "select 1",
-		QueryFormat:  interfaces.QueryFormatSQL,
-		InputDialect: "opensearch",
+		assertHTTPError(t, err, http.StatusBadRequest)
 	})
-
-	assertHTTPError(t, err, http.StatusBadRequest)
 }
 
-func TestExtractResourceIDsSupportsHyphenatedIDs(t *testing.T) {
-	previousPolicy := rawQueryPolicy
-	rawQueryPolicy = &recordingPolicy{resourceIDs: []string{"orders-2026", "customer_data"}}
-	t.Cleanup(func() { rawQueryPolicy = previousPolicy })
-
-	ids, err := (&rawQueryService{}).extractResourceIDs(context.Background(), "SELECT * FROM {{orders-2026}} JOIN {{.customer_data}} ON true", "postgres")
-
-	require.NoError(t, err)
-	assert.Equal(t, []string{"orders-2026", "customer_data"}, ids)
-}
-
-func TestPrepareSQLQueryRejectsResourcePlaceholderOutsideTableReference(t *testing.T) {
-	svc := &rawQueryService{}
-	previousPolicy := rawQueryPolicy
-	rawQueryPolicy = &recordingPolicy{}
-	t.Cleanup(func() { rawQueryPolicy = previousPolicy })
-
+func TestRawQueryServicePrepareSQLQuery(t *testing.T) {
 	for _, sql := range []string{
 		"SELECT * FROM public.orders /* {{resource-1}} */",
 		"SELECT * FROM public.orders -- {{resource-1}}\n",
 		"SELECT '{{resource-1}}' FROM public.orders",
 	} {
-		t.Run(sql, func(t *testing.T) {
+		t.Run("rejects placeholder outside table reference: "+sql, func(t *testing.T) {
+			svc := &rawQueryService{}
+			previousPolicy := rawQueryPolicy
+			rawQueryPolicy = &recordingPolicy{}
+			t.Cleanup(func() { rawQueryPolicy = previousPolicy })
+
 			_, err := svc.prepareSQLQuery(context.Background(), &interfaces.RawQueryRequest{
 				Query:        sql,
 				QueryFormat:  interfaces.QueryFormatSQL,
@@ -260,239 +337,341 @@ func TestPrepareSQLQueryRejectsResourcePlaceholderOutsideTableReference(t *testi
 			assert.Equal(t, "at least one resource_id is required for SQL queries", httpErr.BaseError.ErrorDetails)
 		})
 	}
-}
+	t.Run("revalidates transpiled SQL", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockRS := mock_interfaces.NewMockResourceService(ctrl)
+		svc := &rawQueryService{cs: mockCS, rs: mockRS}
+		resource := &interfaces.Resource{
+			ID:               "resource-1",
+			CatalogID:        "catalog-1",
+			SourceIdentifier: "orders",
+			Status:           interfaces.ResourceStatusActive,
+		}
+		mockRS.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{resource}, nil)
+		mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil).AnyTimes()
+		mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{
+			ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeMySQL,
+		}, nil)
 
-func TestReplacePlaceholderInSQLCodePreservesCommentsAndLiterals(t *testing.T) {
-	got := replacePlaceholderInSQLCode(
-		"SELECT '{{resource-1}}' FROM {{resource-1}} /* {{resource-1}} */ -- {{resource-1}}\n",
-		"{{resource-1}}", "public.orders", "postgres",
-	)
-	assert.Equal(t, "SELECT '{{resource-1}}' FROM public.orders /* {{resource-1}} */ -- {{resource-1}}\n", got)
-}
+		policy := &recordingPolicy{resourceIDs: []string{"resource-1"}}
+		previousPolicy := rawQueryPolicy
+		rawQueryPolicy = policy
+		t.Cleanup(func() { rawQueryPolicy = previousPolicy })
+		patches := gomonkey.ApplyFunc(sqlglot.TranspileSQL,
+			func(context.Context, string, string, string) (*sqlglot.SQLParseResult, error) {
+				return &sqlglot.SQLParseResult{SQL: "SELECT * FROM `orders`"}, nil
+			})
+		defer patches.Reset()
 
-func TestReplacePlaceholderInSQLCodeHonorsMySQLBackslashEscapes(t *testing.T) {
-	got := replacePlaceholderInSQLCode(
-		"SELECT 'it\\'s {{resource-1}}' FROM {{resource-1}}",
-		"{{resource-1}}", "public.orders", "mysql",
-	)
-	assert.Equal(t, "SELECT 'it\\'s {{resource-1}}' FROM public.orders", got)
-}
-
-func TestQueryExecutionContextAppliesTimeout(t *testing.T) {
-	ctx, cancel := queryExecutionContext(context.Background(), 1)
-	defer cancel()
-	_, ok := ctx.Deadline()
-	assert.True(t, ok)
-
-	ctx, cancel = queryExecutionContext(context.Background(), 0)
-	defer cancel()
-	_, ok = ctx.Deadline()
-	assert.False(t, ok)
-}
-
-func TestInitialSQLQueryAppliesTimeoutBeforePolicyValidation(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-	mockRS := mock_interfaces.NewMockResourceService(ctrl)
-	svc := &rawQueryService{cs: mockCS, rs: mockRS}
-	resource := &interfaces.Resource{
-		ID:               "resource-1",
-		CatalogID:        "catalog-1",
-		SourceIdentifier: "public.orders",
-		Status:           interfaces.ResourceStatusActive,
-	}
-	mockRS.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{resource}, nil)
-	mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{
-		ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypePostgreSQL,
-	}, nil)
-	mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil).Times(2)
-
-	policy := &deadlineInspectingPolicy{}
-	previousPolicy := rawQueryPolicy
-	rawQueryPolicy = policy
-	t.Cleanup(func() { rawQueryPolicy = previousPolicy })
-
-	_, err := svc.executeInitialSQLQuery(context.Background(), &interfaces.RawQueryRequest{
-		Query:           "SELECT * FROM {{resource-1}}",
-		QueryFormat:     interfaces.QueryFormatSQL,
-		QueryTimeoutSec: 1,
-		Paging:          interfaces.PagingRequest{Limit: 1},
+		prepared, err := svc.prepareSQLQuery(context.Background(), &interfaces.RawQueryRequest{
+			Query:        "SELECT * FROM {{resource-1}}",
+			QueryFormat:  interfaces.QueryFormatSQL,
+			InputDialect: "trino",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, "SELECT * FROM `orders`", prepared.sql)
+		assert.Equal(t, []string{"trino"}, policy.dialects)
+		assert.Equal(t, []string{"mysql"}, policy.derivedDialects)
 	})
-	require.Error(t, err)
-	assert.True(t, policy.sawDeadline)
+}
+
+func TestReplacePlaceholderInSQLCode(t *testing.T) {
+	t.Run("preserves comments and literals", func(t *testing.T) {
+		got := replacePlaceholderInSQLCode(
+			"SELECT '{{resource-1}}' FROM {{resource-1}} /* {{resource-1}} */ -- {{resource-1}}\n",
+			"{{resource-1}}", "public.orders", "postgres",
+		)
+		assert.Equal(t, "SELECT '{{resource-1}}' FROM public.orders /* {{resource-1}} */ -- {{resource-1}}\n", got)
+	})
+
+	t.Run("honors mysql backslash escapes", func(t *testing.T) {
+		got := replacePlaceholderInSQLCode(
+			"SELECT 'it\\'s {{resource-1}}' FROM {{resource-1}}",
+			"{{resource-1}}", "public.orders", "mysql",
+		)
+		assert.Equal(t, "SELECT 'it\\'s {{resource-1}}' FROM public.orders", got)
+	})
+}
+
+func TestQueryExecutionContext(t *testing.T) {
+	t.Run("sets deadline for positive timeout", func(t *testing.T) {
+		ctx, cancel := queryExecutionContext(context.Background(), 1)
+		defer cancel()
+		_, ok := ctx.Deadline()
+		assert.True(t, ok)
+	})
+	t.Run("does not set deadline for zero timeout", func(t *testing.T) {
+		ctx, cancel := queryExecutionContext(context.Background(), 0)
+		defer cancel()
+		_, ok := ctx.Deadline()
+		assert.False(t, ok)
+	})
+}
+
+func TestRawQueryServiceExecuteInitialSQLQuery(t *testing.T) {
+	t.Run("propagates query timeout to validation", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockRS := mock_interfaces.NewMockResourceService(ctrl)
+		svc := &rawQueryService{cs: mockCS, rs: mockRS}
+		resource := &interfaces.Resource{
+			ID:               "resource-1",
+			CatalogID:        "catalog-1",
+			SourceIdentifier: "public.orders",
+			Status:           interfaces.ResourceStatusActive,
+		}
+		mockRS.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{resource}, nil)
+		mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{
+			ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypePostgreSQL,
+		}, nil)
+		mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil).Times(2)
+
+		policy := &deadlineInspectingPolicy{}
+		previousPolicy := rawQueryPolicy
+		rawQueryPolicy = policy
+		t.Cleanup(func() { rawQueryPolicy = previousPolicy })
+
+		_, err := svc.executeInitialSQLQuery(context.Background(), &interfaces.RawQueryRequest{
+			Query:           "SELECT * FROM {{resource-1}}",
+			QueryFormat:     interfaces.QueryFormatSQL,
+			QueryTimeoutSec: 1,
+			Paging:          interfaces.PagingRequest{Limit: 1},
+		})
+		require.Error(t, err)
+		assert.True(t, policy.sawDeadline)
+	})
 }
 
 func TestValidateCursorResourceBinding(t *testing.T) {
-	previousManager := rawQueryCursorSessions
-	rawQueryCursorSessions = newCursorSessionManager(10)
-	t.Cleanup(func() { rawQueryCursorSessions = previousManager })
-	rawSession, err := rawQueryCursorSessions.create("account-1", "catalog-1", nil, "SELECT 1", 1, 60, 60)
-	require.NoError(t, err)
-	err = validateCursorResourceBinding(context.Background(), rawSession, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-1"})
-	var httpErr *rest.HTTPError
-	require.ErrorAs(t, err, &httpErr)
-	assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
-	require.NoError(t, validateCursorResourceBinding(context.Background(), rawSession, &interfaces.RawQueryRequest{}))
+	t.Run("validates resource identity and update time", func(t *testing.T) {
+		previousManager := rawQueryCursorSessions
+		rawQueryCursorSessions = newCursorSessionManager(10)
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+		rawSession, err := rawQueryCursorSessions.create("account-1", "catalog-1", nil, "SELECT 1", 1, 60, 60)
+		require.NoError(t, err)
+		err = validateCursorResourceBinding(context.Background(), rawSession, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-1"})
+		var httpErr *rest.HTTPError
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+		require.NoError(t, validateCursorResourceBinding(context.Background(), rawSession, &interfaces.RawQueryRequest{}))
 
-	session, err := rawQueryCursorSessions.create("account-1", "catalog-1", nil, "SELECT 1", 1, 60, 60)
-	require.NoError(t, err)
-	bindCursorResource(session, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-1", ResourceDataUpdateTime: 10})
+		session, err := rawQueryCursorSessions.create("account-1", "catalog-1", nil, "SELECT 1", 1, 60, 60)
+		require.NoError(t, err)
+		bindCursorResource(session, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-1", ResourceDataUpdateTime: 10})
 
-	err = validateCursorResourceBinding(context.Background(), session, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-2", ResourceDataUpdateTime: 10})
-	require.ErrorAs(t, err, &httpErr)
-	assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
-	_, exists := rawQueryCursorSessions.acquire(session.ID)
-	assert.True(t, exists)
-	if exists {
-		rawQueryCursorSessions.release(session)
-	}
+		err = validateCursorResourceBinding(context.Background(), session, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-2", ResourceDataUpdateTime: 10})
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+		_, exists := rawQueryCursorSessions.acquire(session.ID)
+		assert.True(t, exists)
+		if exists {
+			rawQueryCursorSessions.release(session)
+		}
 
-	err = validateCursorResourceBinding(context.Background(), session, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-1", ResourceDataUpdateTime: 11})
-	require.ErrorAs(t, err, &httpErr)
-	assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
-	_, exists = rawQueryCursorSessions.acquire(session.ID)
-	assert.False(t, exists)
+		err = validateCursorResourceBinding(context.Background(), session, &interfaces.RawQueryRequest{ResourceDataResourceID: "logic-1", ResourceDataUpdateTime: 11})
+		require.ErrorAs(t, err, &httpErr)
+		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
+		_, exists = rawQueryCursorSessions.acquire(session.ID)
+		assert.False(t, exists)
+	})
 }
 
-func TestPrepareSQLQueryRevalidatesTranspiledSQL(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-	mockRS := mock_interfaces.NewMockResourceService(ctrl)
-	svc := &rawQueryService{cs: mockCS, rs: mockRS}
-	resource := &interfaces.Resource{
-		ID:               "resource-1",
-		CatalogID:        "catalog-1",
-		SourceIdentifier: "orders",
-		Status:           interfaces.ResourceStatusActive,
+func requireRawQuerySQLGlotRuntime(t *testing.T) {
+	t.Helper()
+	if err := exec.Command("python3", "-c",
+		"import sqlglot; assert callable(getattr(sqlglot, 'parse_one', None))").Run(); err != nil {
+		t.Skip("sqlglot Python runtime is not installed")
 	}
-	mockRS.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{resource}, nil)
-	mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").Return(resource, nil).AnyTimes()
-	mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(&interfaces.Catalog{
-		ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeMySQL,
-	}, nil)
-
-	policy := &recordingPolicy{resourceIDs: []string{"resource-1"}}
-	previousPolicy := rawQueryPolicy
-	rawQueryPolicy = policy
-	t.Cleanup(func() { rawQueryPolicy = previousPolicy })
-	patches := gomonkey.ApplyFunc(sqlglot.TranspileSQL,
-		func(context.Context, string, string, string) (*sqlglot.SQLParseResult, error) {
-			return &sqlglot.SQLParseResult{SQL: "SELECT * FROM `orders`"}, nil
-		})
-	defer patches.Reset()
-
-	prepared, err := svc.prepareSQLQuery(context.Background(), &interfaces.RawQueryRequest{
-		Query:        "SELECT * FROM {{resource-1}}",
-		QueryFormat:  interfaces.QueryFormatSQL,
-		InputDialect: "trino",
-	})
-	require.NoError(t, err)
-	assert.Equal(t, "SELECT * FROM `orders`", prepared.sql)
-	assert.Equal(t, []string{"trino", "mysql"}, policy.dialects)
 }
 
-func TestExecuteInitialDSLQueryControlsTrackTotalHits(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
-	expectIndexConnectorClose(indexConnector)
-	mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-	mockRS := mock_interfaces.NewMockResourceService(ctrl)
-	svc := &rawQueryService{cs: mockCS, rs: mockRS}
+func TestRawQueryServiceExecuteSQL(t *testing.T) {
+	t.Run("single page uses connector paging wrapper", func(t *testing.T) {
+		catalog := rawQuerySQLServerCatalog()
+		ctrl := gomock.NewController(t)
+		connector := mock_interfaces.NewMockTableConnector(ctrl)
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), catalog.ConnectorType, catalog.ConnectorCfg).
+			Return(connector, nil)
+		svc := &rawQueryService{cf: connectorFactory}
+		connector.EXPECT().Close(gomock.Any()).Return(nil)
+		connector.EXPECT().BuildPagedSQL("SELECT id FROM dbo.orders", 20, 10).Return("TSQL SINGLE PAGE")
+		connector.EXPECT().ExecuteRawSQL(gomock.Any(), "TSQL SINGLE PAGE").Return(&interfaces.RawQueryResponse{
+			Entries: []map[string]any{{"id": 1}},
+		}, nil)
 
-	mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").DoAndReturn(
-		func(ctx context.Context, _ string) (*interfaces.Resource, error) {
-			_, hasDeadline := ctx.Deadline()
-			assert.True(t, hasDeadline)
-			return &interfaces.Resource{
-				ID:               "resource-1",
-				CatalogID:        "catalog-1",
-				SourceIdentifier: "events",
-			}, nil
-		}).Times(4)
-	mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).DoAndReturn(
-		func(ctx context.Context, _ string, _ bool) (*interfaces.Catalog, error) {
-			_, hasDeadline := ctx.Deadline()
-			assert.True(t, hasDeadline)
-			return &interfaces.Catalog{
-				ID:            "catalog-1",
-				Enabled:       true,
-				ConnectorType: interfaces.ConnectorTypeOpenSearch,
-			}, nil
-		}).Times(4)
+		result, err := svc.executeSQL(context.Background(), catalog,
+			"SELECT id FROM dbo.orders", interfaces.PagingModeSingle, &rawSQLBuildOptions{offset: 20, limit: 10})
 
-	patches := gomonkey.ApplyFunc(factory.GetFactory, func() *factory.ConnectorFactory {
-		return &factory.ConnectorFactory{}
+		require.NoError(t, err)
+		assert.Equal(t, []map[string]any{{"id": 1}}, result.Entries)
 	})
-	patches.ApplyMethod(&factory.ConnectorFactory{}, "CreateConnectorInstance",
-		func(*factory.ConnectorFactory, context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
-			return indexConnector, nil
+}
+
+func TestRawQueryServiceExecuteSQLCursorPage(t *testing.T) {
+	t.Run("cursor page requests one lookahead row", func(t *testing.T) {
+		catalog := rawQuerySQLServerCatalog()
+		previousManager := rawQueryCursorSessions
+		rawQueryCursorSessions = newCursorSessionManager(10)
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+		session, err := rawQueryCursorSessions.create("account-1", catalog.ID, []string{"resource-1"},
+			"SELECT id FROM dbo.orders", 2, 60, 0)
+		require.NoError(t, err)
+		session.Offset = 4
+
+		ctrl := gomock.NewController(t)
+		connector := mock_interfaces.NewMockTableConnector(ctrl)
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), catalog.ConnectorType, catalog.ConnectorCfg).
+			Return(connector, nil)
+		svc := &rawQueryService{cf: connectorFactory}
+		connector.EXPECT().Close(gomock.Any()).Return(nil)
+		connector.EXPECT().BuildPagedSQL("SELECT id FROM dbo.orders", 4, 3).Return("TSQL CURSOR PAGE")
+		connector.EXPECT().ExecuteRawSQL(gomock.Any(), "TSQL CURSOR PAGE").Return(&interfaces.RawQueryResponse{
+			Entries: []map[string]any{{"id": 5}, {"id": 6}, {"id": 7}},
+		}, nil)
+
+		result, err := svc.executeSQLCursorPage(context.Background(), session, catalog, nil)
+
+		require.NoError(t, err)
+		assert.Equal(t, []map[string]any{{"id": 5}, {"id": 6}}, result.Entries)
+		require.NotNil(t, result.Paging)
+		assert.NotNil(t, result.Paging.NextCursor)
+		assert.Equal(t, 6, session.Offset)
+	})
+}
+
+func TestRawQueryServiceExecuteSQLTotalCount(t *testing.T) {
+	t.Run("total count is not paged", func(t *testing.T) {
+		catalog := rawQuerySQLServerCatalog()
+		ctrl := gomock.NewController(t)
+		connector := mock_interfaces.NewMockTableConnector(ctrl)
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), catalog.ConnectorType, catalog.ConnectorCfg).
+			Return(connector, nil)
+		svc := &rawQueryService{cf: connectorFactory}
+		connector.EXPECT().Close(gomock.Any()).Return(nil)
+		connector.EXPECT().BuildCountSQL("SELECT id FROM dbo.orders").Return(
+			"SELECT COUNT(*) AS _raw_query_total_count FROM (SELECT id FROM dbo.orders) AS _raw_query_total")
+		connector.EXPECT().ExecuteRawSQL(gomock.Any(),
+			"SELECT COUNT(*) AS _raw_query_total_count FROM (SELECT id FROM dbo.orders) AS _raw_query_total").
+			Return(&interfaces.RawQueryResponse{
+				Entries: []map[string]any{{rawQueryTotalCountColumn: int64(42)}},
+			}, nil)
+
+		count, err := svc.executeSQLTotalCount(context.Background(), catalog, "SELECT id FROM dbo.orders")
+
+		require.NoError(t, err)
+		assert.Equal(t, int64(42), count)
+	})
+}
+
+func rawQuerySQLServerCatalog() *interfaces.Catalog {
+	return &interfaces.Catalog{
+		ID: "catalog-1", Name: "sqlserver-catalog", ConnectorType: interfaces.ConnectorTypeSQLServer,
+	}
+}
+
+func TestRawQueryServiceExecuteInitialDSLQuery(t *testing.T) {
+	t.Run("applies timeout totals and aggregation paging", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
+		expectIndexConnectorClose(indexConnector)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockRS := mock_interfaces.NewMockResourceService(ctrl)
+		svc := &rawQueryService{cs: mockCS, rs: mockRS}
+
+		mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").DoAndReturn(
+			func(ctx context.Context, _ string) (*interfaces.Resource, error) {
+				_, hasDeadline := ctx.Deadline()
+				assert.True(t, hasDeadline)
+				return &interfaces.Resource{
+					ID:               "resource-1",
+					CatalogID:        "catalog-1",
+					SourceIdentifier: "events",
+				}, nil
+			}).Times(4)
+		mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).DoAndReturn(
+			func(ctx context.Context, _ string, _ bool) (*interfaces.Catalog, error) {
+				_, hasDeadline := ctx.Deadline()
+				assert.True(t, hasDeadline)
+				return &interfaces.Catalog{
+					ID:            "catalog-1",
+					Enabled:       true,
+					ConnectorType: interfaces.ConnectorTypeOpenSearch,
+				}, nil
+			}).Times(4)
+
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeOpenSearch, gomock.Any()).
+			Return(indexConnector, nil).Times(4)
+		svc.cf = connectorFactory
+
+		callCount := 0
+		indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
+			DoAndReturn(func(ctx context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
+				callCount++
+				_, ok := ctx.Deadline()
+				assert.True(t, ok)
+				if callCount == 1 {
+					assert.NotContains(t, query, "track_total_hits")
+				} else if callCount == 2 {
+					assert.Equal(t, true, query["track_total_hits"])
+				} else {
+					assert.Equal(t, 0, query["size"])
+					assert.NotContains(t, query, "from")
+				}
+				if callCount == 3 {
+					return &interfaces.RawQueryResponse{Entries: []map[string]any{{"id": 1}, {"id": 2}, {"id": 3}}}, nil
+				}
+				if callCount == 4 {
+					return nil, &opensearchconnector.RawAggregationValidationError{Path: "aggs", Reason: "exactly one aggregation is required"}
+				}
+				return &interfaces.RawQueryResponse{}, nil
+			}).Times(4)
+
+		_, err := svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
+			Query:           map[string]any{"resource_id": "resource-1", "track_total_hits": true},
+			QueryTimeoutSec: 1,
+			Paging:          interfaces.PagingRequest{Limit: 10},
 		})
-	defer patches.Reset()
+		require.NoError(t, err)
 
-	callCount := 0
-	indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
-		DoAndReturn(func(ctx context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
-			callCount++
-			_, ok := ctx.Deadline()
-			assert.True(t, ok)
-			if callCount == 1 {
-				assert.NotContains(t, query, "track_total_hits")
-			} else if callCount == 2 {
-				assert.Equal(t, true, query["track_total_hits"])
-			} else {
-				assert.Equal(t, 0, query["size"])
-				assert.NotContains(t, query, "from")
-			}
-			if callCount == 3 {
-				return &interfaces.RawQueryResponse{Entries: []map[string]any{{"id": 1}, {"id": 2}, {"id": 3}}}, nil
-			}
-			if callCount == 4 {
-				return nil, &opensearchconnector.RawAggregationValidationError{Path: "aggs", Reason: "exactly one aggregation is required"}
-			}
-			return &interfaces.RawQueryResponse{}, nil
-		}).Times(4)
+		_, err = svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
+			Query:           map[string]any{"resource_id": "resource-1", "track_total_hits": false},
+			QueryTimeoutSec: 1,
+			NeedTotal:       true,
+			Paging:          interfaces.PagingRequest{Limit: 10},
+		})
+		require.NoError(t, err)
 
-	_, err := svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
-		Query:           map[string]any{"resource_id": "resource-1", "track_total_hits": true},
-		QueryTimeoutSec: 1,
-		Paging:          interfaces.PagingRequest{Limit: 10},
-	})
-	require.NoError(t, err)
-
-	_, err = svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
-		Query:           map[string]any{"resource_id": "resource-1", "track_total_hits": false},
-		QueryTimeoutSec: 1,
-		NeedTotal:       true,
-		Paging:          interfaces.PagingRequest{Limit: 10},
-	})
-	require.NoError(t, err)
-
-	result, err := svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
-		Query: map[string]any{
-			"resource_id": "resource-1",
-			"aggs":        map[string]any{"by_status": map[string]any{"terms": map[string]any{"field": "status"}}},
-		},
-		QueryTimeoutSec: 1,
-		Paging:          interfaces.PagingRequest{Limit: 1, Offset: 1},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, []map[string]any{{"id": 2}}, result.Entries)
-
-	_, err = svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
-		Query: map[string]any{
-			"resource_id": "resource-1",
-			"aggs": map[string]any{
-				"by_status": map[string]any{"terms": map[string]any{"field": "status"}},
-				"by_type":   map[string]any{"terms": map[string]any{"field": "type"}},
+		result, err := svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
+			Query: map[string]any{
+				"resource_id": "resource-1",
+				"aggs":        map[string]any{"by_status": map[string]any{"terms": map[string]any{"field": "status"}}},
 			},
-		},
-		QueryTimeoutSec: 1,
-		Paging:          interfaces.PagingRequest{Limit: 2},
+			QueryTimeoutSec: 1,
+			Paging:          interfaces.PagingRequest{Limit: 1, Offset: 1},
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []map[string]any{{"id": 2}}, result.Entries)
+
+		_, err = svc.executeInitialDSLQuery(context.Background(), &interfaces.RawQueryRequest{
+			Query: map[string]any{
+				"resource_id": "resource-1",
+				"aggs": map[string]any{
+					"by_status": map[string]any{"terms": map[string]any{"field": "status"}},
+					"by_type":   map[string]any{"terms": map[string]any{"field": "type"}},
+				},
+			},
+			QueryTimeoutSec: 1,
+			Paging:          interfaces.PagingRequest{Limit: 2},
+		})
+		assertHTTPError(t, err, http.StatusBadRequest)
 	})
-	assertHTTPError(t, err, http.StatusBadRequest)
 }
 
-func TestPrepareOpenSearchCursorQuery(t *testing.T) {
+func TestRawQueryServicePrepareOpenSearchCursorQuery(t *testing.T) {
 	t.Run("requires a stable sort", func(t *testing.T) {
 		svc := &rawQueryService{}
 		_, _, _, _, err := svc.prepareOpenSearchCursorQuery(context.Background(), &interfaces.RawQueryRequest{
@@ -552,267 +731,257 @@ func TestPrepareOpenSearchCursorQuery(t *testing.T) {
 	})
 }
 
-func TestInitialOpenSearchCursorRespectsInitialOffsetForLastPage(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
-	expectIndexConnectorClose(indexConnector)
-	mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-	mockRS := mock_interfaces.NewMockResourceService(ctrl)
-	svc := &rawQueryService{cs: mockCS, rs: mockRS}
+func TestRawQueryServiceExecuteInitialOpenSearchCursor(t *testing.T) {
+	t.Run("closes cursor when initial page reaches total", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
+		expectIndexConnectorClose(indexConnector)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockRS := mock_interfaces.NewMockResourceService(ctrl)
+		svc := &rawQueryService{cs: mockCS, rs: mockRS}
 
-	mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").DoAndReturn(
-		func(ctx context.Context, _ string) (*interfaces.Resource, error) {
-			_, hasDeadline := ctx.Deadline()
-			assert.True(t, hasDeadline)
-			return &interfaces.Resource{
-				ID:               "resource-1",
-				CatalogID:        "catalog-1",
-				SourceIdentifier: "events",
-			}, nil
-		})
-	mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).DoAndReturn(
-		func(ctx context.Context, _ string, _ bool) (*interfaces.Catalog, error) {
-			_, hasDeadline := ctx.Deadline()
-			assert.True(t, hasDeadline)
-			return &interfaces.Catalog{
-				ID:            "catalog-1",
-				Enabled:       true,
-				ConnectorType: interfaces.ConnectorTypeOpenSearch,
-			}, nil
-		})
-
-	patches := gomonkey.ApplyFunc(factory.GetFactory, func() *factory.ConnectorFactory {
-		return &factory.ConnectorFactory{}
-	})
-	patches.ApplyMethod(&factory.ConnectorFactory{}, "CreateConnectorInstance",
-		func(*factory.ConnectorFactory, context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
-			return indexConnector, nil
-		})
-	defer patches.Reset()
-
-	indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
-			assert.Equal(t, 90, query["from"])
-			return &interfaces.RawQueryResponse{
-				Entries:     []map[string]any{{"id": "91"}, {"id": "92"}},
-				SearchAfter: []any{"page-92"},
-				TotalCount:  int64Pointer(92),
-			}, nil
-		})
-
-	result, err := svc.executeInitialOpenSearchCursor(context.Background(), &interfaces.RawQueryRequest{
-		Query: map[string]any{
-			"resource_id": "resource-1",
-			"sort":        []any{"timestamp"},
-		},
-		NeedTotal:       true,
-		QueryTimeoutSec: 1,
-		Paging:          interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Offset: 90, Limit: 2},
-	})
-
-	require.NoError(t, err)
-	assert.Nil(t, result.Paging.NextCursor)
-	require.NotNil(t, result.TotalCount)
-	assert.Equal(t, int64(92), *result.TotalCount)
-}
-
-func TestExecuteOpenSearchCursorPage(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
-	indexConnector.EXPECT().Close(gomock.Any()).Return(nil).Times(2)
-	manager := newCursorSessionManager(10)
-	previousManager := rawQueryCursorSessions
-	rawQueryCursorSessions = manager
-	t.Cleanup(func() { rawQueryCursorSessions = previousManager })
-
-	session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 2, 60, 0)
-	require.NoError(t, err)
-	session.QueryFormat = interfaces.QueryFormatDSL
-	session.OpenSearchIndex = "events"
-	session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "from": 10, "size": 2, "track_total_hits": true}
-	session.NeedTotal = true
-
-	patches := gomonkey.ApplyFunc(factory.GetFactory, func() *factory.ConnectorFactory {
-		return &factory.ConnectorFactory{}
-	})
-	patches.ApplyMethod(&factory.ConnectorFactory{}, "CreateConnectorInstance",
-		func(*factory.ConnectorFactory, context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
-			return indexConnector, nil
-		})
-	defer patches.Reset()
-
-	callCount := 0
-	indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
-			callCount++
-			if callCount == 1 {
-				assert.Equal(t, 10, query["from"])
-				assert.NotContains(t, query, "search_after")
-				assert.Equal(t, true, query["track_total_hits"])
-				return &interfaces.RawQueryResponse{
-					Entries:     []map[string]any{{"id": "1"}, {"id": "2"}},
-					SearchAfter: []any{"page-1"},
-					TotalCount:  int64Pointer(3),
+		mockRS.EXPECT().GetByID(gomock.Any(), "resource-1").DoAndReturn(
+			func(ctx context.Context, _ string) (*interfaces.Resource, error) {
+				_, hasDeadline := ctx.Deadline()
+				assert.True(t, hasDeadline)
+				return &interfaces.Resource{
+					ID:               "resource-1",
+					CatalogID:        "catalog-1",
+					SourceIdentifier: "events",
 				}, nil
-			}
-			assert.NotContains(t, query, "from")
-			assert.NotContains(t, query, "track_total_hits")
-			assert.Equal(t, []any{"page-1"}, query["search_after"])
-			return &interfaces.RawQueryResponse{Entries: []map[string]any{{"id": "3"}}, TotalCount: int64Pointer(99)}, nil
-		}).Times(2)
+			})
+		mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).DoAndReturn(
+			func(ctx context.Context, _ string, _ bool) (*interfaces.Catalog, error) {
+				_, hasDeadline := ctx.Deadline()
+				assert.True(t, hasDeadline)
+				return &interfaces.Catalog{
+					ID:            "catalog-1",
+					Enabled:       true,
+					ConnectorType: interfaces.ConnectorTypeOpenSearch,
+				}, nil
+			})
 
-	svc := &rawQueryService{}
-	catalog := &interfaces.Catalog{ID: "catalog-1", ConnectorType: interfaces.ConnectorTypeOpenSearch}
-	first, err := svc.executeOpenSearchCursorPage(context.Background(), session, catalog, nil)
-	require.NoError(t, err)
-	require.NotNil(t, first.Paging)
-	require.NotNil(t, first.Paging.NextCursor)
-	assert.Equal(t, session.ID, *first.Paging.NextCursor)
-	require.NotNil(t, first.TotalCount)
-	assert.Equal(t, int64(3), *first.TotalCount)
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeOpenSearch, gomock.Any()).
+			Return(indexConnector, nil)
+		svc.cf = connectorFactory
 
-	last, err := svc.executeOpenSearchCursorPage(context.Background(), session, catalog, nil)
-	require.NoError(t, err)
-	require.NotNil(t, last.Paging)
-	assert.Nil(t, last.Paging.NextCursor)
-	assert.Nil(t, last.Paging.ExpiresAtSec)
-	require.NotNil(t, last.TotalCount)
-	assert.Equal(t, int64(3), *last.TotalCount)
-	_, ok := manager.acquire(session.ID)
-	assert.False(t, ok)
+		indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
+				assert.Equal(t, 90, query["from"])
+				return &interfaces.RawQueryResponse{
+					Entries:     []map[string]any{{"id": "91"}, {"id": "92"}},
+					SearchAfter: []any{"page-92"},
+					TotalCount:  int64Pointer(92),
+				}, nil
+			})
+
+		result, err := svc.executeInitialOpenSearchCursor(context.Background(), &interfaces.RawQueryRequest{
+			Query: map[string]any{
+				"resource_id": "resource-1",
+				"sort":        []any{"timestamp"},
+			},
+			NeedTotal:       true,
+			QueryTimeoutSec: 1,
+			Paging:          interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Offset: 90, Limit: 2},
+		})
+
+		require.NoError(t, err)
+		assert.Nil(t, result.Paging.NextCursor)
+		require.NotNil(t, result.TotalCount)
+		assert.Equal(t, int64(92), *result.TotalCount)
+	})
 }
 
-func TestOpenSearchCursorDoesNotCreateEmptyPageForExactMultiple(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
-	expectIndexConnectorClose(indexConnector)
-	manager := newCursorSessionManager(10)
-	previousManager := rawQueryCursorSessions
-	rawQueryCursorSessions = manager
-	t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+func TestRawQueryServiceExecuteOpenSearchCursorPage(t *testing.T) {
+	t.Run("continues and closes", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
+		indexConnector.EXPECT().Close(gomock.Any()).Return(nil).Times(2)
+		manager := newCursorSessionManager(10)
+		previousManager := rawQueryCursorSessions
+		rawQueryCursorSessions = manager
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
-	session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 2, 60, 0)
-	require.NoError(t, err)
-	session.QueryFormat = interfaces.QueryFormatDSL
-	session.OpenSearchIndex = "events"
-	session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "size": 2}
-	session.NeedTotal = true
+		session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 2, 60, 0)
+		require.NoError(t, err)
+		session.QueryFormat = interfaces.QueryFormatDSL
+		session.OpenSearchIndex = "events"
+		session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "from": 10, "size": 2, "track_total_hits": true}
+		session.NeedTotal = true
 
-	patches := gomonkey.ApplyFunc(factory.GetFactory, func() *factory.ConnectorFactory {
-		return &factory.ConnectorFactory{}
+		callCount := 0
+		indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
+				callCount++
+				if callCount == 1 {
+					assert.Equal(t, 10, query["from"])
+					assert.NotContains(t, query, "search_after")
+					assert.Equal(t, true, query["track_total_hits"])
+					return &interfaces.RawQueryResponse{
+						Entries:     []map[string]any{{"id": "1"}, {"id": "2"}},
+						SearchAfter: []any{"page-1"},
+						TotalCount:  int64Pointer(3),
+					}, nil
+				}
+				assert.NotContains(t, query, "from")
+				assert.NotContains(t, query, "track_total_hits")
+				assert.Equal(t, []any{"page-1"}, query["search_after"])
+				return &interfaces.RawQueryResponse{Entries: []map[string]any{{"id": "3"}}, TotalCount: int64Pointer(99)}, nil
+			}).Times(2)
+
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeOpenSearch, gomock.Any()).
+			Return(indexConnector, nil).Times(2)
+		svc := &rawQueryService{cf: connectorFactory}
+		catalog := &interfaces.Catalog{ID: "catalog-1", ConnectorType: interfaces.ConnectorTypeOpenSearch}
+		first, err := svc.executeOpenSearchCursorPage(context.Background(), session, catalog, nil)
+		require.NoError(t, err)
+		require.NotNil(t, first.Paging)
+		require.NotNil(t, first.Paging.NextCursor)
+		assert.Equal(t, session.ID, *first.Paging.NextCursor)
+		require.NotNil(t, first.TotalCount)
+		assert.Equal(t, int64(3), *first.TotalCount)
+
+		last, err := svc.executeOpenSearchCursorPage(context.Background(), session, catalog, nil)
+		require.NoError(t, err)
+		require.NotNil(t, last.Paging)
+		assert.Nil(t, last.Paging.NextCursor)
+		assert.Nil(t, last.Paging.ExpiresAtSec)
+		require.NotNil(t, last.TotalCount)
+		assert.Equal(t, int64(3), *last.TotalCount)
+		_, ok := manager.acquire(session.ID)
+		assert.False(t, ok)
 	})
-	patches.ApplyMethod(&factory.ConnectorFactory{}, "CreateConnectorInstance",
-		func(*factory.ConnectorFactory, context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
-			return indexConnector, nil
-		})
-	defer patches.Reset()
 
-	indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).Return(&interfaces.RawQueryResponse{
-		Entries:     []map[string]any{{"id": "1"}, {"id": "2"}},
-		SearchAfter: []any{"page-2"},
-		TotalCount:  int64Pointer(2),
-	}, nil)
+	t.Run("does not create empty page for exact multiple", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
+		expectIndexConnectorClose(indexConnector)
+		manager := newCursorSessionManager(10)
+		previousManager := rawQueryCursorSessions
+		rawQueryCursorSessions = manager
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
-	result, err := (&rawQueryService{}).executeOpenSearchCursorPage(context.Background(), session,
-		&interfaces.Catalog{ID: "catalog-1", ConnectorType: interfaces.ConnectorTypeOpenSearch}, nil)
-	require.NoError(t, err)
-	assert.Nil(t, result.Paging.NextCursor)
-	require.NotNil(t, result.TotalCount)
-	assert.Equal(t, int64(2), *result.TotalCount)
-	_, ok := manager.acquire(session.ID)
-	assert.False(t, ok)
+		session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 2, 60, 0)
+		require.NoError(t, err)
+		session.QueryFormat = interfaces.QueryFormatDSL
+		session.OpenSearchIndex = "events"
+		session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "size": 2}
+		session.NeedTotal = true
+
+		indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).Return(&interfaces.RawQueryResponse{
+			Entries:     []map[string]any{{"id": "1"}, {"id": "2"}},
+			SearchAfter: []any{"page-2"},
+			TotalCount:  int64Pointer(2),
+		}, nil)
+
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeOpenSearch, gomock.Any()).
+			Return(indexConnector, nil)
+		svc := &rawQueryService{cf: connectorFactory}
+		result, err := svc.executeOpenSearchCursorPage(context.Background(), session,
+			&interfaces.Catalog{ID: "catalog-1", ConnectorType: interfaces.ConnectorTypeOpenSearch}, nil)
+		require.NoError(t, err)
+		assert.Nil(t, result.Paging.NextCursor)
+		require.NotNil(t, result.TotalCount)
+		assert.Equal(t, int64(2), *result.TotalCount)
+		_, ok := manager.acquire(session.ID)
+		assert.False(t, ok)
+	})
+
+	t.Run("failure does not refresh expiry", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
+		expectIndexConnectorClose(indexConnector)
+		manager := newCursorSessionManager(10)
+		previousManager := rawQueryCursorSessions
+		rawQueryCursorSessions = manager
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+
+		session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 1, 60, 0)
+		require.NoError(t, err)
+		session.OpenSearchIndex = "events"
+		session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "size": 1}
+		expiresAt := time.Now().Add(30 * time.Second).Unix()
+		atomic.StoreInt64(&session.ExpiresAtSec, expiresAt)
+
+		indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).Return(nil, errors.New("backend unavailable"))
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeOpenSearch, gomock.Any()).
+			Return(indexConnector, nil)
+		svc := &rawQueryService{cf: connectorFactory}
+		_, err = svc.executeOpenSearchCursorPage(context.Background(), session,
+			&interfaces.Catalog{ID: "catalog-1", ConnectorType: interfaces.ConnectorTypeOpenSearch}, nil)
+		require.Error(t, err)
+		assert.Equal(t, expiresAt, atomic.LoadInt64(&session.ExpiresAtSec))
+	})
 }
 
-func TestOpenSearchCursorContinuationRejectsConcurrentUse(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
-	expectIndexConnectorClose(indexConnector)
-	mockCS := mock_interfaces.NewMockCatalogService(ctrl)
-	mockRS := mock_interfaces.NewMockResourceService(ctrl)
-	manager := newCursorSessionManager(10)
-	previousManager := rawQueryCursorSessions
-	rawQueryCursorSessions = manager
-	t.Cleanup(func() { rawQueryCursorSessions = previousManager })
+func TestRawQueryServiceExecuteSQLCursorContinuation(t *testing.T) {
+	t.Run("rejects concurrent continuation", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
+		expectIndexConnectorClose(indexConnector)
+		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
+		mockRS := mock_interfaces.NewMockResourceService(ctrl)
+		manager := newCursorSessionManager(10)
+		previousManager := rawQueryCursorSessions
+		rawQueryCursorSessions = manager
+		t.Cleanup(func() { rawQueryCursorSessions = previousManager })
 
-	session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 1, 60, 0)
-	require.NoError(t, err)
-	session.QueryFormat = interfaces.QueryFormatDSL
-	session.OpenSearchIndex = "events"
-	session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "size": 1}
-	session.NeedTotal = true
+		session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 1, 60, 0)
+		require.NoError(t, err)
+		session.QueryFormat = interfaces.QueryFormatDSL
+		session.OpenSearchIndex = "events"
+		session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "size": 1}
+		session.NeedTotal = true
 
-	resource := &interfaces.Resource{ID: "resource-1", CatalogID: "catalog-1", Status: interfaces.ResourceStatusActive}
-	catalog := &interfaces.Catalog{ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeOpenSearch}
-	mockRS.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{resource}, nil)
-	mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(catalog, nil)
+		resource := &interfaces.Resource{ID: "resource-1", CatalogID: "catalog-1", Status: interfaces.ResourceStatusActive}
+		catalog := &interfaces.Catalog{ID: "catalog-1", Enabled: true, ConnectorType: interfaces.ConnectorTypeOpenSearch}
+		mockRS.EXPECT().GetByIDs(gomock.Any(), []string{"resource-1"}).Return([]*interfaces.Resource{resource}, nil)
+		mockCS.EXPECT().GetByID(gomock.Any(), "catalog-1", true).Return(catalog, nil)
 
-	patches := gomonkey.ApplyFunc(factory.GetFactory, func() *factory.ConnectorFactory {
-		return &factory.ConnectorFactory{}
+		started := make(chan struct{})
+		finish := make(chan struct{})
+		indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
+				assert.NotContains(t, query, "search_after")
+				close(started)
+				<-finish
+				return &interfaces.RawQueryResponse{Entries: []map[string]any{}}, nil
+			})
+
+		connectorFactory := mock_interfaces.NewMockConnectorFactory(ctrl)
+		connectorFactory.EXPECT().CreateConnectorInstance(gomock.Any(), interfaces.ConnectorTypeOpenSearch, gomock.Any()).
+			Return(indexConnector, nil)
+		svc := &rawQueryService{cs: mockCS, rs: mockRS, cf: connectorFactory}
+		ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "account-1"})
+		req := &interfaces.RawQueryRequest{Paging: interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Cursor: session.ID}}
+		firstErr := make(chan error, 1)
+		go func() { _, err := svc.executeSQLCursorContinuation(ctx, req); firstErr <- err }()
+		<-started
+
+		_, err = svc.executeSQLCursorContinuation(ctx, req)
+		require.Error(t, err)
+		close(finish)
+		require.NoError(t, <-firstErr)
+		_, ok := manager.acquire(session.ID)
+		assert.False(t, ok)
 	})
-	patches.ApplyMethod(&factory.ConnectorFactory{}, "CreateConnectorInstance",
-		func(*factory.ConnectorFactory, context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
-			return indexConnector, nil
-		})
-	defer patches.Reset()
-
-	started := make(chan struct{})
-	finish := make(chan struct{})
-	indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).
-		DoAndReturn(func(_ context.Context, _ string, query map[string]any) (*interfaces.RawQueryResponse, error) {
-			assert.NotContains(t, query, "search_after")
-			close(started)
-			<-finish
-			return &interfaces.RawQueryResponse{Entries: []map[string]any{}}, nil
-		})
-
-	svc := &rawQueryService{cs: mockCS, rs: mockRS}
-	ctx := context.WithValue(context.Background(), interfaces.ACCOUNT_INFO_KEY, interfaces.AccountInfo{ID: "account-1"})
-	req := &interfaces.RawQueryRequest{Paging: interfaces.PagingRequest{Mode: interfaces.PagingModeCursor, Cursor: session.ID}}
-	firstErr := make(chan error, 1)
-	go func() { _, err := svc.executeSQLCursorContinuation(ctx, req); firstErr <- err }()
-	<-started
-
-	_, err = svc.executeSQLCursorContinuation(ctx, req)
-	require.Error(t, err)
-	close(finish)
-	require.NoError(t, <-firstErr)
-	_, ok := manager.acquire(session.ID)
-	assert.False(t, ok)
-}
-
-func TestOpenSearchCursorPageFailureDoesNotRefreshExpiry(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	indexConnector := mock_interfaces.NewMockIndexConnector(ctrl)
-	expectIndexConnectorClose(indexConnector)
-	manager := newCursorSessionManager(10)
-	previousManager := rawQueryCursorSessions
-	rawQueryCursorSessions = manager
-	t.Cleanup(func() { rawQueryCursorSessions = previousManager })
-
-	session, err := manager.create("account-1", "catalog-1", []string{"resource-1"}, "", 1, 60, 0)
-	require.NoError(t, err)
-	session.OpenSearchIndex = "events"
-	session.OpenSearchQuery = map[string]any{"sort": []any{"timestamp"}, "size": 1}
-	expiresAt := time.Now().Add(30 * time.Second).Unix()
-	atomic.StoreInt64(&session.ExpiresAtSec, expiresAt)
-
-	patches := gomonkey.ApplyFunc(factory.GetFactory, func() *factory.ConnectorFactory {
-		return &factory.ConnectorFactory{}
-	})
-	patches.ApplyMethod(&factory.ConnectorFactory{}, "CreateConnectorInstance",
-		func(*factory.ConnectorFactory, context.Context, string, interfaces.ConnectorConfig) (interfaces.Connector, error) {
-			return indexConnector, nil
-		})
-	defer patches.Reset()
-
-	indexConnector.EXPECT().ExecuteRawQuery(gomock.Any(), "events", gomock.Any()).Return(nil, errors.New("backend unavailable"))
-	_, err = (&rawQueryService{}).executeOpenSearchCursorPage(context.Background(), session,
-		&interfaces.Catalog{ID: "catalog-1", ConnectorType: interfaces.ConnectorTypeOpenSearch}, nil)
-	require.Error(t, err)
-	assert.Equal(t, expiresAt, atomic.LoadInt64(&session.ExpiresAtSec))
 }
 
 func TestRawQueryServiceExtractResourceIDs(t *testing.T) {
+	t.Run("supports hyphenated IDs", func(t *testing.T) {
+		previousPolicy := rawQueryPolicy
+		rawQueryPolicy = &recordingPolicy{resourceIDs: []string{"orders-2026", "customer_data"}}
+		t.Cleanup(func() { rawQueryPolicy = previousPolicy })
+
+		ids, err := (&rawQueryService{}).extractResourceIDs(context.Background(), "SELECT * FROM {{orders-2026}} JOIN {{.customer_data}} ON true", "postgres")
+
+		require.NoError(t, err)
+		assert.Equal(t, []string{"orders-2026", "customer_data"}, ids)
+	})
 	t.Run("raw query service extract resource ids", func(t *testing.T) {
 		svc := &rawQueryService{}
 		previousPolicy := rawQueryPolicy
@@ -831,9 +1000,20 @@ func TestRawQueryServiceExtractResourceIDs(t *testing.T) {
 }
 
 func TestHasOpenSearchAggregation(t *testing.T) {
-	assert.True(t, hasOpenSearchAggregation(map[string]any{"aggs": map[string]any{"by_category": map[string]any{}}}))
-	assert.True(t, hasOpenSearchAggregation(map[string]any{"aggregations": map[string]any{"by_category": map[string]any{}}}))
-	assert.False(t, hasOpenSearchAggregation(map[string]any{"query": map[string]any{"match_all": map[string]any{}}}))
+	tests := []struct {
+		name  string
+		query map[string]any
+		want  bool
+	}{
+		{name: "aggs", query: map[string]any{"aggs": map[string]any{"by_category": map[string]any{}}}, want: true},
+		{name: "aggregations", query: map[string]any{"aggregations": map[string]any{"by_category": map[string]any{}}}, want: true},
+		{name: "without aggregation", query: map[string]any{"query": map[string]any{"match_all": map[string]any{}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, hasOpenSearchAggregation(test.query))
+		})
+	}
 }
 
 func TestRawQueryServiceReplaceResourceIDWithSchemaTable(t *testing.T) {
@@ -844,10 +1024,12 @@ func TestRawQueryServiceReplaceResourceIDWithSchemaTable(t *testing.T) {
 
 		rs.EXPECT().GetByID(gomock.Any(), "r1").Return(&interfaces.Resource{
 			ID:               "r1",
+			Schema:           "schema",
 			SourceIdentifier: "schema.table_one",
 		}, nil)
 		rs.EXPECT().GetByID(gomock.Any(), "r2").Return(&interfaces.Resource{
 			ID:               "r2",
+			Schema:           "schema",
 			SourceIdentifier: "schema.table_two",
 		}, nil)
 
@@ -859,7 +1041,45 @@ func TestRawQueryServiceReplaceResourceIDWithSchemaTable(t *testing.T) {
 		)
 
 		require.NoError(t, err)
-		assert.Equal(t, "select * from schema.table_one join schema.table_two on schema.table_one.id = schema.table_two.id", got)
+		assert.Equal(t, `select * from "schema"."table_one" join "schema"."table_two" on "schema"."table_one".id = "schema"."table_two".id`, got)
+	})
+
+	t.Run("quotes tsql special identifiers", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		rs := mock_interfaces.NewMockResourceService(ctrl)
+		svc := &rawQueryService{rs: rs}
+		rs.EXPECT().GetByID(gomock.Any(), "r1").Return(&interfaces.Resource{
+			ID:               "r1",
+			Schema:           "sales data",
+			SourceIdentifier: "sales data.Order.Archive]",
+		}, nil)
+
+		got, err := svc.replaceResourceIDWithSchemaTable(context.Background(),
+			"SELECT * FROM {{r1}}",
+			[]string{"r1"},
+			&interfaces.Catalog{Name: "catalog"},
+			"tsql",
+		)
+
+		require.NoError(t, err)
+		assert.Equal(t, "SELECT * FROM [sales data].[Order.Archive]]]", got)
+	})
+
+	t.Run("quotes schema containing dots", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		rs := mock_interfaces.NewMockResourceService(ctrl)
+		svc := &rawQueryService{rs: rs}
+		rs.EXPECT().GetByID(gomock.Any(), "r1").Return(&interfaces.Resource{
+			ID:               "r1",
+			Schema:           "sales.archive",
+			SourceIdentifier: "sales.archive.orders",
+		}, nil)
+
+		got, err := svc.replaceResourceIDWithSchemaTable(context.Background(),
+			"SELECT * FROM {{r1}}", []string{"r1"}, &interfaces.Catalog{Name: "catalog"}, "tsql")
+
+		require.NoError(t, err)
+		assert.Equal(t, "SELECT * FROM [sales.archive].[orders]", got)
 	})
 }
 

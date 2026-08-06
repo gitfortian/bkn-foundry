@@ -34,6 +34,7 @@ var (
 
 type resourceDataService struct {
 	appSetting *common.AppSetting
+	cf         interfaces.ConnectorFactory
 	ds         interfaces.DatasetService
 	lim        interfaces.LocalIndexManager
 	cs         interfaces.CatalogService
@@ -47,6 +48,7 @@ func NewResourceDataService(appSetting *common.AppSetting) interfaces.ResourceDa
 	rdServiceOnce.Do(func() {
 		rdService = &resourceDataService{
 			appSetting: appSetting,
+			cf:         factory.GetFactory(appSetting),
 			ds:         dataset.NewDatasetService(appSetting),
 			lim:        local_index.NewLocalIndexManager(appSetting),
 			cs:         catalog.NewCatalogService(appSetting),
@@ -324,7 +326,7 @@ func (rds *resourceDataService) QueryData(ctx context.Context, catalog *interfac
 	logger.Debugf("QueryData, resourceID: %s, catalogID: %s, params: %v",
 		resource.ID, resource.CatalogID, params)
 
-	connector, err := factory.GetFactory().CreateConnectorInstance(ctx, catalog.ConnectorType, catalog.ConnectorCfg)
+	connector, err := rds.cf.CreateConnectorInstance(ctx, catalog.ConnectorType, catalog.ConnectorCfg)
 	if err != nil {
 		otellog.LogError(ctx, "Create connector failed", err)
 		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError).
@@ -356,7 +358,7 @@ func (rds *resourceDataService) QueryData(ctx context.Context, catalog *interfac
 		}
 
 		span.SetStatus(codes.Ok, "")
-		return result.Rows, result.Total, nil
+		return result.Entries, result.Total, nil
 
 	case interfaces.ResourceCategoryIndex:
 		indexConnector, ok := connector.(interfaces.IndexConnector)
@@ -376,7 +378,7 @@ func (rds *resourceDataService) QueryData(ctx context.Context, catalog *interfac
 
 		span.SetStatus(codes.Ok, "")
 		params.SearchAfter = append([]any(nil), result.SearchAfter...)
-		return result.Rows, result.Total, nil
+		return result.Entries, result.Total, nil
 
 	case interfaces.ResourceCategoryFileset:
 		fc, ok := connector.(interfaces.FilesetConnector)
@@ -396,7 +398,7 @@ func (rds *resourceDataService) QueryData(ctx context.Context, catalog *interfac
 		}
 
 		span.SetStatus(codes.Ok, "")
-		return result.Rows, result.Total, nil
+		return result.Entries, result.Total, nil
 
 	default:
 		httpErr := rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InternalError_InvalidCategory).

@@ -14,11 +14,13 @@ import (
 	"vega-backend/logics/connector/local/table/postgresql"
 )
 
-// InitLocalConnectors 初始化本地 connector
-func (cf *ConnectorFactory) InitLocalConnectors() {
+// initLocalConnectors 初始化本地 connector
+func (cf *connectorFactory) initLocalConnectors() {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
 	cf.connectors[interfaces.ConnectorTypeMySQL] = mariadb.NewMariaDBConnector()
 	cf.connectors[interfaces.ConnectorTypeOpenSearch] = opensearch.NewOpenSearchConnector()
-	//cf.connectors[interfaces.ConnectorTypeOracle] = oracle.NewOracleConnector()
 	cf.connectors[interfaces.ConnectorTypeMariaDB] = mariadb.NewMariaDBConnector()
 	cf.connectors[interfaces.ConnectorTypePostgreSQL] = postgresql.NewPostgresqlConnector()
 	cf.connectors[interfaces.ConnectorTypeAnyShare] = anyshare.NewAnyShareConnector()

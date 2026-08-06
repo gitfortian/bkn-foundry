@@ -11,7 +11,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	_ "github.com/lib/pq"
@@ -148,11 +150,11 @@ func (c *PostgresqlConnector) New(cfg interfaces.ConnectorConfig) (interfaces.Co
 	}, nil
 }
 
-func (c *PostgresqlConnector) buildConnString() string {
+func (c *PostgresqlConnector) connectionString() string {
 	u := &url.URL{
 		Scheme: "postgres",
 		User:   url.UserPassword(c.config.Username, c.config.Password),
-		Host:   fmt.Sprintf("%s:%d", c.config.Host, c.config.Port),
+		Host:   net.JoinHostPort(c.config.Host, strconv.Itoa(c.config.Port)),
 		Path:   "/" + strings.TrimPrefix(c.config.Database, "/"),
 	}
 	q := u.Query()
@@ -174,7 +176,7 @@ func (c *PostgresqlConnector) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	db, err := sql.Open("postgres", c.buildConnString())
+	db, err := sql.Open("postgres", c.connectionString())
 	if err != nil {
 		return err
 	}
@@ -234,67 +236,4 @@ func (c *PostgresqlConnector) validateSchemas(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-// ExecuteRawSQL 执行原始SQL查询
-func (c *PostgresqlConnector) ExecuteRawSQL(ctx context.Context, sql string) (*interfaces.RawQueryResponse, error) {
-	if err := c.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("connect failed: %w", err)
-	}
-
-	rows, err := c.db.QueryContext(ctx, sql)
-	if err != nil {
-		return nil, fmt.Errorf("execute query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("get columns failed: %w", err)
-	}
-
-	columnTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, fmt.Errorf("get column types failed: %w", err)
-	}
-
-	response := &interfaces.RawQueryResponse{
-		Columns: make([]interfaces.ColumnInfo, len(columns)),
-		Entries: make([]map[string]any, 0),
-	}
-
-	// 填充列信息
-	for i, col := range columns {
-		response.Columns[i] = interfaces.ColumnInfo{
-			Name: col,
-			Type: c.MapType(columnTypes[i].DatabaseTypeName()),
-		}
-	}
-
-	// 读取结果行
-	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, fmt.Errorf("scan row failed: %w", err)
-		}
-
-		row := make(map[string]any)
-		for i, col := range columns {
-			row[col] = convertValue(values[i], col, nil)
-		}
-		response.Entries = append(response.Entries, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate rows failed: %w", err)
-	}
-
-	totalCount := int64(len(response.Entries))
-	response.TotalCount = &totalCount
-
-	return response, nil
 }

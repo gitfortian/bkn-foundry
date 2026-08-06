@@ -1,5 +1,4 @@
 // Copyright openbkn.ai
-// Copyright The kweaver.ai Authors.
 //
 // Licensed under the Apache License, Version 2.0.
 // See the LICENSE file in the project root for details.
@@ -8,6 +7,7 @@ package sqlglot
 
 import (
 	"context"
+	"os/exec"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,6 +27,8 @@ func TestMapDataSourceTypeToDialect(t *testing.T) {
 		{name: "postgres alias", sourceType: "postgres", want: "postgres"},
 		{name: "postgres connector type", sourceType: interfaces.ConnectorTypePostgreSQL, want: "postgres"},
 		{name: "mariadb", sourceType: interfaces.ConnectorTypeMariaDB, want: "mysql"},
+		{name: "sqlserver", sourceType: interfaces.ConnectorTypeSQLServer, want: "tsql"},
+		{name: "tsql target dialect", sourceType: "tsql", want: "tsql"},
 		{name: "maria alias", sourceType: "maria", want: "mysql"},
 	}
 
@@ -38,9 +40,6 @@ func TestMapDataSourceTypeToDialect(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
-}
-
-func TestMapDataSourceTypeToDialectUnsupported(t *testing.T) {
 	t.Run("returns error for unsupported source type", func(t *testing.T) {
 		got, err := MapDataSourceTypeToDialect("oracle")
 
@@ -51,6 +50,24 @@ func TestMapDataSourceTypeToDialectUnsupported(t *testing.T) {
 }
 
 func TestTranspileSQL(t *testing.T) {
+	t.Run("transpiles postgres input to tsql target dialect", func(t *testing.T) {
+		requireSQLGlotRuntime(t)
+		got, err := TranspileSQL(context.Background(), "SELECT id FROM orders WHERE active = TRUE", "postgres", "tsql")
+
+		require.NoError(t, err)
+		assert.Equal(t, "tsql", got.Dialect)
+		assert.Equal(t, "SELECT id FROM orders WHERE active = 1", got.SQL)
+	})
+
+	t.Run("transpiles mysql input to tsql target dialect", func(t *testing.T) {
+		requireSQLGlotRuntime(t)
+		got, err := TranspileSQL(context.Background(), "SELECT `id` FROM `orders` LIMIT 10", "mysql", "tsql")
+
+		require.NoError(t, err)
+		assert.Equal(t, "tsql", got.Dialect)
+		assert.Equal(t, "SELECT TOP 10 [id] FROM [orders]", got.SQL)
+	})
+
 	t.Run("returns mapping error before invoking sqlglot", func(t *testing.T) {
 		got, err := TranspileSQL(context.Background(), "select * from t", "mysql", "oracle")
 
@@ -69,4 +86,12 @@ func TestTranspileSQL(t *testing.T) {
 		assert.ErrorIs(t, err, context.Canceled)
 		assert.Nil(t, got)
 	})
+}
+
+func requireSQLGlotRuntime(t *testing.T) {
+	t.Helper()
+	if err := exec.Command("python3", "-c",
+		"import sqlglot; assert callable(getattr(sqlglot, 'transpile', None))").Run(); err != nil {
+		t.Skip("sqlglot Python runtime is not installed")
+	}
 }

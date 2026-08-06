@@ -36,7 +36,7 @@ const connectorTypeAuthResourcePermissionBatchSize = 10000
 type connectorTypeService struct {
 	appSetting *common.AppSetting
 	cta        interfaces.ConnectorTypeAccess
-	cf         *factory.ConnectorFactory
+	cf         interfaces.ConnectorFactory
 	ps         interfaces.PermissionService
 }
 
@@ -46,7 +46,7 @@ func NewConnectorTypeService(appSetting *common.AppSetting) interfaces.Connector
 		ctService = &connectorTypeService{
 			appSetting: appSetting,
 			cta:        logics.CTA,
-			cf:         factory.GetFactory(),
+			cf:         factory.GetFactory(appSetting),
 			ps:         permission.NewPermissionService(appSetting),
 		}
 	})
@@ -76,6 +76,12 @@ func (cts *connectorTypeService) Register(ctx context.Context, req *interfaces.C
 		Endpoint:    req.Endpoint,
 		FieldConfig: req.FieldConfig,
 		Enabled:     req.Enabled,
+	}
+	ct, err = cts.cf.ResolveConnectorTypeRegistration(ctx, ct)
+	if err != nil {
+		otellog.LogError(ctx, "Validate connector type registration failed", err)
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_ConnectorType_BadRequest).
+			WithErrorDetails(err.Error())
 	}
 
 	err = cts.cta.Create(ctx, ct)
@@ -126,6 +132,7 @@ func (cts *connectorTypeService) GetByType(ctx context.Context, tp string) (*int
 		return nil, rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
 			WithErrorDetails(fmt.Sprintf("Access denied: insufficient permissions for[%v]", interfaces.OPERATION_TYPE_VIEW_DETAIL))
 	}
+	ct.Available = cts.cf.IsConnectorAvailable(ct.Type)
 
 	span.SetStatus(codes.Ok, "")
 	return ct, nil
@@ -161,6 +168,10 @@ func (cts *connectorTypeService) List(ctx context.Context, params interfaces.Con
 	for _, c := range connectorTypesArr {
 		// 只留下有权限的模型
 		if resrc, exist := matchResoucesMap[c.Type]; exist {
+			c.Available = cts.cf.IsConnectorAvailable(c.Type)
+			if params.Available != nil && c.Available != *params.Available {
+				continue
+			}
 			c.Operations = resrc.Operations // 用户当前有权限的操作
 			connectorTypes = append(connectorTypes, c)
 		}
@@ -291,7 +302,7 @@ func (cts *connectorTypeService) Update(ctx context.Context, ct *interfaces.Conn
 		return err
 	}
 
-	// Apply updates
+	// Validate immutable fields before resolving the mutable definition.
 	if req.Type != ct.Type {
 		span.SetStatus(codes.Error, "can not change connector type")
 		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_ConnectorType_InvalidParameter_Type)
@@ -305,23 +316,32 @@ func (cts *connectorTypeService) Update(ctx context.Context, ct *interfaces.Conn
 		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_ConnectorType_InvalidParameter_Category)
 	}
 
-	ct.Type = req.Type
-	ct.Name = req.Name
-	ct.Tags = req.Tags
-	ct.Description = req.Description
-	ct.Mode = req.Mode
-	ct.Category = req.Category
-	ct.Endpoint = req.Endpoint
-	ct.FieldConfig = req.FieldConfig
-	ct.Enabled = req.Enabled
+	updated := &interfaces.ConnectorType{
+		Type:        req.Type,
+		Name:        req.Name,
+		Tags:        req.Tags,
+		Description: req.Description,
+		Mode:        req.Mode,
+		Category:    req.Category,
+		Endpoint:    req.Endpoint,
+		FieldConfig: req.FieldConfig,
+		Enabled:     req.Enabled,
+	}
 
-	if err := cts.cta.Update(ctx, ct); err != nil {
+	resolved, err := cts.cf.ResolveConnectorTypeRegistration(ctx, updated)
+	if err != nil {
+		otellog.LogError(ctx, "Validate connector type update failed", err)
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_ConnectorType_BadRequest).
+			WithErrorDetails(err.Error())
+	}
+
+	if err := cts.cta.Update(ctx, resolved); err != nil {
 		span.SetStatus(codes.Error, "Update connector type failed")
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_ConnectorType_InternalError_UpdateFailed).
 			WithErrorDetails(err.Error())
 	}
 
-	if err := cts.cf.RegisterConnector(ctx, ct.Type, ct); err != nil {
+	if err := cts.cf.RegisterConnector(ctx, resolved.Type, resolved); err != nil {
 		otellog.LogError(ctx, "Register connector type failed", err)
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_ConnectorType_InternalError_RegisterFailed).
 			WithErrorDetails(err.Error())
@@ -330,9 +350,9 @@ func (cts *connectorTypeService) Update(ctx context.Context, ct *interfaces.Conn
 	// 请求更新资源名称的接口，更新资源的名称
 	if nameModified {
 		err = cts.ps.UpdateResource(ctx, interfaces.PermissionResource{
-			ID:   ct.Type,
+			ID:   resolved.Type,
 			Type: interfaces.AUTH_RESOURCE_TYPE_CONNECTOR_TYPE,
-			Name: ct.Name,
+			Name: resolved.Name,
 		})
 		if err != nil {
 			return err
@@ -363,11 +383,7 @@ func (cts *connectorTypeService) DeleteByType(ctx context.Context, tp string) er
 			WithErrorDetails(err.Error())
 	}
 
-	if err := cts.cf.DeleteConnector(ctx, tp); err != nil {
-		otellog.LogError(ctx, "Delete connector type failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_ConnectorType_InternalError_DeleteFailed).
-			WithErrorDetails(err.Error())
-	}
+	cts.cf.DeleteConnector(tp)
 
 	//  清除资源策略
 	err = cts.ps.DeleteResources(ctx, interfaces.AUTH_RESOURCE_TYPE_CONNECTOR_TYPE, []string{tp})
@@ -398,6 +414,7 @@ func (cts *connectorTypeService) SetEnabled(ctx context.Context, tp string, enab
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_ConnectorType_InternalError_UpdateFailed).
 			WithErrorDetails(err.Error())
 	}
+	cts.cf.SetConnectorEnabled(tp, enabled)
 
 	span.SetStatus(codes.Ok, "")
 	return nil

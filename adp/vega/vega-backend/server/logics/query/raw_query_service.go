@@ -28,19 +28,18 @@ import (
 	"vega-backend/logics/catalog"
 	"vega-backend/logics/connector/factory"
 	opensearchconnector "vega-backend/logics/connector/local/index/opensearch"
-	"vega-backend/logics/connector/local/table/mariadb"
-	"vega-backend/logics/connector/local/table/postgresql"
 	"vega-backend/logics/query/querypolicy"
 	"vega-backend/logics/query/sqlglot"
 	resourcelogic "vega-backend/logics/resource"
 )
 
 var (
-	rawQueryServiceOnce     sync.Once
-	rawQueryServiceInstance interfaces.RawQueryService
+	rqServiceOnce sync.Once
+	rqService     interfaces.RawQueryService
 )
 
 type rawQueryService struct {
+	cf interfaces.ConnectorFactory
 	cs interfaces.CatalogService
 	rs interfaces.ResourceService
 }
@@ -50,13 +49,14 @@ const rawQueryTotalCountColumn = "_raw_query_total_count"
 // NewRawQueryService 创建SQL查询服务（单例模式）
 func NewRawQueryService(appSetting *common.AppSetting) interfaces.RawQueryService {
 	rawQueryCursorSessions.configure(appSetting.QuerySetting.CursorMaxSessions)
-	rawQueryServiceOnce.Do(func() {
-		rawQueryServiceInstance = &rawQueryService{
+	rqServiceOnce.Do(func() {
+		rqService = &rawQueryService{
+			cf: factory.GetFactory(appSetting),
 			cs: catalog.NewCatalogService(appSetting),
 			rs: resourcelogic.NewResourceService(appSetting),
 		}
 	})
-	return rawQueryServiceInstance
+	return rqService
 }
 
 // Execute 执行SQL查询
@@ -123,11 +123,11 @@ func (rqs *rawQueryService) validateRequest(ctx context.Context, req *interfaces
 func (rqs *rawQueryService) executeInitialSQLQuery(ctx context.Context, req *interfaces.RawQueryRequest) (*interfaces.RawQueryResponse, error) {
 	queryCtx, cancel := queryExecutionContext(ctx, req.QueryTimeoutSec)
 	defer cancel()
+
 	prepared, err := rqs.prepareSQLQuery(queryCtx, req)
 	if err != nil {
 		return nil, err
 	}
-	finalSQL := applySingleQueryPaging(prepared.sql, req.Paging.Offset, req.Paging.Limit)
 
 	var totalCount int64
 	if req.NeedTotal {
@@ -136,7 +136,10 @@ func (rqs *rawQueryService) executeInitialSQLQuery(ctx context.Context, req *int
 			return nil, err
 		}
 	}
-	result, err := rqs.executeSQL(queryCtx, prepared.catalog, finalSQL, interfaces.PagingModeSingle)
+	result, err := rqs.executeSQL(queryCtx, prepared.catalog, prepared.sql, interfaces.PagingModeSingle, &rawSQLBuildOptions{
+		offset: req.Paging.Offset,
+		limit:  req.Paging.Limit,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -254,19 +257,19 @@ func (rqs *rawQueryService) prepareSQLQuery(ctx context.Context, req *interfaces
 	if err != nil {
 		return nil, err
 	}
+	targetDialect, err := targetDialectForCatalog(ctx, catalog)
+	if err != nil {
+		return nil, err
+	}
 	replacedSQL, err := rqs.replaceResourceIDWithSchemaTable(ctx, req.Query, resourceIDs, catalog, inputDialect)
 	if err != nil {
 		return nil, err
 	}
-	allowedReferences, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs)
+	allowedReferences, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs, inputDialect)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSQLPolicy(ctx, replacedSQL, inputDialect, allowedReferences); err != nil {
-		return nil, err
-	}
-	targetDialect, err := targetDialectForCatalog(ctx, catalog)
-	if err != nil {
+	if err := validateSQLPolicy(ctx, replacedSQL, inputDialect, allowedReferences, inputDialect == targetDialect); err != nil {
 		return nil, err
 	}
 	finalSQL := replacedSQL
@@ -277,18 +280,28 @@ func (rqs *rawQueryService) prepareSQLQuery(ctx context.Context, req *interfaces
 				WithErrorDetails("failed to compile SQL query")
 		}
 		finalSQL = result.SQL
+		targetReferences, err := rqs.resourceSourceIdentifiers(ctx, resourceIDs, targetDialect)
+		if err != nil {
+			return nil, err
+		}
 		// The connector executes finalSQL, not the input-dialect SQL validated
 		// above. Revalidate the target-dialect output so the read-only and
 		// table-reference boundaries apply to the executable statement.
-		if err := validateSQLPolicy(ctx, finalSQL, targetDialect, allowedReferences); err != nil {
+		if err := validateSQLPolicy(ctx, finalSQL, targetDialect, targetReferences, true); err != nil {
 			return nil, err
 		}
 	}
 	return &preparedSQLQuery{catalog: catalog, resourceIDs: resourceIDs, sql: trimSQLTerminator(finalSQL), warnings: warnings}, nil
 }
 
-func validateSQLPolicy(ctx context.Context, sql, dialect string, allowedReferences []string) error {
-	if err := rawQueryPolicy.ValidateSQL(ctx, sql, dialect); err != nil {
+func validateSQLPolicy(ctx context.Context, sql, dialect string, allowedReferences []string, derivedTable bool) error {
+	var err error
+	if derivedTable {
+		err = rawQueryPolicy.ValidateDerivedTable(ctx, sql, dialect)
+	} else {
+		err = rawQueryPolicy.ValidateSQL(ctx, sql, dialect)
+	}
+	if err != nil {
 		if httpErr := rawQueryValidationError(ctx, err); httpErr != nil {
 			return httpErr
 		}
@@ -305,7 +318,7 @@ func validateSQLPolicy(ctx context.Context, sql, dialect string, allowedReferenc
 	return nil
 }
 
-func (rqs *rawQueryService) resourceSourceIdentifiers(ctx context.Context, resourceIDs []string) ([]string, error) {
+func (rqs *rawQueryService) resourceSourceIdentifiers(ctx context.Context, resourceIDs []string, dialect string) ([]string, error) {
 	identifiers := make([]string, 0, len(resourceIDs))
 	for _, resourceID := range resourceIDs {
 		resource, err := rqs.rs.GetByID(ctx, resourceID)
@@ -316,7 +329,7 @@ func (rqs *rawQueryService) resourceSourceIdentifiers(ctx context.Context, resou
 			return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Query_ResourceNotFound).
 				WithErrorDetails(fmt.Sprintf("resource %s has no queryable source", resourceID))
 		}
-		identifiers = append(identifiers, resource.SourceIdentifier)
+		identifiers = append(identifiers, quotedResourceSourceIdentifier(resource, dialect))
 	}
 	return identifiers, nil
 }
@@ -326,10 +339,13 @@ func trimSQLTerminator(sql string) string {
 }
 
 func (rqs *rawQueryService) executeSQLCursorPage(ctx context.Context, session *interfaces.CursorSession, catalog *interfaces.Catalog, warnings []string) (*interfaces.RawQueryResponse, error) {
-	pageSQL := fmt.Sprintf("SELECT * FROM (%s) AS _raw_query_cursor LIMIT %d OFFSET %d", session.CompiledSQL, session.Limit+1, session.Offset)
 	pageCtx, cancel := queryExecutionContext(ctx, session.QueryTimeoutSec)
 	defer cancel()
-	result, err := rqs.executeSQL(pageCtx, catalog, pageSQL, interfaces.PagingModeCursor)
+
+	result, err := rqs.executeSQL(pageCtx, catalog, session.CompiledSQL, interfaces.PagingModeCursor, &rawSQLBuildOptions{
+		offset: session.Offset,
+		limit:  session.Limit + 1,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -519,7 +535,7 @@ func (rqs *rawQueryService) executeOpenSearchCursorPage(ctx context.Context, ses
 		pageCtx, cancel = context.WithTimeout(ctx, time.Duration(session.QueryTimeoutSec)*time.Second)
 		defer cancel()
 	}
-	connector, err := factory.GetFactory().CreateConnectorInstance(pageCtx, catalog.ConnectorType, catalog.ConnectorCfg)
+	connector, err := rqs.cf.CreateConnectorInstance(pageCtx, catalog.ConnectorType, catalog.ConnectorCfg)
 	if err != nil {
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Query_ExecuteFailed).
 			WithErrorDetails("connector initialization failed")
@@ -633,7 +649,7 @@ func (rqs *rawQueryService) executeInitialDSLQuery(ctx context.Context, req *int
 	}
 
 	delete(queryMap, "resource_id")
-	connector, err := factory.GetFactory().CreateConnectorInstance(queryCtx, catalog.ConnectorType, catalog.ConnectorCfg)
+	connector, err := rqs.cf.CreateConnectorInstance(queryCtx, catalog.ConnectorType, catalog.ConnectorCfg)
 	if err != nil {
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Query_ExecuteFailed).
 			WithErrorDetails("connector initialization failed")
@@ -692,19 +708,16 @@ func targetDialectForCatalog(ctx context.Context, catalog *interfaces.Catalog) (
 		return "mysql", nil
 	case interfaces.ConnectorTypePostgreSQL:
 		return "postgres", nil
+	case interfaces.ConnectorTypeSQLServer:
+		return "tsql", nil
 	default:
 		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Query_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("unsupported connector type: %s", catalog.ConnectorType))
 	}
 }
 
-func applySingleQueryPaging(sql string, offset, size int) string {
-	return fmt.Sprintf("SELECT * FROM (%s) AS _raw_query_single LIMIT %d OFFSET %d", sql, size, offset)
-}
-
 func (rqs *rawQueryService) executeSQLTotalCount(ctx context.Context, catalog *interfaces.Catalog, sql string) (int64, error) {
-	countSQL := fmt.Sprintf("SELECT COUNT(*) AS %s FROM (%s) AS _raw_query_total", rawQueryTotalCountColumn, sql)
-	result, err := rqs.executeSQL(ctx, catalog, countSQL, interfaces.PagingModeSingle)
+	result, err := rqs.executeSQL(ctx, catalog, sql, interfaces.PagingModeSingle, &rawSQLBuildOptions{count: true})
 	if err != nil {
 		return 0, err
 	}
@@ -825,7 +838,9 @@ func ensureCatalogEnabled(ctx context.Context, catalog *interfaces.Catalog) erro
 }
 
 // replaceResourceIDWithSchemaTable 将resource_id替换为schema.table格式
-func (rqs *rawQueryService) replaceResourceIDWithSchemaTable(ctx context.Context, sql any, resourceIDs []string, catalog *interfaces.Catalog, inputDialect string) (string, error) {
+func (rqs *rawQueryService) replaceResourceIDWithSchemaTable(ctx context.Context,
+	sql any, resourceIDs []string, catalog *interfaces.Catalog, inputDialect string) (string, error) {
+
 	replacedSQL := sql.(string)
 	logger.Infof("Before replace - %s, resource_ids: %v", SafeQuerySummary(replacedSQL), resourceIDs)
 
@@ -846,12 +861,46 @@ func (rqs *rawQueryService) replaceResourceIDWithSchemaTable(ctx context.Context
 		// 替换{{.resource_id}}和{{resource_id}}为schema.table
 		placeholder1 := fmt.Sprintf("{{.%s}}", resourceID)
 		placeholder2 := fmt.Sprintf("{{%s}}", resourceID)
-		replacedSQL = replacePlaceholderInSQLCode(replacedSQL, placeholder1, resource.SourceIdentifier, inputDialect)
-		replacedSQL = replacePlaceholderInSQLCode(replacedSQL, placeholder2, resource.SourceIdentifier, inputDialect)
+		quotedIdentifier := quotedResourceSourceIdentifier(resource, inputDialect)
+		replacedSQL = replacePlaceholderInSQLCode(replacedSQL, placeholder1, quotedIdentifier, inputDialect)
+		replacedSQL = replacePlaceholderInSQLCode(replacedSQL, placeholder2, quotedIdentifier, inputDialect)
 	}
 
 	logger.Infof("After replace - %s", SafeQuerySummary(replacedSQL))
 	return replacedSQL, nil
+}
+
+func quotedResourceSourceIdentifier(resource *interfaces.Resource, dialect string) string {
+	sourceIdentifier := strings.TrimSpace(resource.SourceIdentifier)
+	schema := strings.TrimSpace(resource.Schema)
+	table := sourceIdentifier
+	if schema != "" {
+		prefixLength := len(schema) + 1
+		if len(sourceIdentifier) >= prefixLength &&
+			strings.EqualFold(sourceIdentifier[:prefixLength], schema+".") {
+			table = sourceIdentifier[prefixLength:]
+		} else if separator := strings.IndexByte(sourceIdentifier, '.'); separator >= 0 &&
+			strings.EqualFold(strings.TrimSpace(sourceIdentifier[:separator]), schema) {
+			table = sourceIdentifier[separator+1:]
+		}
+	} else if separator := strings.IndexByte(sourceIdentifier, '.'); separator >= 0 {
+		schema, table = sourceIdentifier[:separator], sourceIdentifier[separator+1:]
+	}
+	if schema == "" {
+		return quoteSQLIdentifier(strings.TrimSpace(table), dialect)
+	}
+	return quoteSQLIdentifier(schema, dialect) + "." + quoteSQLIdentifier(strings.TrimSpace(table), dialect)
+}
+
+func quoteSQLIdentifier(identifier, dialect string) string {
+	switch dialect {
+	case "mysql":
+		return "`" + strings.ReplaceAll(identifier, "`", "``") + "`"
+	case "tsql":
+		return "[" + strings.ReplaceAll(identifier, "]", "]]") + "]"
+	default:
+		return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
+	}
 }
 
 // replacePlaceholderInSQLCode preserves comments and quoted literals. They
@@ -915,12 +964,17 @@ func replacePlaceholderInSQLCode(sql, placeholder, replacement, inputDialect str
 	return output.String()
 }
 
-// executeSQL 执行 SQL 查询并记录分页模式。
-func (rqs *rawQueryService) executeSQL(ctx context.Context, catalog *interfaces.Catalog, sql string, pagingMode interfaces.PagingMode) (*interfaces.RawQueryResponse, error) {
-	logger.Infof("Executing query - %s, paging_mode: %s, catalog: %s", SafeQuerySummary(sql), pagingMode, catalog.Name)
+type rawSQLBuildOptions struct {
+	offset int
+	limit  int
+	count  bool
+}
 
+// executeSQL 执行 SQL 查询并记录分页模式。
+func (rqs *rawQueryService) executeSQL(ctx context.Context, catalog *interfaces.Catalog, sql string,
+	pagingMode interfaces.PagingMode, buildOptions *rawSQLBuildOptions) (*interfaces.RawQueryResponse, error) {
 	// 创建connector
-	connector, err := factory.GetFactory().CreateConnectorInstance(ctx, catalog.ConnectorType, catalog.ConnectorCfg)
+	connector, err := rqs.cf.CreateConnectorInstance(ctx, catalog.ConnectorType, catalog.ConnectorCfg)
 	if err != nil {
 		otellog.LogError(ctx, "Create connector failed", err)
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Query_ExecuteFailed).
@@ -928,20 +982,20 @@ func (rqs *rawQueryService) executeSQL(ctx context.Context, catalog *interfaces.
 	}
 	defer func() { _ = connector.Close(ctx) }()
 
-	// 根据connector类型执行SQL
-	var result *interfaces.RawQueryResponse
-	switch catalog.ConnectorType {
-	case interfaces.ConnectorTypeMariaDB, interfaces.ConnectorTypeMySQL:
-		mariadbConnector := connector.(*mariadb.MariaDBConnector)
-		result, err = mariadbConnector.ExecuteRawSQL(ctx, sql)
-	case interfaces.ConnectorTypePostgreSQL:
-		postgresqlConnector := connector.(*postgresql.PostgresqlConnector)
-		result, err = postgresqlConnector.ExecuteRawSQL(ctx, sql)
-	default:
+	tableConnector, ok := connector.(interfaces.TableConnector)
+	if !ok {
 		return nil, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Query_InvalidParameter).
 			WithErrorDetails(fmt.Sprintf("unsupported connector type: %s", catalog.ConnectorType))
 	}
-
+	if buildOptions != nil {
+		if buildOptions.count {
+			sql = tableConnector.BuildCountSQL(sql)
+		} else {
+			sql = tableConnector.BuildPagedSQL(sql, buildOptions.offset, buildOptions.limit)
+		}
+	}
+	logger.Infof("Executing query - %s, paging_mode: %s, catalog: %s", SafeQuerySummary(sql), pagingMode, catalog.Name)
+	result, err := tableConnector.ExecuteRawSQL(ctx, sql)
 	if err != nil {
 		otellog.LogError(ctx, "Execute SQL failed", err)
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Query_ExecuteFailed).

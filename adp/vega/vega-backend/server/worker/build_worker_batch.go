@@ -32,6 +32,7 @@ type batchBuildWorker struct {
 	appSetting  *common.AppSetting
 	client      *asynq.Client
 	bts         interfaces.BuildTaskService
+	cf          interfaces.ConnectorFactory
 	cs          interfaces.CatalogService
 	kafkaAccess interfaces.KafkaAccess
 	lim         interfaces.LocalIndexManager
@@ -49,6 +50,7 @@ func NewBatchBuildWorker(appSetting *common.AppSetting) *batchBuildWorker {
 		appSetting:  appSetting,
 		client:      client,
 		bts:         build_task.NewBuildTaskService(appSetting, rs),
+		cf:          factory.GetFactory(appSetting),
 		rs:          rs,
 		cs:          catalog.NewCatalogService(appSetting),
 		lim:         local_index.NewLocalIndexManager(appSetting),
@@ -249,7 +251,7 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, resource *interfa
 	firstQuery := true
 
 	// get total rows from MySQL
-	connector, err := factory.GetFactory().CreateConnectorInstance(ctx, catalog.ConnectorType, catalog.ConnectorCfg)
+	connector, err := bbw.cf.CreateConnectorInstance(ctx, catalog.ConnectorType, catalog.ConnectorCfg)
 	if err != nil {
 		return fmt.Errorf("create connector instance failed: %w", err)
 	}
@@ -360,12 +362,12 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, resource *interfa
 		}
 
 		totalRows := result.Total
-		readRows := len(result.Rows)
+		readRows := len(result.Entries)
 
 		if readRows > 0 {
 			// Update lastBatchKeyValues with the last values in this batch
 			newSyncedMark := map[string]any{}
-			lastItem := result.Rows[readRows-1]
+			lastItem := result.Entries[readRows-1]
 			lastBatchKeyValues = advanceCursor(lastBatchKeyValues, keys, lastItem)
 			for _, field := range batchFields {
 				newSyncedMark[field] = lastItem[field]
@@ -373,7 +375,7 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, resource *interfa
 
 			// Convert documents to upsert format
 			upsertRequests := make([]map[string]any, 0, readRows)
-			for _, doc := range result.Rows {
+			for _, doc := range result.Entries {
 				docID := getNewDocID(lastBatchKeyValues, doc)
 				if docID == "" {
 					return fmt.Errorf("build document ID: no build key values found in source row")

@@ -11,7 +11,9 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/mitchellh/mapstructure"
@@ -151,14 +153,7 @@ func (c *MariaDBConnector) New(cfg interfaces.ConnectorConfig) (interfaces.Conne
 	}, nil
 }
 
-// Connect establishes connection to MariaDB database.
-// 如果 Config.Database 为空，则连接到实例级别（不指定数据库）。
-func (c *MariaDBConnector) Connect(ctx context.Context) error {
-	if c.connected {
-		return nil
-	}
-
-	// Build DSN
+func (c *MariaDBConnector) connectionString() string {
 	values := url.Values{}
 	values.Set("charset", "utf8mb4")
 	values.Set("parseTime", "true")
@@ -168,11 +163,21 @@ func (c *MariaDBConnector) Connect(ctx context.Context) error {
 		values.Set(k, fmt.Sprintf("%v", v))
 	}
 
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/?%s",
-		c.config.Username, c.config.Password, c.config.Host, c.config.Port,
+	return fmt.Sprintf("%s:%s@tcp(%s)/?%s",
+		c.config.Username,
+		c.config.Password,
+		net.JoinHostPort(c.config.Host, strconv.Itoa(c.config.Port)),
 		values.Encode())
+}
 
-	db, err := sql.Open("mysql", dsn)
+// Connect establishes connection to MariaDB database.
+// 如果 Config.Database 为空，则连接到实例级别（不指定数据库）。
+func (c *MariaDBConnector) Connect(ctx context.Context) error {
+	if c.connected {
+		return nil
+	}
+
+	db, err := sql.Open("mysql", c.connectionString())
 	if err != nil {
 		return err
 	}
@@ -259,67 +264,4 @@ func (c *MariaDBConnector) validateDatabases(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-// ExecuteRawSQL 执行原始SQL查询
-func (c *MariaDBConnector) ExecuteRawSQL(ctx context.Context, sql string) (*interfaces.RawQueryResponse, error) {
-	if err := c.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("connect failed: %w", err)
-	}
-
-	rows, err := c.db.QueryContext(ctx, sql)
-	if err != nil {
-		return nil, fmt.Errorf("execute query failed: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, fmt.Errorf("get columns failed: %w", err)
-	}
-
-	columnTypes, err := rows.ColumnTypes()
-	if err != nil {
-		return nil, fmt.Errorf("get column types failed: %w", err)
-	}
-
-	response := &interfaces.RawQueryResponse{
-		Columns: make([]interfaces.ColumnInfo, len(columns)),
-		Entries: make([]map[string]any, 0),
-	}
-
-	// 填充列信息
-	for i, col := range columns {
-		response.Columns[i] = interfaces.ColumnInfo{
-			Name: col,
-			Type: c.MapType(columnTypes[i].DatabaseTypeName()),
-		}
-	}
-
-	// 读取结果行
-	for rows.Next() {
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, fmt.Errorf("scan row failed: %w", err)
-		}
-
-		row := make(map[string]any)
-		for i, col := range columns {
-			row[col] = convertValue(values[i])
-		}
-		response.Entries = append(response.Entries, row)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate rows failed: %w", err)
-	}
-
-	totalCount := int64(len(response.Entries))
-	response.TotalCount = &totalCount
-
-	return response, nil
 }

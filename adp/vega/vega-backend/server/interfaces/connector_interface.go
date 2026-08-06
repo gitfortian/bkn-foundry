@@ -68,6 +68,14 @@ type TableConnector interface {
 	// ExecuteQuery 执行单表查询语句
 	ExecuteQuery(ctx context.Context, resource *Resource,
 		params *ResourceDataQueryParams) (*QueryResult, error)
+	// BuildPagedSQL wraps a validated read-only SQL statement with the
+	// connector-specific offset/limit syntax.
+	BuildPagedSQL(sql string, offset, limit int) string
+	// BuildCountSQL wraps a validated read-only SQL statement with the
+	// connector-specific total-count syntax.
+	BuildCountSQL(sql string) string
+	// ExecuteRawSQL 执行统一查询链路已校验的只读 SQL。
+	ExecuteRawSQL(ctx context.Context, sql string) (*RawQueryResponse, error)
 }
 
 // FileConnector defines the interface for file/document storage connectors.
@@ -132,9 +140,4 @@ type IndexConnector interface {
 // Implementations: rest, graphql, etc.
 type APIConnector interface {
 	Connector
-}
-
-// MariaDBSQLExecutor defines the interface for executing raw SQL on MariaDB
-type MariaDBSQLExecutor interface {
-	ExecuteRawSQL(ctx context.Context, sql string) (*RawQueryResponse, error)
 }

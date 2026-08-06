@@ -17,7 +17,7 @@ import (
 	"github.com/openbkn-ai/bkn-comm-go/logger"
 
 	"vega-backend/interfaces"
-	"vega-backend/logics/connector/local/table/safelog"
+	"vega-backend/logics/connector/local/table"
 )
 
 // convertValue converts []byte to string for MariaDB driver compatibility
@@ -26,6 +26,79 @@ func convertValue(v any) any {
 		return string(b)
 	}
 	return v
+}
+
+// BuildPagedSQL applies MariaDB paging syntax to a validated query.
+func (c *MariaDBConnector) BuildPagedSQL(sql string, offset, limit int) string {
+	return fmt.Sprintf("SELECT * FROM (%s) AS _raw_query_page LIMIT %d OFFSET %d", sql, limit, offset)
+}
+
+// BuildCountSQL applies MariaDB total-count syntax to a validated query.
+func (c *MariaDBConnector) BuildCountSQL(sql string) string {
+	return fmt.Sprintf("SELECT COUNT(*) AS _raw_query_total_count FROM (%s) AS _raw_query_total", sql)
+}
+
+// ExecuteRawSQL 执行原始SQL查询
+func (c *MariaDBConnector) ExecuteRawSQL(ctx context.Context, sql string) (*interfaces.RawQueryResponse, error) {
+	if err := c.Connect(ctx); err != nil {
+		return nil, fmt.Errorf("connect failed: %w", err)
+	}
+
+	rows, err := c.db.QueryContext(ctx, sql)
+	if err != nil {
+		return nil, fmt.Errorf("execute query failed: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("get columns failed: %w", err)
+	}
+
+	columnTypes, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, fmt.Errorf("get column types failed: %w", err)
+	}
+
+	response := &interfaces.RawQueryResponse{
+		Columns: make([]interfaces.ColumnInfo, len(columns)),
+		Entries: make([]map[string]any, 0),
+	}
+
+	// 填充列信息
+	for i, col := range columns {
+		response.Columns[i] = interfaces.ColumnInfo{
+			Name: col,
+			Type: c.MapType(columnTypes[i].DatabaseTypeName()),
+		}
+	}
+
+	// 读取结果行
+	for rows.Next() {
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, fmt.Errorf("scan row failed: %w", err)
+		}
+
+		row := make(map[string]any)
+		for i, col := range columns {
+			row[col] = convertValue(values[i])
+		}
+		response.Entries = append(response.Entries, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate rows failed: %w", err)
+	}
+
+	totalCount := int64(len(response.Entries))
+	response.TotalCount = &totalCount
+
+	return response, nil
 }
 
 func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interfaces.Resource,
@@ -50,7 +123,7 @@ func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interface
 	}
 
 	result := &interfaces.QueryResult{
-		Rows: make([]map[string]any, 0),
+		Entries: make([]map[string]any, 0),
 	}
 
 	// 构建SELECT子句
@@ -231,9 +304,9 @@ func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interface
 
 	isAggregate := params.Aggregation != nil || len(params.GroupBy) > 0 || params.Having != nil
 	if isAggregate {
-		logger.Debugf("aggregate query: %s", safelog.SQLSummary(query, args))
+		logger.Debugf("aggregate query: %s", table.SQLSummary(query, args))
 	} else {
-		logger.Debugf("query: %s", safelog.SQLSummary(query, args))
+		logger.Debugf("query: %s", table.SQLSummary(query, args))
 	}
 
 	rows, err := c.db.QueryContext(ctx, query, args...)
@@ -263,14 +336,14 @@ func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interface
 		for i, col := range columns {
 			row[col] = convertValue(values[i])
 		}
-		result.Rows = append(result.Rows, row)
+		result.Entries = append(result.Entries, row)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
 	// 处理总数（仅明细查询）：独立 COUNT 查询，与 postgresql 连接器对齐。
-	// 此前直接取 len(result.Rows)——即本页行数，超过一页的表 total 永远等于
+	// 此前直接取 len(result.Entries)——即本页行数，超过一页的表 total 永远等于
 	// LIMIT（构建任务进度条显示 "20802 / 1000" 即此 bug）
 	if params.NeedTotal && !isAggregate {
 		countBuilder := sq.Select("COUNT(1)").From(resource.SourceIdentifier)
@@ -281,7 +354,7 @@ func (c *MariaDBConnector) ExecuteQuery(ctx context.Context, resource *interface
 		if countErr != nil {
 			return nil, fmt.Errorf("failed to build count query: %w", countErr)
 		}
-		logger.Debugf("count query: %s", safelog.SQLSummary(countQuery, countArgs))
+		logger.Debugf("count query: %s", table.SQLSummary(countQuery, countArgs))
 		var total int64
 		row := c.db.QueryRowContext(ctx, countQuery, countArgs...)
 		if err := row.Scan(&total); err != nil {
