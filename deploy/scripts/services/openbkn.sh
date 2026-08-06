@@ -440,7 +440,8 @@ OPENBKN_TRACE_INGEST_SECRET="${OPENBKN_TRACE_INGEST_SECRET:-bkn-trace-evidence-i
 
 # The chart defaults keep standalone development lightweight. A complete
 # OpenBKN installation, however, must make managed Agent conversations durable
-# and queryable after agent-observability restarts.
+# and queryable after agent-observability restarts. The trace/log indexes below
+# must track the bundled Collector's ss4o dataset=default and namespace=namespace.
 _openbkn_trace_profile_sets() {
     local release_name="$1"
     case "${release_name}" in
@@ -454,11 +455,14 @@ _openbkn_trace_profile_sets() {
                 "evidence.indexManagement.createJob.enabled=true"
                 "evidence.ingestAuth.existingSecret=${OPENBKN_TRACE_INGEST_SECRET}"
                 "evidence.ingestAuth.secretKey=token"
+                "opensearch.traceIndex=ss4o_traces-default-namespace"
+                "opensearch.logIndex=ss4o_logs-default-namespace"
             )
             ;;
         agent-retrieval)
             CORE_RELEASE_EXTRA_SETS+=(
                 "observability.trace.enabled=true"
+                "observability.log.enabled=true"
                 "observability.lifecycle.core_url=http://agent-observability-internal:8081"
                 "observability.evidence.ingest_url=http://agent-observability:8080/api/agent-observability/v1/evidence/events"
                 "observability.evidence.ingest_token_secret_name=${OPENBKN_TRACE_INGEST_SECRET}"

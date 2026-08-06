@@ -48,11 +48,27 @@ contains "AO creates evidence index" "${ao_sets}" "evidence.indexManagement.crea
 contains "AO protects evidence producer ingest" "${ao_sets}" "evidence.ingestAuth.existingSecret=bkn-trace-evidence-ingest"
 not_contains "AO has no query gateway Secret" "${ao_sets}" "queryAuth.existingSecret="
 
+otel_values="$(<"${SCRIPT_DIR}/../bkn-trace/otelcol-contribute-chart/charts/otelcol-contrib/values.yaml")"
+contains "collector uses the Trace profile dataset" "${otel_values}" "dataset: default"
+contains "collector uses the Trace profile namespace" "${otel_values}" "namespace: namespace"
+contains "collector uses SS4O index names" "${otel_values}" "mode: ss4o"
+collector_dataset="$(awk '/^  dataset:/ { print $2; exit }' <<<"${otel_values}")"
+collector_namespace="$(awk '/^  namespace:/ { print $2; exit }' <<<"${otel_values}")"
+expected_trace_index="ss4o_traces-${collector_dataset}-${collector_namespace}"
+expected_log_index="ss4o_logs-${collector_dataset}-${collector_namespace}"
+contains "AO profile reads the Collector Trace index" "${ao_sets}" "opensearch.traceIndex=${expected_trace_index}"
+contains "AO profile reads the Collector log index" "${ao_sets}" "opensearch.logIndex=${expected_log_index}"
+
+agent_observability_values="$(<"${SCRIPT_DIR}/../bkn-trace/agent-observability/charts/agent-observability/values.yaml")"
+contains "standalone AO reads the Collector Trace index" "${agent_observability_values}" "traceIndex: ${expected_trace_index}"
+contains "standalone AO reads the Collector log index" "${agent_observability_values}" "logIndex: ${expected_log_index}"
+
 CORE_RELEASE_EXTRA_SETS=()
 _openbkn_trace_profile_sets agent-retrieval
 ar_sets="${CORE_RELEASE_EXTRA_SETS[*]:-}"
 contains "retrieval targets internal Trace Core" "${ar_sets}" "observability.lifecycle.core_url=http://agent-observability-internal:8081"
 contains "retrieval emits Trace spans" "${ar_sets}" "observability.trace.enabled=true"
+contains "retrieval emits searchable runtime logs" "${ar_sets}" "observability.log.enabled=true"
 contains "retrieval emits evidence through token-protected ingest" "${ar_sets}" "observability.evidence.ingest_url=http://agent-observability:8080/api/agent-observability/v1/evidence/events"
 contains "retrieval uses evidence ingest Secret" "${ar_sets}" "observability.evidence.ingest_token_secret_name=bkn-trace-evidence-ingest"
 not_contains "retrieval has no query gateway Secret" "${ar_sets}" "gateway_token_secret_name="
