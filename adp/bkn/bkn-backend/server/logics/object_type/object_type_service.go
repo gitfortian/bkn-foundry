@@ -1959,15 +1959,16 @@ func (ots *objectTypeService) GetObjectTypeByID(ctx context.Context, tx *sql.Tx,
 // multi_match 的执行链路本来就是通的（bkn 改写 → Vega 路由到 fulltext 子字段），
 // 这里只是把它如实登记出来，让上层检索知道可以用。
 //
-// 向量能力有意不映射成 knn：knn 改写要求属性类型字面是 vector，而表资源的源字段
-// 是 string，向量落在构建任务生成的字段上，对象类里并没有对应属性——现在放开
-// 只会让上层稳定收到 400。等「生成向量字段 → 对象类属性」的映射契约落地后再说。
+// 向量能力映射成 knn 的前提是属性上已经带了 index_config.vector_config（物理向量
+// 字段 + 已解析的模型 ID）：表资源的源字段是 string，向量落在构建任务生成的字段上，
+// 查询侧靠这份配置改写，缺了就发不出去。调用方在解析不到模型时会先把 Vector 置回
+// false，所以这里只管如实登记。
 func applyIndexCapOps(ops []string, propCaps logics.PropertyIndexCaps) []string {
-	if !propCaps.Keyword && !propCaps.Fulltext {
+	if !propCaps.Keyword && !propCaps.Fulltext && !propCaps.Vector {
 		return ops
 	}
 
-	merged := make([]string, len(ops), len(ops)+len(interfaces.DSL_KEYWORD_OPS)+len(interfaces.DSL_TEXT_OPS))
+	merged := make([]string, len(ops), len(ops)+len(interfaces.DSL_KEYWORD_OPS)+len(interfaces.DSL_TEXT_OPS)+len(interfaces.DSL_VECTOR_OPS))
 	copy(merged, ops)
 	seen := make(map[string]struct{}, cap(merged))
 	for _, op := range merged {
@@ -1988,6 +1989,9 @@ func applyIndexCapOps(ops []string, propCaps logics.PropertyIndexCaps) []string 
 	}
 	if propCaps.Fulltext {
 		appendOps(interfaces.DSL_TEXT_OPS)
+	}
+	if propCaps.Vector {
+		appendOps(interfaces.DSL_VECTOR_OPS)
 	}
 	return merged
 }

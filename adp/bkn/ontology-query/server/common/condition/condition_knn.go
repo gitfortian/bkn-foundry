@@ -133,34 +133,42 @@ func (cond *KnnCond) Convert2SQL(ctx context.Context) (string, error) {
 func rewriteKnnCond(ctx context.Context, cfg *CondCfg,
 	vectorizer func(ctx context.Context, property *DataProperty, word string) ([]VectorResp, error)) (*CondCfg, error) {
 
-	// 过滤条件中的属性字段换成映射的视图字段
 	if cfg.NameField.Name == "" {
 		return nil, fmt.Errorf("向量过滤[knn]操作符使用的过滤字段[%s]在对象类的属性中不存在", cfg.Name)
 	}
 
-	// 转为视图的 knn_vector 的查询，则要求字段是 vector 字段，且小模型不为空
-	if cfg.NameField.Type != dtype.DATATYPE_VECTOR {
-		return nil, fmt.Errorf("condition [knn] left field is not a vector field: %s:%s", cfg.NameField.Name, cfg.NameField.Type)
+	// 属性本身就是 vector 类型：向量就存在这个字段上，用哪个模型也由对象类自己声明
+	// （index_config.vector_config.model_id）。这是对象类的 Schema，不是底层索引的
+	// 实现细节，所以在这里算好向量传下去——这类资源可能根本没有本地构建索引
+	// （例如直接对接的向量索引资源），下游没有别的依据可用。
+	if cfg.NameField.Type == dtype.DATATYPE_VECTOR {
+		if cfg.NameField.IndexConfig == nil || cfg.NameField.IndexConfig.VectorConfig.ModelID == "" {
+			return nil, fmt.Errorf("condition [knn] left field field: %s need config a small model, current small model is empty", cfg.NameField.Name)
+		}
+
+		vector, err := vectorizer(ctx, cfg.NameField, fmt.Sprintf("%v", cfg.Value))
+		if err != nil {
+			return nil, fmt.Errorf("condition [knn]: vectorizer [%v] failed, error: %s", cfg.Value, err.Error())
+		}
+
+		return &CondCfg{
+			Name:      cfg.NameField.MappedField.Name,
+			Operation: OperationKNNVector,
+			ValueOptCfg: ValueOptCfg{
+				Value: vector[0].Vector,
+			},
+			RemainCfg: cfg.RemainCfg,
+		}, nil
 	}
 
-	// knn能支持的场景: 字段类型是 vector 或者字段配置了向量索引的构建
-	if cfg.NameField.IndexConfig == nil || cfg.NameField.IndexConfig.VectorConfig.ModelID == "" {
-		return nil, fmt.Errorf("condition [knn] left field field: %s need config a small model, current small model is empty", cfg.NameField.Name)
-	}
-
-	// value 是向量化后的内容
-	v := fmt.Sprintf("%v", cfg.Value)
-
-	vector, err := vectorizer(ctx, cfg.NameField, v)
-	if err != nil {
-		return nil, fmt.Errorf("condition [knn]: vectorizer [%s] failed, error: %s", v, err.Error())
-	}
-
+	// 标量属性：向量落在构建任务生成的字段上，字段名与模型都是本地索引的实现细节，
+	// 交给 vega 自己解析——它知道索引是哪个构建任务建的、当时用的哪个模型。这里只把
+	// 逻辑属性名换成资源字段名，查询词原样下传（与全文检索的分工一致）。
 	return &CondCfg{
 		Name:      cfg.NameField.MappedField.Name,
-		Operation: OperationKNNVector, // 操作符为 knn_vector
+		Operation: OperationKNNVector,
 		ValueOptCfg: ValueOptCfg{
-			Value: vector[0].Vector, // 值用向量化后的内容
+			Value: cfg.Value,
 		},
 		RemainCfg: cfg.RemainCfg,
 	}, nil
