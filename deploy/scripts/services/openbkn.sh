@@ -1057,8 +1057,6 @@ install_openbkn() {
     # Best-effort: never fails the install.
     gen_install_status_json || true
 
-    log_info "Context Loader toolset is auto-imported by agent-retrieval at startup (no manual onboard step needed)."
-
     local _host _port _scheme
     _host="$(_read_access_address_field "host" 2>/dev/null || true)"
     _port="$(_read_access_address_field "port" 2>/dev/null || true)"
