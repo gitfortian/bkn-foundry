@@ -437,6 +437,11 @@ CORE_RELEASE_EXTRA_SET_STRINGS=()
 OPENBKN_TRACE_CORE_SECRET="${OPENBKN_TRACE_CORE_SECRET:-bkn-trace-core-mariadb}"
 OPENBKN_TRACE_DATABASE="bkn_trace"
 OPENBKN_TRACE_INGEST_SECRET="${OPENBKN_TRACE_INGEST_SECRET:-bkn-trace-evidence-ingest}"
+# One definition of where Evidence goes. Producers use different value keys, so
+# repeating the literal per release is how they drift apart — and a producer
+# posting to the wrong path fails the same silent way an unwired one does.
+OPENBKN_TRACE_EVIDENCE_INGEST_URL="${OPENBKN_TRACE_EVIDENCE_INGEST_URL:-http://agent-observability:8080/api/agent-observability/v1/evidence/events}"
+OPENBKN_TRACE_ARTIFACT_INGEST_URL="${OPENBKN_TRACE_ARTIFACT_INGEST_URL:-http://agent-observability:8080/api/agent-observability/v1/evidence/artifacts}"
 OPENBKN_TRACE_OPENSEARCH_SECRET="${OPENBKN_TRACE_OPENSEARCH_SECRET:-bkn-trace-opensearch}"
 
 _openbkn_trace_opensearch_protocol() {
@@ -495,12 +500,206 @@ _openbkn_trace_profile_sets() {
                 "observability.trace.enabled=true"
                 "observability.log.enabled=true"
                 "observability.lifecycle.core_url=http://agent-observability-internal:8081"
-                "observability.evidence.ingest_url=http://agent-observability:8080/api/agent-observability/v1/evidence/events"
+                "observability.evidence.ingest_url=${OPENBKN_TRACE_EVIDENCE_INGEST_URL}"
                 "observability.evidence.ingest_token_secret_name=${OPENBKN_TRACE_INGEST_SECRET}"
                 "observability.evidence.ingest_token_secret_key=token"
             )
             ;;
+        vega-backend)
+            # A different chart generation, so the same three facts live under
+            # different keys. Both the URL and the Secret name must be set: each
+            # gates its own env block in the template, and the token alone —
+            # without an ingest URL — writes nowhere.
+            CORE_RELEASE_EXTRA_SETS+=(
+                "bknTrace.evidence.ingestUrl=${OPENBKN_TRACE_EVIDENCE_INGEST_URL}"
+                "bknTrace.evidence.artifactIngestUrl=${OPENBKN_TRACE_ARTIFACT_INGEST_URL}"
+                "bknTrace.evidence.ingestTokenSecretName=${OPENBKN_TRACE_INGEST_SECRET}"
+                "bknTrace.evidence.ingestTokenSecretKey=token"
+            )
+            ;;
     esac
+}
+
+# Releases that write Evidence and therefore need the ingest token. Their charts
+# all default ingestTokenSecretName to the empty string, and the template only
+# injects the token env when that name is set — so a producer nobody wires here
+# posts Evidence with no token at all, which agent-observability rejects
+# (allowUnauthenticated defaults to false).
+#
+# That failure is silent: the pod stays green and only the Evidence goes
+# missing. Naming the unwired ones at install time is the difference between a
+# known gap and a mystery weeks later.
+_OPENBKN_TRACE_EVIDENCE_PRODUCERS=(
+    agent-retrieval
+    vega-backend
+    bkn-backend
+    ontology-query
+    bkn-agent
+    agent-operator-integration
+)
+
+# Env vars that used to be written into the Deployment as a literal value and
+# are now sourced from a Secret.
+_OPENBKN_ENV_MOVED_TO_SECRET=(
+    BKN_TRACE_EVIDENCE_INGEST_TOKEN
+)
+
+# Kubernetes merges a container's env list by name, so an entry that carried a
+# literal `value` keeps it while the new render adds `valueFrom` — and a
+# container may not have both:
+#
+#   env[N].valueFrom: Invalid value: "": may not be specified when `value` is not empty
+#
+# helm upgrade cannot resolve that on its own; the stale entry has to go first.
+# Every deployment installed before the token moved into a Secret hits this, so
+# without this step "upgrade the existing installation" simply fails — the same
+# class of blocker as the Secret key rename, and the one an operator is least
+# equipped to diagnose from the message above.
+#
+# Dropping the whole entry rather than just its value keeps this a single
+# strategic-merge patch, and the chart re-adds it in the same upgrade.
+# Deliberately quiet when there is nothing to do: fresh installs and
+# already-migrated ones must not print a scary line about Secrets.
+_openbkn_drop_literal_env_now_from_secret() {
+    local release_name="$1"
+    local namespace="$2"
+    local env_name current_value container_name
+
+    kubectl get deployment "${release_name}" -n "${namespace}" >/dev/null 2>&1 || return 0
+
+    # The strategic patch addresses the container by name. It happens to equal
+    # the release name for every release here, but reading it costs one call and
+    # removes a coincidence the next chart is free to break.
+    container_name="$(kubectl get deployment "${release_name}" -n "${namespace}" \
+        -o jsonpath='{.spec.template.spec.containers[0].name}' 2>/dev/null)"
+    [[ -n "${container_name}" ]] || return 0
+
+    for env_name in "${_OPENBKN_ENV_MOVED_TO_SECRET[@]}"; do
+        # A literal survivor has .value set. One already sourced from a Secret
+        # has only .valueFrom, so this reads empty and is left alone.
+        current_value="$(kubectl get deployment "${release_name}" -n "${namespace}" \
+            -o "jsonpath={.spec.template.spec.containers[0].env[?(@.name=='${env_name}')].value}" 2>/dev/null)"
+        [[ -n "${current_value}" ]] || continue
+
+        if kubectl patch deployment "${release_name}" -n "${namespace}" --type=strategic \
+            -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"${container_name}\",\"env\":[{\"name\":\"${env_name}\",\"\$patch\":\"delete\"}]}]}}}}" >/dev/null 2>&1; then
+            log_info "${release_name}: dropped literal ${env_name} so the upgrade can source it from a Secret"
+        else
+            log_warn "${release_name}: could not drop literal ${env_name}; the upgrade will fail while both value and valueFrom are set"
+        fi
+    done
+}
+
+# Run one release's helm upgrade, adopting pre-Helm objects if that is what
+# blocked it, then retrying once.
+#
+# Output keeps streaming — an install waits minutes on cold pulls and a silent
+# terminal reads as a hang — so helm's own exit code comes from PIPESTATUS.
+_openbkn_helm_upgrade_release() {
+    local release_name="$1" namespace="$2"
+    shift 2
+    local -a helm_args=("$@")
+
+    # Here rather than at either call site: both the repository and the local
+    # --charts-dir paths reach helm through this function, and a cleanup wired
+    # to only one of them leaves the other stuck on exactly the error it exists
+    # to remove.
+    _openbkn_drop_literal_env_now_from_secret "${release_name}" "${namespace}"
+
+    local helm_log
+    helm_log="$(mktemp)"
+    helm "${helm_args[@]}" 2>&1 | tee "${helm_log}"
+    local helm_status=${PIPESTATUS[0]}
+
+    if [[ ${helm_status} -ne 0 ]] && _openbkn_adopt_unowned_resources "${helm_log}" "${release_name}" "${namespace}"; then
+        log_info "Retrying ${release_name} now that its pre-Helm objects are adopted..."
+        helm "${helm_args[@]}" 2>&1 | tee "${helm_log}"
+        helm_status=${PIPESTATUS[0]}
+    fi
+    rm -f "${helm_log}"
+
+    if [[ ${helm_status} -eq 0 ]]; then
+        log_info "✓ ${release_name} installed successfully"
+        return 0
+    fi
+    log_error "✗ Failed to install ${release_name}"
+    return 1
+}
+
+# Helm 3 refuses to take over an object it did not create:
+#
+#   Service "agent-observability-internal" in namespace "openbkn" exists and
+#   cannot be imported into the current release: invalid ownership metadata
+#
+# Installations old enough to predate an object moving into a chart hit this,
+# and the upgrade stops on an error that names no remedy. Stamping the three
+# fields Helm looks for is the documented way to hand an existing object over.
+#
+# Cluster-scoped objects (ClusterRole, ClusterRoleBinding, …) appear in the same
+# error with an EMPTY namespace — helm still says `in namespace ""`. They are
+# adopted the same way, addressed without -n; the release-namespace annotation
+# still names the release's namespace, which is what helm compares against.
+# Dropping them for want of a namespace would leave the upgrade stuck on exactly
+# the error this function exists to clear, and silently.
+#
+# Only objects that NO release claims are adopted. One already annotated for a
+# different release is a real collision — two charts believing they own the same
+# object — and silently reassigning it would let the rightful owner's next
+# upgrade delete something this release depends on. That case is reported and
+# left alone.
+#
+# Succeeds only when something was adopted, i.e. when a retry is worth doing.
+_openbkn_adopt_unowned_resources() {
+    local helm_log="$1" release_name="$2" namespace="$3"
+    local adopted=1 kind name res_ns owner scope
+    local -a ns_args
+
+    while IFS=$'\t' read -r kind name res_ns; do
+        [[ -n "${kind}" && -n "${name}" ]] || continue
+
+        if [[ -n "${res_ns}" ]]; then
+            ns_args=(-n "${res_ns}")
+            scope="in ${res_ns}"
+        else
+            ns_args=()
+            scope="(cluster-scoped)"
+        fi
+
+        owner="$(kubectl "${ns_args[@]}" get "${kind}" "${name}" \
+            -o 'jsonpath={.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null)"
+        if [[ -n "${owner}" ]]; then
+            log_error "${kind}/${name} ${scope} is already owned by release ${owner}; not reassigning it to ${release_name}"
+            continue
+        fi
+
+        if kubectl "${ns_args[@]}" label "${kind}" "${name}" \
+                "app.kubernetes.io/managed-by=Helm" --overwrite >/dev/null 2>&1 &&
+           kubectl "${ns_args[@]}" annotate "${kind}" "${name}" \
+                "meta.helm.sh/release-name=${release_name}" \
+                "meta.helm.sh/release-namespace=${namespace}" --overwrite >/dev/null 2>&1; then
+            log_info "Adopted pre-Helm ${kind}/${name} ${scope} into release ${release_name}"
+            adopted=0
+        else
+            log_warn "Could not adopt ${kind}/${name} ${scope}; ${release_name} will keep failing on ownership"
+        fi
+    done < <(sed -nE 's/.*[[:space:]]([A-Za-z]+) "([^"]+)" in namespace "([^"]*)" exists and cannot be imported.*/\1\t\2\t\3/p' "${helm_log}")
+
+    return ${adopted}
+}
+
+_openbkn_warn_unwired_evidence_producers() {
+    local -a unwired=()
+    local release_name
+    for release_name in "$@"; do
+        _openbkn_release_list_contains "${release_name}" "${_OPENBKN_TRACE_EVIDENCE_PRODUCERS[@]}" || continue
+        case "${release_name}" in
+            agent-retrieval|vega-backend) ;;
+            *) unwired+=("${release_name}") ;;
+        esac
+    done
+    if [[ ${#unwired[@]} -gt 0 ]]; then
+        log_warn "BKN Trace: no Evidence ingest token wired for ${unwired[*]} — their Evidence writes will be rejected until their charts are wired here"
+    fi
 }
 
 _openbkn_release_list_contains() {
@@ -513,16 +712,45 @@ _openbkn_release_list_contains() {
     return 1
 }
 
+# The key this Secret is read under is "token". Deployments that predate that
+# name hold the same value under "ingest-token" — still the default of every
+# producer chart's ingestTokenSecretKey — so an upgrade finds a Secret that
+# exists but looks empty.
+#
+# Such an installation must upgrade, not stop: an existing community deployment
+# being able to move to the enterprise images is the whole upgrade path, and it
+# cannot depend on an operator knowing to rename a Secret key by hand.
+#
+# The legacy value is carried across rather than replaced with a fresh one.
+# Producers already hold the old token; minting a new one would silently break
+# every evidence write that works today — the failure would show up as missing
+# evidence long after the upgrade, with nothing pointing back to it.
+#
+# The old key is left in place. Rolling back to the previous chart must keep
+# working, and an unused key costs nothing.
 _openbkn_prepare_trace_ingest_secret() {
     local namespace="$1"
     if kubectl get secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" >/dev/null 2>&1; then
         local encoded_token
         encoded_token="$(kubectl get secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" -o jsonpath='{.data.token}' 2>/dev/null)"
-        if [[ -z "${encoded_token}" ]]; then
-            log_error "BKN Trace Evidence ingest Secret ${OPENBKN_TRACE_INGEST_SECRET} must contain key token"
-            return 1
+        if [[ -n "${encoded_token}" ]]; then
+            return 0
         fi
-        return 0
+
+        local legacy_token
+        legacy_token="$(kubectl get secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" -o jsonpath='{.data.ingest-token}' 2>/dev/null)"
+        if [[ -n "${legacy_token}" ]]; then
+            if ! kubectl patch secret "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" --type=json \
+                -p "[{\"op\":\"add\",\"path\":\"/data/token\",\"value\":\"${legacy_token}\"}]" >/dev/null; then
+                log_error "BKN Trace cannot migrate Evidence ingest Secret ${OPENBKN_TRACE_INGEST_SECRET} from key ingest-token to token"
+                return 1
+            fi
+            log_info "BKN Trace Evidence ingest Secret ${OPENBKN_TRACE_INGEST_SECRET}: copied legacy key ingest-token to token (same value; old key kept)"
+            return 0
+        fi
+
+        log_error "BKN Trace Evidence ingest Secret ${OPENBKN_TRACE_INGEST_SECRET} must contain key token, and has no legacy ingest-token to migrate from"
+        return 1
     fi
 
     if ! generate_random_password 48 | kubectl create secret generic "${OPENBKN_TRACE_INGEST_SECRET}" -n "${namespace}" \
@@ -664,7 +892,11 @@ _openbkn_release_extra_sets() {
         else
             CORE_RELEASE_EXTRA_SETS+=("evidence.ingestAuth.createSecret=false")
         fi
-    elif [[ "${release_name}" == "agent-retrieval" || "${release_name}" == "otelcol-contrib" ]]; then
+    elif [[ "${release_name}" == "agent-retrieval" || "${release_name}" == "otelcol-contrib" ||
+            "${release_name}" == "vega-backend" ]]; then
+        # This list gates _openbkn_trace_profile_sets: a release absent here
+        # never reaches the case inside it, however complete that case looks.
+        # Adding a producer means adding it in both places.
         _openbkn_trace_profile_sets "${release_name}"
         if [[ "${release_name}" == "agent-retrieval" ]]; then
             # This chart renders metadata.namespace from values; keep it aligned
@@ -747,12 +979,7 @@ _install_openbkn_release_local() {
         helm_args+=("--set" "${set_value}")
     done
 
-    if helm "${helm_args[@]}"; then
-        log_info "✓ ${release_name} installed successfully"
-    else
-        log_error "✗ Failed to install ${release_name}"
-        return 1
-    fi
+    _openbkn_helm_upgrade_release "${release_name}" "${namespace}" "${helm_args[@]}"
 }
 
 # Install a single bkn-foundry release from a Helm repository
@@ -820,12 +1047,7 @@ _install_openbkn_release_repo() {
         helm_args+=("--set" "${set_value}")
     done
 
-    if helm "${helm_args[@]}"; then
-        log_info "✓ ${release_name} installed successfully"
-    else
-        log_error "✗ Failed to install ${release_name}"
-        return 1
-    fi
+    _openbkn_helm_upgrade_release "${release_name}" "${namespace}" "${helm_args[@]}"
 }
 
 # Resolve a --registry shorthand to a full registry/namespace string.
@@ -1111,6 +1333,7 @@ install_openbkn() {
             log_error "BKN Trace installation profile is not ready"
             return 1
         fi
+        _openbkn_warn_unwired_evidence_producers "${release_names[@]}"
     fi
 
     local release_version
