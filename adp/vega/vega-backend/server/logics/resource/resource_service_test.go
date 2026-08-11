@@ -801,6 +801,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			Category:  interfaces.ResourceCategoryTable,
 		}, &interfaces.ResourceRequest{
 			CatalogID:  "catalog-1",
+			Category:   interfaces.ResourceCategoryTable,
 			Name:       "resource",
 			Extensions: &extensionValues,
 		})
@@ -828,8 +829,9 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), gomock.Any()).Return(true, nil)
 		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any()).Return(nil)
 
-		err := rs.Update(context.Background(), &interfaces.Resource{ID: "r1", Name: "updated"}, &interfaces.ResourceRequest{
-			Name: "updated",
+		err := rs.Update(context.Background(), &interfaces.Resource{ID: "r1", Name: "updated", Category: interfaces.ResourceCategoryTable}, &interfaces.ResourceRequest{
+			Name:     "updated",
+			Category: interfaces.ResourceCategoryTable,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -859,6 +861,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			SchemaDefinition: []*interfaces.Property{{
@@ -906,6 +909,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			Description:      "new",
 			SourceIdentifier: "public.orders",
@@ -948,6 +952,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			SchemaDefinition: []*interfaces.Property{{
@@ -989,6 +994,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			IndexConfig: &interfaces.ResourceIndexConfig{
@@ -1037,6 +1043,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			IndexConfig: &interfaces.ResourceIndexConfig{
@@ -1074,6 +1081,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			IndexConfig: &interfaces.ResourceIndexConfig{
@@ -1119,6 +1127,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			IndexConfig: &interfaces.ResourceIndexConfig{
@@ -1155,6 +1164,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			SchemaDefinition: []*interfaces.Property{{
@@ -1181,8 +1191,45 @@ func TestResourceServiceUpdate(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.customers",
+		})
+
+		httpErr, ok := err.(*rest.HTTPError)
+		if !ok {
+			t.Fatalf("expected HTTPError, got %T", err)
+		}
+		if httpErr.HTTPCode != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", httpErr.HTTPCode)
+		}
+	})
+	t.Run("update requires category", func(t *testing.T) {
+		rs, _, mockPS, _, _, _, _ := newTestService(t)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+		err := rs.Update(context.Background(), &interfaces.Resource{
+			ID:       "r1",
+			Category: interfaces.ResourceCategoryDataset,
+		}, &interfaces.ResourceRequest{})
+
+		httpErr, ok := err.(*rest.HTTPError)
+		if !ok {
+			t.Fatalf("expected HTTPError, got %T", err)
+		}
+		if httpErr.HTTPCode != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", httpErr.HTTPCode)
+		}
+	})
+	t.Run("update rejects category change", func(t *testing.T) {
+		rs, _, mockPS, _, _, _, _ := newTestService(t)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+
+		err := rs.Update(context.Background(), &interfaces.Resource{
+			ID:       "r1",
+			Category: interfaces.ResourceCategoryDataset,
+		}, &interfaces.ResourceRequest{
+			Category: interfaces.ResourceCategoryTable,
 		})
 
 		httpErr, ok := err.(*rest.HTTPError)
@@ -1206,6 +1253,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
 			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
 			SourceIdentifier: "public.orders",
 			SchemaDefinition: []*interfaces.Property{
@@ -1220,6 +1268,45 @@ func TestResourceServiceUpdate(t *testing.T) {
 		}
 		if httpErr.HTTPCode != http.StatusBadRequest {
 			t.Fatalf("expected 400, got %d", httpErr.HTTPCode)
+		}
+	})
+	t.Run("dataset update allows adding properties", func(t *testing.T) {
+		rs, mockRA, mockPS, _, _, mockCS, mockBTA := newTestService(t)
+		expectResourceServiceTransaction(t, rs, true)
+		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
+		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, int64(0), nil)
+		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
+		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource) error {
+				if got.LocalIndexName != "" {
+					t.Fatalf("expected LocalIndexName to be cleared, got %q", got.LocalIndexName)
+				}
+				if len(got.SchemaDefinition) != 2 || got.SchemaDefinition[1].Name != "title" {
+					t.Fatalf("expected added dataset property, got %#v", got.SchemaDefinition)
+				}
+				return nil
+			})
+
+		err := rs.Update(context.Background(), &interfaces.Resource{
+			ID:               "r1",
+			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryDataset,
+			Name:             "dataset",
+			LocalIndexName:   "vega-build-r1-task-1",
+			SourceIdentifier: "dataset-r1",
+			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
+		}, &interfaces.ResourceRequest{
+			CatalogID:        "cat1",
+			Category:         interfaces.ResourceCategoryDataset,
+			Name:             "dataset",
+			SourceIdentifier: "dataset-r1",
+			SchemaDefinition: []*interfaces.Property{
+				{Name: "id", Type: interfaces.DataType_String},
+				{Name: "title", Type: interfaces.DataType_Text},
+			},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
