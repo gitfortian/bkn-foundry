@@ -28,13 +28,14 @@ import (
 
 type analyzerValidatingIndexManager struct {
 	interfaces.LocalIndexManager
-	err      error
-	captured map[string]string
+	available bool
+	err       error
+	captured  []string
 }
 
-func (m *analyzerValidatingIndexManager) ValidateAnalyzers(_ context.Context, analyzers map[string]string) error {
-	m.captured = analyzers
-	return m.err
+func (m *analyzerValidatingIndexManager) ValidateAnalyzer(_ context.Context, analyzer string) (bool, error) {
+	m.captured = append(m.captured, analyzer)
+	return m.available, m.err
 }
 
 func TestBuildTaskServiceRejectsUnavailableFieldAnalyzerBeforePersistence(t *testing.T) {
@@ -42,11 +43,7 @@ func TestBuildTaskServiceRejectsUnavailableFieldAnalyzerBeforePersistence(t *tes
 	mockCS := mock_interfaces.NewMockCatalogService(ctrl)
 	mockRS := mock_interfaces.NewMockResourceService(ctrl)
 	mockBTA := mock_interfaces.NewMockBuildTaskAccess(ctrl)
-	validator := &analyzerValidatingIndexManager{err: &interfaces.AnalyzerUnavailableError{
-		Analyzer: "hanlp_index",
-		Fields:   []string{"status"},
-		Detail:   "analyzer not found",
-	}}
+	validator := &analyzerValidatingIndexManager{}
 	service := &buildTaskService{
 		bta:            mockBTA,
 		cs:             mockCS,
@@ -74,8 +71,8 @@ func TestBuildTaskServiceRejectsUnavailableFieldAnalyzerBeforePersistence(t *tes
 
 	_, err := service.Create(context.Background(), &interfaces.CreateBuildTaskRequest{ResourceID: "resource-1", Mode: interfaces.BuildTaskModeBatch})
 	httpErr := requireHTTPError(t, err, verrors.VegaBackend_BuildTask_InvalidParameter_Analyzer)
-	assert.Contains(t, httpErr.BaseError.ErrorDetails, "status")
-	assert.Equal(t, map[string]string{"coupon_code": "standard", "status": "hanlp_index"}, validator.captured)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, "analyzer")
+	assert.Len(t, validator.captured, 1)
 }
 
 func TestFillBuildTaskIndexSnapshotRejectsMissingEmbeddingModel(t *testing.T) {
@@ -95,6 +92,24 @@ func TestFillBuildTaskIndexSnapshotRejectsMissingEmbeddingModel(t *testing.T) {
 	requireHTTPError(t, err, verrors.VegaBackend_BuildTask_InvalidParameter_EmbeddingModel)
 }
 
+func TestFillBuildTaskIndexSnapshotRejectsDuplicateFeatureType(t *testing.T) {
+	service := &buildTaskService{}
+	buildTask := &interfaces.BuildTask{}
+
+	err := service.fillBuildTaskIndexSnapshot(context.Background(), &interfaces.Resource{
+		SchemaDefinition: []*interfaces.Property{{
+			Name: "title",
+			Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.PropertyFeatureType_Fulltext},
+				{FeatureType: interfaces.PropertyFeatureType_Fulltext},
+			},
+		}},
+	}, buildTask)
+
+	httpErr := requireHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, `property "title" has more than one "fulltext" feature`)
+}
+
 func TestValidateBuildTaskAnalyzersReturnsInternalErrorForTransportFailure(t *testing.T) {
 	validator := &analyzerValidatingIndexManager{err: errors.New("connect OpenSearch: connection refused")}
 	buildTask := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{
@@ -106,6 +121,20 @@ func TestValidateBuildTaskAnalyzersReturnsInternalErrorForTransportFailure(t *te
 	err := validateBuildTaskAnalyzers(context.Background(), validator, buildTask)
 	httpErr := requireHTTPError(t, err, verrors.VegaBackend_BuildTask_InternalError_ValidateAnalyzerFailed)
 	assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
+}
+
+func TestValidateBuildTaskAnalyzersReturnsCapabilityUnavailableForStartupProbeFailure(t *testing.T) {
+	validator := &analyzerValidatingIndexManager{err: &interfaces.IndexCapabilitiesUnavailableError{Cause: errors.New("connection refused")}}
+	buildTask := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{
+		Features: map[string]interfaces.BuildTaskFieldIndexFeature{
+			"status": {Fulltext: &interfaces.BuildTaskFulltextConfig{Analyzer: "hanlp_index"}},
+		},
+	}}
+
+	err := validateBuildTaskAnalyzers(context.Background(), validator, buildTask)
+	httpErr := requireHTTPError(t, err, verrors.VegaBackend_IndexCapability_InternalError_Unavailable)
+	assert.Equal(t, http.StatusServiceUnavailable, httpErr.HTTPCode)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, "connection refused")
 }
 
 func TestBuildTaskServicePopulatesTaskReferencesForListAndGet(t *testing.T) {
@@ -932,11 +961,7 @@ func TestBuildTaskServiceStartBuildTask(t *testing.T) {
 		mockCS := mock_interfaces.NewMockCatalogService(ctrl)
 		mockRS := mock_interfaces.NewMockResourceService(ctrl)
 		mockBTA := mock_interfaces.NewMockBuildTaskAccess(ctrl)
-		validator := &analyzerValidatingIndexManager{err: &interfaces.AnalyzerUnavailableError{
-			Analyzer: "hanlp_index",
-			Fields:   []string{"status"},
-			Detail:   "analyzer not found",
-		}}
+		validator := &analyzerValidatingIndexManager{}
 		service := &buildTaskService{
 			debugTaskQueue: make(chan *asynq.Task, 10),
 			bta:            mockBTA,
@@ -978,8 +1003,8 @@ func TestBuildTaskServiceStartBuildTask(t *testing.T) {
 		err := service.Start(context.Background(), "task-1", false)
 		httpErr := requireHTTPError(t, err, verrors.VegaBackend_BuildTask_InvalidParameter_Analyzer)
 		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
-		assert.Contains(t, httpErr.BaseError.ErrorDetails, "status")
-		assert.Equal(t, map[string]string{"status": "hanlp_index"}, validator.captured)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "unavailable")
+		assert.Equal(t, []string{"hanlp_index"}, validator.captured)
 		select {
 		case queued := <-service.DebugTaskQueue():
 			t.Fatalf("expected no queued task, got %s", queued.Type())

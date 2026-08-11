@@ -185,26 +185,27 @@ func validateBuildTaskAnalyzers(ctx context.Context, indexManager interfaces.Loc
 	if indexManager == nil {
 		return nil
 	}
-	analyzers := map[string]string{}
 	if buildTask == nil || buildTask.IndexConfig == nil {
 		return nil
 	}
 	for field, feature := range buildTask.IndexConfig.Features {
-		if feature.Fulltext != nil && strings.TrimSpace(feature.Fulltext.Analyzer) != "" {
-			analyzers[field] = feature.Fulltext.Analyzer
+		if feature.Fulltext == nil || strings.TrimSpace(feature.Fulltext.Analyzer) == "" {
+			continue
 		}
-	}
-	if len(analyzers) == 0 {
-		return nil
-	}
-	if err := indexManager.ValidateAnalyzers(ctx, analyzers); err != nil {
-		var unavailableErr *interfaces.AnalyzerUnavailableError
-		if errors.As(err, &unavailableErr) {
+		available, err := indexManager.ValidateAnalyzer(ctx, feature.Fulltext.Analyzer)
+		if err != nil {
+			var unavailableErr *interfaces.IndexCapabilitiesUnavailableError
+			if errors.As(err, &unavailableErr) {
+				return rest.NewHTTPError(ctx, http.StatusServiceUnavailable, verrors.VegaBackend_IndexCapability_InternalError_Unavailable).
+					WithErrorDetails(err.Error())
+			}
+			return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_ValidateAnalyzerFailed).
+				WithErrorDetails(err.Error())
+		}
+		if !available {
 			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_BuildTask_InvalidParameter_Analyzer).
-				WithErrorDetails(unavailableErr.Error())
+				WithErrorDetails(fmt.Sprintf("analyzer %q for field %q is unavailable", feature.Fulltext.Analyzer, field))
 		}
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_ValidateAnalyzerFailed).
-			WithErrorDetails(err.Error())
 	}
 	return nil
 }
@@ -283,6 +284,22 @@ func (bts *buildTaskService) newBuildTaskFromCreateRequest(ctx context.Context, 
 }
 
 func (bts *buildTaskService) fillBuildTaskIndexSnapshot(ctx context.Context, resource *interfaces.Resource, buildTask *interfaces.BuildTask) error {
+	for _, property := range resource.SchemaDefinition {
+		if property == nil {
+			continue
+		}
+		seenFeatureTypes := make(map[string]struct{}, len(property.Features))
+		for _, feature := range property.Features {
+			if feature.FeatureType == "" {
+				continue
+			}
+			if _, exists := seenFeatureTypes[feature.FeatureType]; exists {
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+					WithErrorDetails(fmt.Sprintf("property %q has more than one %q feature", property.Name, feature.FeatureType))
+			}
+			seenFeatureTypes[feature.FeatureType] = struct{}{}
+		}
+	}
 	defaultEmbeddingModel := ""
 	defaultFulltextAnalyzer := ""
 	buildTask.IndexConfig = &interfaces.BuildTaskIndexConfig{

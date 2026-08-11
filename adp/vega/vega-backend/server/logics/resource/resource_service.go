@@ -10,6 +10,7 @@ package resource
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -236,7 +237,13 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 	if err := extensions.ValidateSchemaPropertiesExtensions(ctx, req.SchemaDefinition); err != nil {
 		return nil, err
 	}
+	if err := validateSingleFeatureTypePerProperty(ctx, req.SchemaDefinition); err != nil {
+		return nil, err
+	}
 	if err := rs.validateIndexConfigModels(ctx, req.SchemaDefinition, req.IndexConfig); err != nil {
+		return nil, err
+	}
+	if err := rs.validateIndexConfigAnalyzers(ctx, req.SchemaDefinition, req.IndexConfig); err != nil {
 		return nil, err
 	}
 	if req.Extensions != nil {
@@ -718,7 +725,13 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 	if err := extensions.ValidateSchemaPropertiesExtensions(ctx, resource.SchemaDefinition); err != nil {
 		return err
 	}
+	if err := validateSingleFeatureTypePerProperty(ctx, resource.SchemaDefinition); err != nil {
+		return err
+	}
 	if err := rs.validateIndexConfigModels(ctx, resource.SchemaDefinition, resource.IndexConfig); err != nil {
+		return err
+	}
+	if err := rs.validateIndexConfigAnalyzers(ctx, resource.SchemaDefinition, resource.IndexConfig); err != nil {
 		return err
 	}
 	if req.Extensions != nil {
@@ -1068,6 +1081,26 @@ func (rs *resourceService) validateResourceUpdateScope(ctx context.Context, reso
 	return schemaChanged || indexConfigChanged, err
 }
 
+func validateSingleFeatureTypePerProperty(ctx context.Context, schema []*interfaces.Property) error {
+	for _, property := range schema {
+		if property == nil {
+			continue
+		}
+		seen := make(map[string]struct{}, len(property.Features))
+		for _, feature := range property.Features {
+			if feature.FeatureType == "" {
+				continue
+			}
+			if _, exists := seen[feature.FeatureType]; exists {
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+					WithErrorDetails(fmt.Sprintf("property %q has more than one %q feature", property.Name, feature.FeatureType))
+			}
+			seen[feature.FeatureType] = struct{}{}
+		}
+	}
+	return nil
+}
+
 func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema []*interfaces.Property, indexConfig *interfaces.ResourceIndexConfig) error {
 	if err := validateIndexConfigBuildKeyFields(ctx, schema, indexConfig); err != nil {
 		return err
@@ -1116,6 +1149,60 @@ func (rs *resourceService) validateIndexConfigModels(ctx context.Context, schema
 		}
 	}
 	return nil
+}
+
+func (rs *resourceService) validateIndexConfigAnalyzers(ctx context.Context, schema []*interfaces.Property, indexConfig *interfaces.ResourceIndexConfig) error {
+	if rs.lim == nil {
+		return nil
+	}
+	defaultAnalyzer := ""
+	if indexConfig != nil {
+		defaultAnalyzer = strings.TrimSpace(indexConfig.DefaultFulltextAnalyzer)
+	}
+	for _, prop := range schema {
+		if prop == nil {
+			continue
+		}
+		for _, feature := range prop.Features {
+			if feature.FeatureType != interfaces.PropertyFeatureType_Fulltext {
+				continue
+			}
+			analyzer := strings.TrimSpace(fulltextAnalyzerConfigValue(feature.Config))
+			if analyzer == "" {
+				analyzer = defaultAnalyzer
+			}
+			if analyzer == "" {
+				continue
+			}
+			fieldName := prop.Name
+			if feature.RefProperty != "" {
+				fieldName = feature.RefProperty
+			}
+			available, err := rs.lim.ValidateAnalyzer(ctx, analyzer)
+			if err != nil {
+				var unavailableErr *interfaces.IndexCapabilitiesUnavailableError
+				if errors.As(err, &unavailableErr) {
+					return rest.NewHTTPError(ctx, http.StatusServiceUnavailable, verrors.VegaBackend_IndexCapability_InternalError_Unavailable).
+						WithErrorDetails(err.Error())
+				}
+				return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError).
+					WithErrorDetails(err.Error())
+			}
+			if !available {
+				return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter_Analyzer).
+					WithErrorDetails(fmt.Sprintf("analyzer %q for field %q is unavailable", analyzer, fieldName))
+			}
+		}
+	}
+	return nil
+}
+
+func fulltextAnalyzerConfigValue(config map[string]any) string {
+	if config == nil {
+		return ""
+	}
+	value, _ := config["analyzer"].(string)
+	return value
 }
 
 func validateIndexConfigBuildKeyFields(ctx context.Context, schema []*interfaces.Property, indexConfig *interfaces.ResourceIndexConfig) error {

@@ -79,6 +79,19 @@ func expectResourceServiceTransaction(t *testing.T, rs *resourceService, commit 
 	})
 }
 
+func TestValidateSingleFeatureTypePerPropertyRejectsKeywordDuplicates(t *testing.T) {
+	err := validateSingleFeatureTypePerProperty(context.Background(), []*interfaces.Property{{
+		Name: "code",
+		Features: []interfaces.PropertyFeature{
+			{FeatureType: interfaces.PropertyFeatureType_Keyword},
+			{FeatureType: interfaces.PropertyFeatureType_Keyword},
+		},
+	}})
+
+	httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_InvalidParameter_RequestBody)
+	assert.Contains(t, httpErr.BaseError.ErrorDetails, `property "code" has more than one "keyword" feature`)
+}
+
 func TestValidateIndexConfigBuildKeyFields(t *testing.T) {
 	schema := []*interfaces.Property{{Name: "id"}, {Name: "updated_at"}}
 
@@ -410,6 +423,88 @@ func TestResourceServiceList(t *testing.T) {
 			t.Errorf("expected only 'r1' visible, got %v", result)
 		}
 	})
+}
+
+func TestValidateIndexConfigAnalyzers(t *testing.T) {
+	schema := []*interfaces.Property{
+		{Name: "title", Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Fulltext}}},
+		{Name: "summary", Features: []interfaces.PropertyFeature{{FeatureType: interfaces.PropertyFeatureType_Fulltext, Config: map[string]any{"analyzer": "english"}}}},
+	}
+
+	t.Run("accepts defaults and field overrides in the capability snapshot", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "standard").Return(true, nil)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "english").Return(true, nil)
+		rs := &resourceService{lim: lim}
+
+		err := rs.validateIndexConfigAnalyzers(context.Background(), schema, &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: "standard"})
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects an unavailable analyzer with affected fields", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "standard").Return(true, nil)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "english").Return(false, nil)
+		rs := &resourceService{lim: lim}
+
+		err := rs.validateIndexConfigAnalyzers(context.Background(), schema, &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: "standard"})
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_InvalidParameter_Analyzer)
+		assert.Equal(t, http.StatusBadRequest, httpErr.HTTPCode)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "english")
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "summary")
+	})
+
+	t.Run("returns capability unavailable when the startup probe failed", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "standard").Return(false, &interfaces.IndexCapabilitiesUnavailableError{Cause: errors.New("connection refused")})
+		rs := &resourceService{lim: lim}
+
+		err := rs.validateIndexConfigAnalyzers(context.Background(), schema, &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: "standard"})
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_IndexCapability_InternalError_Unavailable)
+		assert.Equal(t, http.StatusServiceUnavailable, httpErr.HTTPCode)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "connection refused")
+	})
+
+	t.Run("returns an internal error for other analyzer validation failures", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "standard").Return(false, errors.New("unexpected validation failure"))
+		rs := &resourceService{lim: lim}
+
+		err := rs.validateIndexConfigAnalyzers(context.Background(), schema, &interfaces.ResourceIndexConfig{DefaultFulltextAnalyzer: "standard"})
+		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_InternalError)
+		assert.Equal(t, http.StatusInternalServerError, httpErr.HTTPCode)
+		assert.Contains(t, httpErr.BaseError.ErrorDetails, "unexpected validation failure")
+	})
+
+	t.Run("validates each configured fulltext feature without collection", func(t *testing.T) {
+		ctrl := gomock.NewController(t)
+		lim := vmock.NewMockLocalIndexManager(ctrl)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "standard").Return(true, nil)
+		lim.EXPECT().ValidateAnalyzer(gomock.Any(), "english").Return(true, nil)
+		rs := &resourceService{lim: lim}
+		multiFeatureSchema := []*interfaces.Property{{
+			Name: "title",
+			Features: []interfaces.PropertyFeature{
+				{FeatureType: interfaces.PropertyFeatureType_Fulltext, Config: map[string]any{"analyzer": "standard"}},
+				{FeatureType: interfaces.PropertyFeatureType_Fulltext, Config: map[string]any{"analyzer": "english"}},
+			},
+		}}
+
+		require.NoError(t, rs.validateIndexConfigAnalyzers(context.Background(), multiFeatureSchema, nil))
+	})
+}
+
+func requireResourceHTTPError(t *testing.T, err error, wantCode string) *rest.HTTPError {
+	t.Helper()
+	require.Error(t, err)
+	httpErr, ok := err.(*rest.HTTPError)
+	require.Truef(t, ok, "expected HTTPError, got %T", err)
+	assert.Equal(t, wantCode, httpErr.BaseError.ErrorCode)
+	return httpErr
 }
 
 func TestResourceServiceCreate(t *testing.T) {
