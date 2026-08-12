@@ -434,6 +434,8 @@ func artifactLink(artifactType evidencevo.ArtifactType) (string, string) {
 		return "agent.interaction.started", "question_artifact_ref"
 	case evidencevo.ArtifactTypeResult:
 		return "claim.created", "result_artifact_ref"
+	case evidencevo.ArtifactTypeQuery:
+		return "data.query.observed", "query_artifact_ref"
 	case evidencevo.ArtifactTypeDataResult:
 		return "data.query.observed", "result_artifact_ref"
 	case evidencevo.ArtifactTypeLogicExecution:
@@ -450,6 +452,9 @@ func receiptScopeCandidates(scope evidencevo.QueryScope) []map[string]any {
 		return receiptLegacyOwnerCandidate(scope)
 	}
 	profile := *scope.AccessProfile
+	if evidencevo.HasTenantWideTraceAccess(profile) {
+		return nil
+	}
 	if scope.View != "" && scope.View != evidencevo.AccessViewBusiness {
 		if evidencevo.NeedsCrossAccountCandidates(scope) {
 			return nil
