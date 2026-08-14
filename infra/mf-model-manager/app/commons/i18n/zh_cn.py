@@ -5,7 +5,7 @@ error_messages = {
     ParamValidationErrors.ParamMissing: {
         "code": ParamValidationErrors.ParamMissing,
         "description": "参数缺失",
-        "detail": "",
+        "detail": "缺少必填参数。",
         "detail_template": "缺少必填参数：{parameters}",
         "solution": "请阅读API文档填写正确的参数",
         "link": ""
@@ -18,6 +18,14 @@ error_messages = {
         "detail_template": "参数类型错误：{parameters}",
         "link": ""
 
+    },
+    "ModelFactory.Router.ParamError.ParamMissing": {
+        "code": "ModelFactory.Router.ParamError.ParamMissing",
+        "description": "参数缺失",
+        "detail": "缺少必填参数。",
+        "detail_template": "缺少必填参数：{parameters}",
+        "solution": "请阅读API文档填写正确的参数",
+        "link": ""
     },
     "ModelFactory.OperationAudit.AccessDenied": {
         "code": "ModelFactory.OperationAudit.AccessDenied",
