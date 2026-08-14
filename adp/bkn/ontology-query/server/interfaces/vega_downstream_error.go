@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"unicode/utf8"
 )
 
 // VegaDownstreamError 保留 vega-backend 返回的状态码与错误内容。
@@ -37,8 +38,15 @@ func (e *VegaDownstreamError) Error() string {
 	return msg
 }
 
+// maxRawMessageLen 是原始报文回退时的长度上限。
+//
+// 4xx 不一定来自 vega 自己：中间的 ingress/网关在 413、502 一类情况下返回的是整页
+// HTML。这种报文解析不出结构，整段回退会让终端调用方在 error_details 里收到一坨
+// HTML 当作错误原因。截断后仍足够辨认来源，也不至于淹没响应。
+const maxRawMessageLen = 512
+
 // Message 返回最有信息量的那一句：优先 error_details（里面是具体到字段与算子的原因），
-// 其次 description，最后退回原始报文。
+// 其次 description，最后退回原始报文（超长则截断）。
 func (e *VegaDownstreamError) Message() string {
 	if e.Details != "" {
 		return e.Details
@@ -46,7 +54,16 @@ func (e *VegaDownstreamError) Message() string {
 	if e.Description != "" {
 		return e.Description
 	}
-	return e.Raw
+	if len(e.Raw) <= maxRawMessageLen {
+		return e.Raw
+	}
+	// 按字节切会在多字节字符中间断开，error_details 里会留下半个 UTF-8 序列。
+	// vega 返回中文错误体、或本地化的网关错误页超过上限时都会命中。
+	truncated := e.Raw[:maxRawMessageLen]
+	for len(truncated) > 0 && !utf8.ValidString(truncated) {
+		truncated = truncated[:len(truncated)-1]
+	}
+	return truncated + "...(truncated)"
 }
 
 // IsClientError 表示这是请求侧的问题，调用方改请求即可，不该被当成依赖故障。
