@@ -21,6 +21,7 @@ const defaultMCPLocale = "zh-CN"
 type mcpLocaleBundle struct {
 	locale             string
 	instructions       string
+	ptcInstructions    string
 	toolMeta           map[string]ToolMeta
 	schemaDescriptions map[string]map[string]string
 }
@@ -48,34 +49,41 @@ func buildMCPLocaleBundle(normalized string) *mcpLocaleBundle {
 
 func buildMCPLocaleBundleFromFS(resources fs.FS, normalized string) *mcpLocaleBundle {
 	bundle := &mcpLocaleBundle{
-		locale:       normalized,
-		instructions: serverInstructions,
+		locale:          normalized,
+		instructions:    mustReadMCPInstructions(resources, defaultMCPLocale),
+		ptcInstructions: mustReadMCPResource(resources, defaultMCPLocale, "ptc_instructions.txt"),
 	}
 	if normalized == defaultMCPLocale {
 		return bundle
 	}
-	base := fmt.Sprintf("schemas/locales/%s", normalized)
-	if data, err := fs.ReadFile(resources, base+"/instructions.txt"); err != nil {
+	if content, err := readMCPResource(resources, normalized, "instructions.txt"); err != nil {
 		log.Printf("WARN: cannot load MCP locale instructions for %s: %v; using baseline", normalized, err)
-	} else if strings.TrimSpace(string(data)) == "" {
+	} else if strings.TrimSpace(content) == "" {
 		log.Printf("WARN: MCP locale instructions for %s are empty; using baseline", normalized)
 	} else {
-		bundle.instructions = string(data)
+		bundle.instructions = content
 	}
-	if data, err := fs.ReadFile(resources, base+"/tools_meta.json"); err != nil {
+	if content, err := readMCPResource(resources, normalized, "ptc_instructions.txt"); err != nil {
+		log.Printf("WARN: cannot load PTC MCP locale instructions for %s: %v; using baseline", normalized, err)
+	} else if strings.TrimSpace(content) == "" {
+		log.Printf("WARN: PTC MCP locale instructions for %s are empty; using baseline", normalized)
+	} else {
+		bundle.ptcInstructions = content
+	}
+	if content, err := readMCPResource(resources, normalized, "tools_meta.json"); err != nil {
 		log.Printf("WARN: cannot load MCP locale tool metadata for %s: %v; using baseline", normalized, err)
 	} else {
-		if err := json.Unmarshal(data, &bundle.toolMeta); err != nil {
+		if err := json.Unmarshal([]byte(content), &bundle.toolMeta); err != nil {
 			log.Printf("WARN: cannot parse MCP locale tool metadata for %s: %v; using baseline", normalized, err)
 			bundle.toolMeta = nil
 		} else if bundle.toolMeta == nil {
 			log.Printf("WARN: MCP locale tool metadata for %s is empty; using baseline", normalized)
 		}
 	}
-	if data, err := fs.ReadFile(resources, base+"/schema_descriptions.json"); err != nil {
+	if content, err := readMCPResource(resources, normalized, "schema_descriptions.json"); err != nil {
 		log.Printf("WARN: cannot load MCP locale schema descriptions for %s: %v; using baseline", normalized, err)
 	} else {
-		if err := json.Unmarshal(data, &bundle.schemaDescriptions); err != nil {
+		if err := json.Unmarshal([]byte(content), &bundle.schemaDescriptions); err != nil {
 			log.Printf("WARN: cannot parse MCP locale schema descriptions for %s: %v; using baseline", normalized, err)
 			bundle.schemaDescriptions = nil
 		} else if bundle.schemaDescriptions == nil {
@@ -83,6 +91,60 @@ func buildMCPLocaleBundleFromFS(resources fs.FS, normalized string) *mcpLocaleBu
 		}
 	}
 	return bundle
+}
+
+func mustReadMCPInstructions(resources fs.FS, locale string) string {
+	return mustReadMCPResource(resources, locale, "instructions.txt")
+}
+
+func mustReadMCPStaticResource(resource string) string {
+	path := fmt.Sprintf("schemas/%s", resource)
+	data, err := fs.ReadFile(schemasFS, path)
+	if err != nil {
+		panic("cannot load MCP static resource: " + err.Error())
+	}
+	content := string(data)
+	if strings.TrimSpace(content) == "" {
+		panic("MCP static resource must not be empty: " + path)
+	}
+	return content
+}
+
+func mustReadMCPResource(resources fs.FS, locale, resource string) string {
+	content, err := readMCPResource(resources, locale, resource)
+	if err != nil {
+		panic("cannot load MCP baseline resource: " + err.Error())
+	}
+	instructions := strings.TrimSpace(content)
+	if instructions == "" {
+		panic("MCP baseline resource must not be empty")
+	}
+	return instructions
+}
+
+func readMCPResource(resources fs.FS, locale, resource string) (string, error) {
+	path := fmt.Sprintf("schemas/locales/%s/%s", locale, resource)
+	data, err := fs.ReadFile(resources, path)
+	if err != nil {
+		return "", err
+	}
+	return stripMCPResourceLicenseHeader(string(data)), nil
+}
+
+func stripMCPResourceLicenseHeader(content string) string {
+	if !strings.HasPrefix(content, "/*") {
+		return content
+	}
+
+	end := strings.Index(content, "*/")
+	if end == -1 {
+		return content
+	}
+	header := content[:end+2]
+	if !strings.Contains(header, "Copyright") || !strings.Contains(header, "openbkn.ai") {
+		return content
+	}
+	return strings.TrimLeft(content[end+2:], "\r\n")
 }
 
 func mcpLocaleFromEnv() string {
@@ -114,6 +176,42 @@ func normalizeMCPLocale(locale string) string {
 
 func (b *mcpLocaleBundle) ServerInstructions() string {
 	return b.instructions
+}
+
+func (b *mcpLocaleBundle) PTCServerInstructions() string {
+	return b.ptcInstructions
+}
+
+func (b *mcpLocaleBundle) PTCResource(name string) string {
+	base := mustReadMCPResource(schemasFS, defaultMCPLocale, name)
+	if b.locale == defaultMCPLocale {
+		return base
+	}
+	content, err := readMCPResource(schemasFS, b.locale, name)
+	if err != nil || strings.TrimSpace(content) == "" {
+		return base
+	}
+	return content
+}
+
+func (b *mcpLocaleBundle) PTCHints(toolName string) []string {
+	var hints map[string][]string
+	if err := json.Unmarshal([]byte(b.PTCResource("ptc_hints.json")), &hints); err != nil {
+		panic("cannot parse PTC hints: " + err.Error())
+	}
+	return hints[toolName]
+}
+
+func (b *mcpLocaleBundle) PTCError(key string, params ...any) string {
+	var messages map[string]string
+	if err := json.Unmarshal([]byte(b.PTCResource("ptc_errors.json")), &messages); err != nil {
+		panic("cannot parse PTC errors: " + err.Error())
+	}
+	message, ok := messages[key]
+	if !ok {
+		panic("PTC error message not found: " + key)
+	}
+	return fmt.Sprintf(message, params...)
 }
 
 // ToolMeta returns the tool's metadata for the bundle's locale.

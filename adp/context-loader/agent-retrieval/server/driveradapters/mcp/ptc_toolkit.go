@@ -67,53 +67,6 @@ const (
 	ptcWrapCdWorkdir = "cd_workdir"
 )
 
-// ptcRunCodeSchema run_code 的入参。
-const ptcRunCodeSchema = `{
-  "type": "object",
-  "properties": {
-    "code": {"type": "string", "description": "要执行的 Python 代码。只有 print 的内容会返回。"},
-    "timeout": {"type": "integer", "default": 60, "description": "执行超时秒数"}
-  },
-  "required": ["code"]
-}`
-
-// ptcRunShellSchema run_shell 的入参。
-const ptcRunShellSchema = `{
-  "type": "object",
-  "properties": {
-    "command": {"type": "string", "description": "要执行的 shell 命令，交给 sh -c 执行，可以用管道和 &&。"},
-    "timeout": {"type": "integer", "default": 60, "description": "执行超时秒数"}
-  },
-  "required": ["command"]
-}`
-
-// ptcRunShellDescription run_shell 的工具描述。
-//
-// 刻意把边界写死：run_shell 一行就能发，run_code 要构思一段脚本，模型天然偏向
-// 前者。不划清楚，它会用 curl 手搓 MCP 调用，把「一段脚本解决整个问题」重新拆成
-// 一轮一次调用——那正是 PTC 要消灭的东西。
-const ptcRunShellDescription = `在沙箱里执行一条 shell 命令，返回 stdout 与 stderr。
-
-工作目录与 ` + "`run_code`" + ` 相同，两个工具看到的是同一批文件：` + "`run_code`" + ` 写下的
-结果这里能直接 ` + "`wc`" + `、` + "`head`" + `、` + "`grep`" + `。
-
-**只用于查看环境与文件**：看目录、查行数、抽取片段、看磁盘占用、确认某个命令存在。
-
-**不要用它取 BKN 数据。** 知识网络、对象类、实例、SQL 一律走 ` + "`run_code`" + `——那边有
-现成的函数，这里没有凭据，用 ` + "`curl`" + ` 手搓 MCP 调用会把一次任务拆成很多轮，
-既慢又容易错。
-
-沙箱是完整的 Linux：coreutils、` + "`grep`" + `、` + "`awk`" + `、` + "`sed`" + `、` + "`jq`" + `、` + "`curl`" + `、
-` + "`python3`" + ` 都在。
-
-示例：
-` + "```" + `
-ls -la && wc -l *.json
-head -c 400 rows.json
-du -sh . && df -h /workspace
-` + "```" + `
-`
-
 // 生命周期工具由调用方按轮次接管，沙箱沿用同一个 interaction，不自行开关——
 // 否则一次任务会分裂成两条互不关联的证据链。
 var ptcSkipTools = map[string]bool{
@@ -131,18 +84,6 @@ var ptcDefaultOverrides = map[string]any{"response_format": "json"}
 var ptcPyTypes = map[string]string{
 	"string": "str", "array": "list", "object": "dict",
 	"boolean": "bool", "integer": "int", "number": "float",
-}
-
-// 少数工具存在「不看完整 docstring 必写错」的调用约定。完整规则留在 docstring
-// （第二级），这里只把最小可用示例提到签名清单（第一级）——实测中模型不会先
-// help() 就动手。新增条目的依据应是实测失败，不是臆测。
-var ptcHints = map[string][]string{
-	"run_sql": {
-		"表名必须写成 {{.<resource_id>}} 占位符，id 取自 search_schema 的 data_source.id",
-		"或 list_resources 的 resource_id；不可原样写 'resource_id' 字面量。",
-		"列名用物理列名。仅单条 SELECT，无 CTE/UNION。",
-		`run_sql(sql="SELECT team_name, COUNT(*) c FROM {{.<resource_id>}} GROUP BY team_name")`,
-	},
 }
 
 const defaultSandboxMCPPath = "/api/agent-retrieval/v1/mcp/"
@@ -307,306 +248,50 @@ func ptcGroupOf(t MCPToolInfo) string {
 	if t.Group != "" {
 		return t.Group
 	}
-	return "其他"
+	return "other"
+}
+
+func ptcGroupTitle(locale *mcpLocaleBundle, tool MCPToolInfo) string {
+	if group := ptcGroupOf(tool); group != "other" {
+		return group
+	}
+	return locale.PTCResource("ptc_group_other.txt")
 }
 
 func renderPTCDigest(tools []MCPToolInfo) string {
+	return renderPTCDigestForLocale(loadMCPLocaleBundle(defaultMCPLocale), tools)
+}
+
+func renderPTCDigestForLocale(locale *mcpLocaleBundle, tools []MCPToolInfo) string {
 	var b strings.Builder
-	b.WriteString(`下列 BKN 能力已在作用域内，直接调用即可，无需 import。
-只有 stdout 会返回给你——中间结果不进上下文，因此请在脚本内完成过滤与聚合，
-只 print 你真正需要的内容。调用失败抛 ` + "`ToolError`" + `。
-
-签名末尾的 ` + "`-> {…}`" + ` 是返回值顶层键。**其中部分键可能不出现**
-（如 ` + "`total_count`" + ` 在带过滤的查询里就没有），一律用 ` + "`.get()`" + ` 取，不要下标。
-过滤字段必须是该对象类真实的数据属性名——先用 ` + "`get_object_types`" + ` 查
-` + "`data_properties`" + `，不要按语义猜。
-
-## 可用函数
-`)
+	b.WriteString(locale.PTCResource("ptc_digest_prefix.txt"))
 	group := ""
-	for _, t := range tools {
-		if g := ptcGroupOf(t); g != group {
+	for _, tool := range tools {
+		if next := ptcGroupOf(tool); next != group {
 			if group != "" {
 				b.WriteString("```\n")
 			}
-			fmt.Fprintf(&b, "\n### %s\n\n```python\n", g)
-			group = g
+			fmt.Fprintf(&b, "\n### %s\n\n```python\n", ptcGroupTitle(locale, tool))
+			group = next
 		}
-		fmt.Fprintf(&b, "%s -> %s\n", ptcSignature(t), ptcReturnKeys(t))
-		if t.Title != "" {
-			fmt.Fprintf(&b, "    # %s\n", t.Title)
+		fmt.Fprintf(&b, "%s -> %s\n", ptcSignature(tool), ptcReturnKeys(tool))
+		if tool.Title != "" {
+			fmt.Fprintf(&b, "    # %s\n", tool.Title)
 		}
-		for _, hint := range ptcHints[t.Name] {
+		for _, hint := range locale.PTCHints(tool.Name) {
 			fmt.Fprintf(&b, "    #   %s\n", hint)
 		}
 	}
 	if group != "" {
 		b.WriteString("```\n")
 	}
-	b.WriteString(`
-## 一段脚本解决整个问题
-
-每发起一次 run_code 就是一次往返。先跑一次看结构、再跑一次取数、再跑一次聚合，
-与逐个调用工具没有区别——探查与求解要用变量串在同一段脚本里：
-
-` + "```python" + `
-kn = "<当前知识网络 id>"
-
-# 1) 先拿结构，结果直接喂给下一步，不要单独跑一轮回来看
-detail = get_kn_detail(kn_id=kn)
-ot = next(o for o in detail.get("object_types", []) if "进球" in o.get("name", ""))
-fields = [p.get("name") for p in
-          get_object_types(kn_id=kn, ids=[ot["id"]])["object_types"][0].get("data_properties", [])]
-
-# 2) 用刚拿到的真实字段名过滤，不要按语义猜
-team_field = next(f for f in fields if "team" in f)
-rows = query_object_instance(kn_id=kn, ot_id=ot["id"], limit=1000)
-
-# 3) 聚合也在这里做完，只 print 结论
-import collections
-top = collections.Counter(r.get(team_field) for r in rows.get("datas", [])).most_common(3)
-print(top)
-` + "```" + `
-
-## 能下推的聚合一律下推
-
-计数、求和、分组、排序、Top-N 这类，**优先写一条 ` + "`run_sql`" + `**，让数据库算完只回结果，
-不要用 ` + "`query_object_instance`" + ` 把行拉进沙箱再统计——那既慢又受 ` + "`limit`" + ` 截断，
-统计口径会悄悄错。
-
-` + "```python" + `
-# 对：一条 SQL 回三行
-run_sql(sql="SELECT team_name, COUNT(*) c FROM {{.<resource_id>}} GROUP BY team_name ORDER BY c DESC LIMIT 3")
-
-# 错：拉 5000 行回来自己数，还可能没拉全
-rows = query_object_instance(kn_id=kn, ot_id="goals", limit=5000)
-` + "```" + `
-
-沙箱里的 pandas、numpy、scipy、sqlite3 与全部标准库，留给 SQL 表达不了的部分：
-跨数据源关联、非 SQL 数据源、按中间结果分支、扇出。那些才是代码模式真正的用武之地。
-
-## 一次执行同时产出答案与依据
-
-多跑一轮，最常见的原因不是想不出解法，而是**对数据口径有误解**：以为只有男足却混着女足，
-以为球队名唯一却有 West Germany 与 Germany 两条。这类问题撞上一次修一次，就变成了
-一轮一次调用。
-
-对策是在**同一段脚本里**把你依赖的口径先打出来，再给答案：
-
-` + "```python" + `
-print("取值范围:", run_sql(sql="SELECT DISTINCT tournament_name FROM {{.<resource_id>}}")["entries"][:20])
-print("答案:", run_sql(sql="SELECT team_name, COUNT(*) c FROM {{.<resource_id>}} GROUP BY team_name ORDER BY c DESC LIMIT 5")["entries"])
-` + "```" + `
-
-这样即使口径判断错了，你也已经拿到了改对它所需的全部信息，下一轮直接给最终答案，
-而不是再花一轮"看一眼"。
-
-不确定的地方用代码兜住而不是回到对话：取值一律 ` + "`.get()`" + `，可能失败的分支用
-try/except 包住并 print 出关键中间信息，让一次执行既拿到答案、又带回排查线索。
-
-## 执行 shell 命令
-
-另有一个 ` + "`run_shell`" + ` 工具，和这里共用工作目录，用来单独看一眼环境或文件
-（` + "`ls`" + `、` + "`wc`" + `、` + "`head`" + `）。
-
-但**只要 shell 是解题过程的一环，就写在这段脚本里**，用 ` + "`subprocess`" + ` 调，
-不要为它单开一轮——那就退回一次调用一轮了：
-
-` + "```python" + `
-import subprocess
-r = subprocess.run("wc -l rows.jsonl && head -c 300 rows.jsonl",
-                   shell=True, capture_output=True, text=True)
-print(r.stdout or r.stderr)          # 非零退出时诊断在 stderr 里
-` + "```" + `
-
-` + "`curl`" + `、` + "`jq`" + `、` + "`awk`" + `、` + "`sort`" + ` 这类都在。但凡 Python 能直接做的（读文件、
-统计、JSON 处理）就别绕 shell，省一层引号转义。
-
-## 工作目录与大结果
-
-回到你面前的只有 stdout，因此**不要把大结果打印出来**：写进文件，再打印行数、字段名、
-头部若干行这类足以判断下一步的信息。需要细看时读取文件的某一段，而不是整份倒出来。
-
-脚本启动时当前目录已经切到本次会话专属的工作目录（` + "`WORKDIR`" + ` 变量指向它），
-**直接用相对路径读写**。不要写 ` + "`/workspace/xxx`" + ` 的绝对路径：那是所有会话共用的
-根目录，会和别人撞名。
-
-` + "```python" + `
-import json, pathlib
-rows = query_object_instance(kn_id=kn, ot_id=ot_id, limit=5000).get("datas", [])
-pathlib.Path("rows.json").write_text(json.dumps(rows, ensure_ascii=False))
-print(f"{len(rows)} 行已落盘，字段：{sorted(rows[0])[:12] if rows else []}")
-print(json.dumps(rows[:3], ensure_ascii=False)[:600])   # 只看头部三行
-` + "```" + `
-
-文件在同一对话的多次执行之间是保留的，下一段脚本可以直接接着用，不必重新取数：
-
-` + "```python" + `
-import json, pathlib
-p = pathlib.Path("rows.json")
-rows = json.loads(p.read_text()) if p.exists() else query_object_instance(...)["datas"]
-` + "```" + `
-
-` + "`exists()`" + ` 判断还是要写：换了对话、或者上一段脚本在落盘前就失败了，文件就不在。
-
-` + "`run_shell`" + ` 落在同一个目录里，两个工具看到的是同一批文件。
-
-## 参数写不准时
-
-完整 schema 在每个函数的 docstring 里，**在同一段脚本里** ` + "`help(fn)`" + ` 自查后接着往下写，
-不要为了看文档单独跑一轮：
-
-` + "```python" + `
-help(query_object_instance)
-` + "```" + `
-
-特别是 ` + "`condition`" + ` 的 ` + "`operation`" + `：` + "`match` / `knn`" + ` 能否使用取决于该属性的
-` + "`condition_operations`" + `（见 ` + "`get_object_types`" + ` 返回），从 ` + "`type`" + ` 推不出来。
-
-## 错误处理
-
-调用失败抛 ` + "`ToolError`" + `，message 为服务端原文的 JSON，形如：
-
-` + "```json" + `
-{"error":{"code":"...","message":"...","required_action":"...","retryable":false}}
-` + "```" + `
-
-**先读 ` + "`retryable`" + ` 再决定下一步。** 为 false 表示同样的请求再发一次仍会失败——
-换参数、换工具，或者把这条错误原样 print 出来交回，不要重试。原地重试三次只是把
-同一个失败抄三遍，既拖慢一轮又什么都没换来。
-
-` + "`required_action`" + ` 有值时按它做（例如提示先查某个工具）。属于参数写错的（字段名
-不存在、算子不支持），在同一段脚本里改完接着跑，不必回到对话轮次。
-
-不要用 ` + "`try/except` + `pass`" + ` 把错误吞掉：你看不到的东西没法修，而调用方只会
-收到一段没有解释的空输出。
-`)
+	b.WriteString(locale.PTCResource("ptc_digest_suffix.txt"))
 	return b.String()
 }
 
-// ptcStubPreamble 是沙箱侧运行时。只用标准库：MCP streamable HTTP 就是 JSON-RPC
-// over POST，urllib 足够，沙箱镜像无需预装任何依赖，也就没有 SDK 版本漂移。
-const ptcStubPreamble = `"""BKN 能力的沙箱侧 stub —— 由 context-loader 生成，请勿手工编辑。
-
-凭据与会话上下文经 _configure(event) 注入，由调用方在发起执行时下发。
-"""
-
-import json
-import os
-import pathlib
-import urllib.request
-
-_CFG = {}
-_SESSION = {}
-
-# 本次会话的工作目录。沙箱 /workspace 是所有调用方共用的一个目录（执行接口不接受
-# session_id，池子实测恒命中同一个会话），直接在根上写 rows.json 这类名字，既会被
-# 别的会话覆盖，也可能读到别人的数据。这里按 conversation 切出独立子目录并 chdir
-# 进去，脚本用相对路径即可，无需关心隔离。
-WORKDIR = pathlib.Path("/workspace")
-
-# 显式不走代理：MCP 端点是集群内地址，任何继承来的代理配置都只会让请求发不出去。
-# 且 urllib 一旦认定要走代理就改发 absolute-form 请求行（POST http://host/path），
-# 网关对此直接 400。
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
-class ToolError(RuntimeError):
-    """工具调用失败。message 为服务端原文，供模型据此修正参数后重试。"""
-
-
-def _configure(event):
-    """由执行入口调用，注入 MCP 端点、凭据与生命周期上下文，并准备工作目录。"""
-    global WORKDIR
-    _CFG.update(event)
-    _SESSION.clear()
-
-    # 目录名由 conversation_id 归一化而来，不做哈希：run_shell 走 language=shell，
-    # 不经过本 stub，得在浏览器侧算出同一个路径才能进到同一个目录。而浏览器的
-    # crypto.subtle 在非 HTTPS 源下不可用（部署常是裸 HTTP），算不了 sha1。
-    # 归一化两边都能实现，且 ls /workspace 时还能直接看出是哪个对话。
-    # 字符集写死成 ASCII 白名单，不用 c.isalnum()：Python 的 isalnum() 认 Unicode，
-    # "名".isalnum() 为真，于是中文 conversation_id 在这里被原样保留，而 Go 侧
-    # （run_shell 走那条路）只认 ASCII，会换成 -。两边就落到不同目录了。
-    _SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-    conversation = str((event.get("bkn") or {}).get("conversation_id") or "").strip()
-    safe = "".join(c if c in _SAFE else "-" for c in conversation)[:64]
-    candidate = pathlib.Path("/workspace") / ("conv-" + safe if safe else "shared")
-    try:
-        candidate.mkdir(parents=True, exist_ok=True)
-        os.chdir(candidate)
-        WORKDIR = candidate
-    except OSError:
-        # 沙箱换了镜像、/workspace 只读之类的情况下不要连累整段脚本，退回当前目录。
-        WORKDIR = pathlib.Path(os.getcwd())
-
-
-def _rpc(method, params=None, notify=False):
-    body = {"jsonrpc": "2.0", "method": method}
-    if params is not None:
-        body["params"] = params
-    if not notify:
-        body["id"] = _SESSION.get("seq", 0) + 1
-        _SESSION["seq"] = body["id"]
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "Authorization": "Bearer " + _CFG["token"],
-    }
-    if _SESSION.get("id"):
-        headers["Mcp-Session-Id"] = _SESSION["id"]
-    request = urllib.request.Request(
-        _CFG["mcp"], data=json.dumps(body).encode(),
-        headers=headers, method="POST",
-    )
-    response = _OPENER.open(request, timeout=_CFG.get("timeout", 120))
-    if not _SESSION.get("id"):
-        _SESSION["id"] = response.headers.get("Mcp-Session-Id")
-    raw = response.read().decode()
-    if not raw.strip():
-        return None
-    for line in raw.splitlines():
-        if line.startswith("data: "):
-            return json.loads(line[6:])
-    return json.loads(raw)
-
-
-def _ensure_session():
-    """MCP 会话在模块级复用，一次执行内 initialize 只发生一次。"""
-    if _SESSION.get("ready"):
-        return
-    _rpc("initialize", {
-        "protocolVersion": "2025-06-18",
-        "capabilities": {},
-        "clientInfo": {"name": "bkn-sandbox", "version": "1"},
-    })
-    _rpc("notifications/initialized", {}, notify=True)
-    _SESSION["ready"] = True
-
-
-def _call(tool, args):
-    """调用 MCP 工具。None 值不下发，交由服务端使用 schema 默认值。"""
-    _ensure_session()
-    payload = {k: v for k, v in args.items() if v is not None}
-    # 业务类工具受会话守卫约束，缺 bkn_context 会被拒（conversation_required）。
-    # 该上下文由调用方透传，模型无需感知，故不出现在函数签名里。
-    if _CFG.get("bkn"):
-        payload["bkn_context"] = _CFG["bkn"]
-
-    result = _rpc("tools/call", {"name": tool, "arguments": payload})["result"]
-    text = "".join(c["text"] for c in result["content"] if c["type"] == "text")
-    if result.get("isError") or result.get("is_error"):
-        raise ToolError(tool + ": " + text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # response_format=toon 等非 JSON 形态按原文返回
-        return text
-`
-
 func renderPTCStub(tools []MCPToolInfo) string {
 	var b strings.Builder
-	b.WriteString(ptcStubPreamble)
+	b.WriteString(mustReadMCPStaticResource("ptc_stub.py"))
 	for _, t := range tools {
 		params := ptcParams(t.InputSchema)
 		fmt.Fprintf(&b, "\n\ndef %s -> dict:\n", ptcSignature(t))
@@ -634,30 +319,39 @@ func renderPTCStub(tools []MCPToolInfo) string {
 // BuildPTCToolkit 渲染 PTC 工具包。endpoint 与 BuildMCPInfo 一致（仅用于自描述），
 // port 是本服务监听端口，用于推导沙箱回访地址。
 func BuildPTCToolkit(endpoint string, port int) (*PTCToolkit, error) {
-	info, err := BuildMCPInfo(endpoint)
+	return BuildPTCToolkitForLocale(endpoint, port, mcpLocaleFromEnv())
+}
+
+// BuildPTCToolkitForLocale renders the PTC toolkit from the effective locale.
+func BuildPTCToolkitForLocale(endpoint string, port int, locale string) (*PTCToolkit, error) {
+	info, err := BuildMCPInfoForLocale(endpoint, locale)
 	if err != nil {
 		return nil, err
 	}
-	return buildPTCToolkitFrom(ptcUsableTools(info), port)
+	return buildPTCToolkitFromLocale(ptcUsableTools(info), port, loadMCPLocaleBundle(locale))
 }
 
 // buildPTCToolkitFrom 从已筛好的工具目录渲染工具包。与 BuildPTCToolkit 分开，
 // 是为了让测试不必起一个真实端点就能覆盖工具表与版本号。
 func buildPTCToolkitFrom(tools []MCPToolInfo, port int) (*PTCToolkit, error) {
-	digest := renderPTCDigest(tools)
+	return buildPTCToolkitFromLocale(tools, port, loadMCPLocaleBundle(defaultMCPLocale))
+}
+
+func buildPTCToolkitFromLocale(tools []MCPToolInfo, port int, locale *mcpLocaleBundle) (*PTCToolkit, error) {
+	digest := renderPTCDigestForLocale(locale, tools)
 	stub := renderPTCStub(tools)
 	exposed := []PTCTool{
 		{
 			Name:        "run_code",
 			Description: digest,
-			InputSchema: json.RawMessage(ptcRunCodeSchema),
+			InputSchema: json.RawMessage(locale.PTCResource("ptc_run_code_schema.json")),
 			Language:    "python",
 			Wrap:        ptcWrapHandler,
 		},
 		{
 			Name:        "run_shell",
-			Description: ptcRunShellDescription,
-			InputSchema: json.RawMessage(ptcRunShellSchema),
+			Description: locale.PTCResource("ptc_run_shell_description.txt"),
+			InputSchema: json.RawMessage(locale.PTCResource("ptc_run_shell_schema.json")),
 			Language:    "shell",
 			Wrap:        ptcWrapCdWorkdir,
 		},
