@@ -100,9 +100,27 @@ func (client *Client) Search(ctx context.Context, query observabilityvo.LogQuery
 	}
 	records := make([]observabilityvo.LogRecord, 0, len(payload.Logs))
 	for _, entry := range payload.Logs {
+		if businessModuleForResource(entry.Resource) == "" {
+			// Login and logout rows are carried by the dedicated access source.
+			// This source is the management-audit projection, so do not pass its
+			// legacy access duplicates to the public operation-log contract.
+			continue
+		}
 		records = append(records, projectAuditLog(entry, query.AuthorizedTenantID))
 	}
-	return observabilityvo.SourcePage{Records: records, Count: payload.Total, CountAccuracy: "exact"}, nil
+	var lastPosition *observabilityvo.SourcePosition
+	if len(payload.Logs) > 0 {
+		last := payload.Logs[len(payload.Logs)-1]
+		lastPosition = &observabilityvo.SourcePosition{EventTimestamp: last.CreatedAt, SourceID: sourceID, LogID: last.ID}
+	}
+	countAccuracy := "exact"
+	if payload.Total != int64(len(records)) {
+		// The upstream total includes legacy rows outside this source's explicit
+		// management-audit scope. Keep it as the pagination signal while marking
+		// the total inexact, so later management rows remain reachable.
+		countAccuracy = "partial"
+	}
+	return observabilityvo.SourcePage{Records: records, LastPosition: lastPosition, Count: payload.Total, CountAccuracy: countAccuracy}, nil
 }
 
 func onlyFailedOutcomes(outcomes []string) bool {

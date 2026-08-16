@@ -243,7 +243,8 @@ func (service *Service) listPage(
 	for _, sourceResult := range service.searchSources(ctx, visibleSources, sourceQuery, positions) {
 		source := sourceResult.source
 		if sourceResult.status.Status == "not_integrated" {
-			failed++
+			// Coverage is shown in source status, but a source that was never
+			// queried cannot make results from reachable sources incomplete.
 			result.SourceStatus = append(result.SourceStatus, sourceResult.status)
 			continue
 		}
@@ -259,7 +260,9 @@ func (service *Service) listPage(
 		coveragePartial = coveragePartial || sourceResult.status.Status == "degraded"
 		sourcePageSizes[source.ID()] = len(page.Records)
 		countExact = countExact && normalizedAccuracy(page.CountAccuracy) == "exact"
-		if len(page.Records) > 0 {
+		if page.LastPosition != nil {
+			sourceLastRawPosition[source.ID()] = *page.LastPosition
+		} else if len(page.Records) > 0 {
 			sourceLastRawPosition[source.ID()] = positionForRecord(page.Records[len(page.Records)-1])
 		}
 		if page.NextCursor != "" || page.Count > int64(len(page.Records)) {
@@ -283,14 +286,14 @@ func (service *Service) listPage(
 				candidates = append(candidates, logCandidate{record: record, adapterSourceID: source.ID()})
 			}
 		}
-		if rejectedProjections > 0 {
+		if rejectedProjections > 0 || normalizedAccuracy(page.CountAccuracy) != "exact" {
 			// Source totals describe its raw result set. Once the public contract
-			// rejects records, retaining that raw total produces an impossible UI
-			// (for example “5 facts” with an empty table). Report the visible lower
-			// bound and mark it partial; later pages may contain more valid records.
+			// rejects records or an adapter has already filtered its source result,
+			// retaining that raw total produces an impossible UI (for example “5
+			// facts” with an empty table). Report the visible lower bound and mark
+			// the count inexact; the source itself remains reachable.
 			totalCount += int64(len(candidates))
 			countExact = false
-			coveragePartial = true
 		} else {
 			totalCount += page.Count
 		}
@@ -449,7 +452,7 @@ func (service *Service) searchSources(
 				results[index].status.CountAccuracy = "unavailable"
 				return
 			}
-			if results[index].status.Status != observabilityvo.SourceCoverageDegraded {
+			if results[index].status.Status != observabilityvo.SourceCoverageDegraded || results[index].status.Reason == observabilityvo.SourceReasonPartialManagementAuditCoverage {
 				results[index].status.Status = "healthy"
 				results[index].status.CountAccuracy = normalizedAccuracy(page.CountAccuracy)
 			}
