@@ -7,6 +7,11 @@ import unittest
 from unittest import mock
 
 from app.commons.i18n import get_error_message
+from app.commons.errors import (
+    ModelFactory_DedaultModel_NotExist,
+    ModelFactory_ExternalSmallModel_Used_NameNotExist,
+    ModelFactory_Router_ParamError_FormatError_Error,
+)
 from app.commons.errors.codes import ParamValidationErrors
 from app.commons.locale import (
     LocaleResponseMiddleware,
@@ -85,18 +90,90 @@ class TestAcceptLanguageResolver(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(content["detail"], "Parameter type is invalid: model_names")
 
-    def test_format_error_preserves_a_dynamic_validation_reason(self):
+    def test_parameter_template_uses_generic_detail_without_a_structured_name(self):
         content, changed = localized_error_content(
             {
-                "code": "ModelFactory.Router.ParamError.FormatError",
-                "description": "参数错误",
-                "detail": "value is not a valid integer",
-                "solution": "请检查输入信息",
+                "code": "ModelFactory.Router.ParamError.ParamMissing",
+                "description": "Required parameter is missing.",
+                "detail": "Provide at least one of model or model_id.",
+                "solution": "Provide the required parameter and try again.",
             },
             "en-US",
         )
         self.assertTrue(changed)
-        self.assertEqual(content["detail"], "value is not a valid integer")
+        self.assertEqual(content["detail"], "Required parameter is missing.")
+
+    def test_format_error_preserves_a_dynamic_validation_reason(self):
+        source = {
+            "code": "ModelFactory.Router.ParamError.FormatError",
+            "description": "Request parameter is invalid.",
+            "detail": "value is not a valid integer",
+            "solution": "Check the input format.",
+        }
+        english, english_changed = localized_error_content(source, "en-US")
+        chinese, chinese_changed = localized_error_content(source, "zh-CN")
+
+        self.assertTrue(english_changed)
+        self.assertTrue(chinese_changed)
+        self.assertEqual(english["detail"], "value is not a valid integer")
+        self.assertEqual(chinese["detail"], "输入参数格式不符合要求。")
+
+    def test_catalog_localizes_service_owned_error_without_changing_code(self):
+        source = {
+            "code": "ModelFactory.ExternalSmallModel.Used.DefaultNotExist",
+            "description": "Default small model is not configured.",
+            "detail": "An administrator has not configured a default small model for this type.",
+            "solution": "Configure a default small model in model management and try again.",
+        }
+
+        english, english_changed = localized_error_content(source, "en-US")
+        chinese, chinese_changed = localized_error_content(source, "zh-CN")
+
+        self.assertTrue(english_changed)
+        self.assertTrue(chinese_changed)
+        self.assertEqual(english["code"], chinese["code"])
+        self.assertEqual(english["detail"],
+                         "An administrator has not configured a default small model for this type.")
+        self.assertEqual(chinese["detail"], "管理员尚未配置该类型的默认小模型。")
+
+    def test_default_large_model_error_is_distinct_and_localized(self):
+        self.assertNotEqual(
+            ModelFactory_DedaultModel_NotExist["code"],
+            ModelFactory_ExternalSmallModel_Used_NameNotExist["code"],
+        )
+
+        english, _ = localized_error_content(ModelFactory_DedaultModel_NotExist, "en-US")
+        chinese, _ = localized_error_content(ModelFactory_DedaultModel_NotExist, "zh-CN")
+
+        self.assertEqual(english["code"], "ModelFactory.LLM.DefaultNotExist")
+        self.assertEqual(english["detail"], "An administrator has not configured a default large model.")
+        self.assertEqual(chinese["detail"], "管理员尚未配置默认大模型。")
+
+    def test_max_tokens_limit_keeps_the_dynamic_value_in_both_locales(self):
+        source = ModelFactory_Router_ParamError_FormatError_Error.copy()
+        source["detail"] = "max_tokens_limit: 4096k"
+
+        english, _ = localized_error_content(source, "en-US")
+        chinese, _ = localized_error_content(source, "zh-CN")
+
+        self.assertEqual(english["detail"], "max_tokens exceeds the maximum value of 4096k.")
+        self.assertEqual(chinese["detail"], "max_tokens 超过最大值 4096k。")
+
+    def test_catalog_hides_internal_database_detail_in_both_locales(self):
+        source = {
+            "code": "ModelFactory.Mydb.DataBase.ParameterError",
+            "description": "Database access failed.",
+            "detail": "dial tcp db.internal:3306: password=secret",
+            "solution": "Retry later.",
+        }
+
+        english, _ = localized_error_content(source, "en-US")
+        chinese, _ = localized_error_content(source, "zh-CN")
+
+        self.assertEqual(english["detail"], "Model Factory cannot access the database right now.")
+        self.assertEqual(chinese["detail"], "模型工厂暂时无法访问数据库。")
+        self.assertNotIn("db.internal", str(english))
+        self.assertNotIn("secret", str(chinese))
 
     def test_platform_stream_error_uses_the_frozen_locale_and_stable_code(self):
         token = set_effective_locale("en-US")
