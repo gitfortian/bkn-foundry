@@ -49,6 +49,46 @@ func Test_ValidateHeaderMethodOverride(t *testing.T) {
 	})
 }
 
+func Test_ValidateHeaderMethodOverrideLocalizesDetails(t *testing.T) {
+	tests := []struct {
+		name     string
+		language rest.Language
+		expected string
+	}{
+		{
+			name:     "Simplified Chinese",
+			language: rest.SimplifiedChinese,
+			expected: "X-HTTP-Method-Override 必须为 GET，当前为 POST。",
+		},
+		{
+			name:     "American English",
+			language: rest.AmericanEnglish,
+			expected: "X-HTTP-Method-Override must be GET; got POST.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := rest.WithLanguage(context.Background(), tt.language)
+			err := ValidateHeaderMethodOverride(ctx, "POST")
+			if err == nil {
+				t.Fatal("ValidateHeaderMethodOverride() returned nil error")
+			}
+
+			httpErr, ok := err.(*rest.HTTPError)
+			if !ok {
+				t.Fatalf("ValidateHeaderMethodOverride() error type = %T, want *rest.HTTPError", err)
+			}
+			if httpErr.BaseError.ErrorCode != oerrors.OntologyQuery_InvalidParameter_OverrideMethod {
+				t.Fatalf("error code = %q, want %q", httpErr.BaseError.ErrorCode, oerrors.OntologyQuery_InvalidParameter_OverrideMethod)
+			}
+			if details, ok := httpErr.BaseError.ErrorDetails.(string); !ok || details != tt.expected {
+				t.Fatalf("error details = %#v, want %q", httpErr.BaseError.ErrorDetails, tt.expected)
+			}
+		})
+	}
+}
+
 func Test_validateObjectsQueryParameters(t *testing.T) {
 	Convey("Test validateObjectsQueryParameters", t, func() {
 		ctx := context.Background()
@@ -715,6 +755,20 @@ func Test_validateObjectSearchRequest(t *testing.T) {
 			}
 			err := validateObjectSearchRequest(ctx, query)
 			So(err, ShouldBeNil)
+		})
+
+		Convey("失败 - Condition 解码错误保留具体原因", func() {
+			localizedCtx := rest.WithLanguage(ctx, rest.SimplifiedChinese)
+			query := &interfaces.ObjectQueryBaseOnObjectType{
+				Condition: map[string]any{"sub_conditions": "invalid"},
+			}
+
+			err := validateObjectSearchRequest(localizedCtx, query)
+			So(err, ShouldNotBeNil)
+			httpErr := err.(*rest.HTTPError)
+			details := httpErr.BaseError.ErrorDetails.(string)
+			So(details, ShouldStartWith, "解析过滤条件失败：")
+			So(details, ShouldContainSubstring, "sub_conditions")
 		})
 
 		Convey("失败 - Limit小于1", func() {
