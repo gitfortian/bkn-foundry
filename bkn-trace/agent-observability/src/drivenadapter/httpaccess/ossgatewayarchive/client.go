@@ -24,6 +24,7 @@ type Config struct {
 type Client struct {
 	config            Config
 	http              *http.Client
+	stream            *http.Client
 	mu                sync.Mutex
 	resolvedStorageID string
 }
@@ -38,7 +39,16 @@ func New(config Config) *Client {
 	if config.BaseURL == "" {
 		config.BaseURL = "http://oss-gateway-backend:8080/api/v1"
 	}
-	return &Client{config: config, http: &http.Client{Timeout: config.Timeout}}
+	streamTransport := http.DefaultTransport.(*http.Transport).Clone()
+	streamTransport.ResponseHeaderTimeout = config.Timeout
+	return &Client{
+		config: config,
+		http:   &http.Client{Timeout: config.Timeout},
+		// Archive bodies can legitimately take longer than the bounded
+		// control-plane calls. Response headers stay bounded while the request
+		// context remains the cancellation boundary once streaming starts.
+		stream: &http.Client{Transport: streamTransport},
+	}
 }
 func (client *Client) Ready() bool {
 	return strings.TrimSpace(client.config.BaseURL) != ""
@@ -102,6 +112,14 @@ func (client *Client) upload(ctx context.Context, key string, content []byte) er
 	return client.signed(ctx, method, signedURL, headers, content)
 }
 func (client *Client) download(ctx context.Context, key string) ([]byte, error) {
+	content, err := client.Read(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = content.Close() }()
+	return io.ReadAll(content)
+}
+func (client *Client) Read(ctx context.Context, key string) (io.ReadCloser, error) {
 	method, signedURL, headers, err := client.authorize(ctx, "download", key, http.MethodGet)
 	if err != nil {
 		return nil, err
@@ -113,19 +131,15 @@ func (client *Client) download(ctx context.Context, key string) ([]byte, error) 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	response, err := client.http.Do(req)
+	response, err := client.stream.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_ = response.Body.Close()
 		return nil, fmt.Errorf("read archive bundle: %s", response.Status)
 	}
-	return io.ReadAll(response.Body)
-}
-func (client *Client) DownloadURL(ctx context.Context, key string) (string, error) {
-	_, signedURL, _, err := client.authorize(ctx, "download", key, http.MethodGet)
-	return signedURL, err
+	return response.Body, nil
 }
 func (client *Client) authorize(ctx context.Context, operation, key, method string) (string, string, map[string]string, error) {
 	storageID, err := client.storageID(ctx)
