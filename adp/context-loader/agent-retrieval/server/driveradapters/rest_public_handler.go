@@ -32,10 +32,15 @@ import (
 )
 
 type restPublicHandler struct {
-	Hydra                          interfaces.Hydra
-	AppKeys                        interfaces.AppKeyVerifier
-	KnRetrievalHandler             knretrieval.KnRetrievalHandler
-	MCPHandler                     http.Handler
+	Hydra              interfaces.Hydra
+	AppKeys            interfaces.AppKeyVerifier
+	KnRetrievalHandler knretrieval.KnRetrievalHandler
+	MCPHandler         http.Handler
+	// PTCMCPHandler 是 PTC 的独立 MCP 端点（…/mcp/ptc）。与 MCPHandler 分开，
+	// 是因为两者的工具面互斥：客户端同时看到 run_code 与二十个业务工具时，
+	// 模型会挑后者，PTC 就退化成普通工具调用。装配失败时为 nil，该路由报 503，
+	// 不影响主工具面。
+	PTCMCPHandler                  http.Handler
 	KnLogicPropertyResolverHandler knlogicpropertyresolver.KnLogicPropertyResolverHandler
 	KnActionRecallHandler          knactionrecall.KnActionRecallHandler
 	KnQueryObjectInstanceHandler   knqueryobjectinstance.KnQueryObjectInstanceHandler
@@ -46,17 +51,21 @@ type restPublicHandler struct {
 	KnSkillsHandler                knskills.KnSkillsHandler
 	Logger                         interfaces.Logger
 	LifecycleClient                *bkntrace.LifecycleClient
+	// ServicePort 用于推导沙箱回访本服务的地址（见 PTC 工具包端点）。
+	ServicePort int
 }
 
 var buildMCPInfo = mcp.BuildMCPInfo
 
 // NewRestPublicHandler 创建restHandler实例
-func NewRestPublicHandler(logger interfaces.Logger) interfaces.HTTPRouterInterface {
+// servicePort 用于推导沙箱回访地址；沙箱在集群内，走不了浏览器侧的网关地址。
+func NewRestPublicHandler(logger interfaces.Logger, servicePort int) interfaces.HTTPRouterInterface {
 	return &restPublicHandler{
 		Hydra:                          drivenadapters.NewHydra(),
 		AppKeys:                        drivenadapters.NewAppKeyVerifier(),
 		KnRetrievalHandler:             knretrieval.NewKnRetrievalHandler(),
 		MCPHandler:                     mcp.NewMCPHandler(),
+		PTCMCPHandler:                  newPTCMCPHandlerOrNil(logger),
 		KnLogicPropertyResolverHandler: knlogicpropertyresolver.NewKnLogicPropertyResolverHandler(),
 		KnActionRecallHandler:          knactionrecall.NewKnActionRecallHandler(),
 		KnQueryObjectInstanceHandler:   knqueryobjectinstance.NewKnQueryObjectInstanceHandler(),
@@ -67,6 +76,7 @@ func NewRestPublicHandler(logger interfaces.Logger) interfaces.HTTPRouterInterfa
 		KnSkillsHandler:                knskills.NewKnSkillsHandler(),
 		Logger:                         logger,
 		LifecycleClient:                bkntrace.NewLifecycleClientFromEnv(),
+		ServicePort:                    servicePort,
 	}
 }
 
@@ -111,30 +121,121 @@ func (r *restPublicHandler) RegisterRouter(engine *gin.RouterGroup) {
 	}
 
 	// MCP Server (Bearer token auth, supports Cursor/Claude Desktop)
-	// GET /mcp/info 返回自描述文档（工具目录 + 连接方式），其余走标准 MCP Streamable HTTP。
+	// GET /mcp/info 返回自描述文档（工具目录 + 连接方式），
+	// GET /mcp/toolkit 返回同一工具面的代码模式形态，其余走标准 MCP Streamable HTTP。
 	engine.Any("/mcp/*path", r.handleMCP)
 }
 
-// handleMCP 在 MCP catch-all 路由内分流：GET …/mcp/info 返回自描述文档，其余交给 MCP Server。
+// handlePTCToolkit 返回 PTC 工具包（GET …/mcp/toolkit）。
+// 内容随工具面变化，客户端按 version 缓存。
+func (r *restPublicHandler) handlePTCToolkit(c *gin.Context) {
+	toolkit, err := mcp.BuildPTCToolkit(publicEndpointURL(c.Request, mcpPath), r.ServicePort)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, toolkit)
+}
+
+// handleMCP 在 MCP catch-all 路由内分流。
+//
+// 路径布局（两台 MCP Server，接入时二选一）：
+//
+//	/mcp                 MCP，二十来个业务工具逐个暴露
+//	/mcp/info            文档：描述 /mcp
+//	/mcp/ptc             MCP，只有 run_code / run_shell 加生命周期
+//	/mcp/ptc/info        文档：描述 /mcp/ptc
+//	/mcp/ptc/toolkit     自己实现 PTC 的素材（stub / digest / 工具表）
+//	/mcp/toolkit         /mcp/ptc/toolkit 的旧别名，已弃用
+//
+// 分流顺序是有意的：**精确匹配必须排在 /ptc 的前缀判断之前**。mcp-go 按前缀吃
+// 路径，把前缀判断提前会让 /mcp/ptc/toolkit 被当成一次 MCP 调用交给 PTC Server，
+// 然后 404——而且是静默的，看起来就像端点没上线。
 func (r *restPublicHandler) handleMCP(c *gin.Context) {
-	if c.Request.Method == http.MethodGet && c.Param("path") == "/info" {
-		info, err := buildMCPInfo(mcpEndpointURL(c.Request))
-		if err != nil {
-			if r.Logger != nil {
-				r.Logger.Errorf("BuildMCPInfo failed: %v", err)
-			}
-			sharedrest.MarkLocalizedCacheableResponse(c)
-			infrarest.ReplyError(c, infraerrors.NewHTTPError(c.Request.Context(), http.StatusInternalServerError, infraerrors.ErrExtMCPInfoBuildFailed, nil))
+	path := c.Param("path")
+	isGet := c.Request.Method == http.MethodGet
+
+	switch {
+	case isGet && path == ptcToolkitPath:
+		r.handlePTCToolkit(c)
+		return
+	// 旧路径。它描述的是 PTC 那套，却挂在 /mcp 下面，读起来像在描述 /mcp——
+	// 与 /mcp/info 的对称关系是错的。保留只为兼容先上线的客户端。
+	case isGet && path == legacyToolkitPath:
+		r.handlePTCToolkit(c)
+		return
+	case isGet && path == ptcInfoPath:
+		r.replyMCPInfo(c, publicEndpointURL(c.Request, ptcMCPPath))
+		return
+	case isGet && path == mcpInfoPath:
+		r.replyMCPInfo(c, mcpEndpointURL(c.Request))
+		return
+	case strings.HasPrefix(path, ptcPathPrefix):
+		// 总闸关着时按「没编译进来」处理，报 404 而不是 503：503 等于向任何探测者
+		// 承认这里本该有一条执行通道，只是眼下不可用。与 /kn/execute_skill 关闭时
+		// 根本不注册路由是同一个取向。
+		if !ptcExecutionEnabled() {
+			c.Status(http.StatusNotFound)
 			return
 		}
-		c.JSON(http.StatusOK, info)
+		// 闸是开的却没装配起来，那是故障，得让它看得见。
+		if r.PTCMCPHandler == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "PTC MCP endpoint is unavailable"})
+			return
+		}
+		r.PTCMCPHandler.ServeHTTP(c.Writer, c.Request)
 		return
 	}
 	r.MCPHandler.ServeHTTP(c.Writer, c.Request)
 }
 
+// MCP catch-all 之下的子路径。集中在一处，好让分流顺序与这份清单对着看。
+const (
+	mcpPath           = "/mcp"
+	ptcMCPPath        = "/mcp/ptc"
+	ptcPathPrefix     = "/ptc"
+	mcpInfoPath       = "/info"
+	ptcInfoPath       = "/ptc/info"
+	ptcToolkitPath    = "/ptc/toolkit"
+	legacyToolkitPath = "/toolkit"
+)
+
+// replyMCPInfo 输出某个 MCP 端点的自描述文档。
+//
+// 两个 info 端点（/mcp/info 与 /mcp/ptc/info）共用这一份实现，差别只在 endpoint。
+func (r *restPublicHandler) replyMCPInfo(c *gin.Context, endpoint string) {
+	info, err := buildMCPInfo(endpoint)
+	if err != nil {
+		if r.Logger != nil {
+			r.Logger.Errorf("BuildMCPInfo failed: %v", err)
+		}
+		sharedrest.MarkLocalizedCacheableResponse(c)
+		infrarest.ReplyError(c, infraerrors.NewHTTPError(
+			c.Request.Context(), http.StatusInternalServerError, infraerrors.ErrExtMCPInfoBuildFailed, nil))
+		return
+	}
+	c.JSON(http.StatusOK, info)
+}
+
 // mcpEndpointURL 依据请求推导本服务对外的 MCP 端点（去掉末尾的 /info）。
 func mcpEndpointURL(req *http.Request) string {
+	scheme := requestScheme(req)
+	base := strings.TrimSuffix(req.URL.Path, "/info")
+	return scheme + "://" + req.Host + base
+}
+
+// publicEndpointURL 按本组路由前缀拼出同一服务下另一个端点的对外地址。
+// 供路径不同的端点复用（如 /ptc/toolkit 需要报出 /mcp 的地址），
+// 不能用 mcpEndpointURL 那套「从当前路径去尾」的推法。
+func publicEndpointURL(req *http.Request, suffix string) string {
+	base := req.URL.Path
+	if i := strings.Index(base, "/v1/"); i >= 0 {
+		base = base[:i+len("/v1")]
+	}
+	return requestScheme(req) + "://" + req.Host + base + suffix
+}
+
+func requestScheme(req *http.Request) string {
 	scheme := "http"
 	if req.TLS != nil {
 		scheme = "https"
@@ -142,6 +243,36 @@ func mcpEndpointURL(req *http.Request) string {
 	if p := req.Header.Get("X-Forwarded-Proto"); p != "" {
 		scheme = p
 	}
-	base := strings.TrimSuffix(req.URL.Path, "/info")
-	return scheme + "://" + req.Host + base
+	return scheme
+}
+
+// ptcExecutionEnabled 本部署是否允许经工具面执行命令。
+//
+// PTC 的 run_code / run_shell 是一条沙箱执行通道，且比 execute_skill 更宽——后者
+// 只能跑已注册技能的入口命令，这两个跑的是调用方现写的任意 Python 与 shell。因此
+// 它必须服从同一道总闸：一个从没设过 EXECUTE_SKILL_ENABLED 的存量部署，其「本部署
+// 没有命令执行能力」的约定不能因为升级就被悄悄推翻。
+//
+// 复用既有开关而不是新开一个：这是同一条部署级策略，拆成两个旋钮只会让运维以为
+// 关掉一个就够了。
+func ptcExecutionEnabled() bool {
+	return logicsSkills.ExecuteEnabled()
+}
+
+// newPTCMCPHandlerOrNil 装配 PTC MCP 端点，失败只记日志并返回 nil。
+//
+// PTC 依赖内嵌的工具元数据渲染工具包，读失败时不该把整个服务拖垮——主工具面
+// 与全部 REST 端点与它无关。该路由随后返回 503，故障是可见的。
+func newPTCMCPHandlerOrNil(logger interfaces.Logger) http.Handler {
+	if !ptcExecutionEnabled() {
+		return nil
+	}
+	handler, err := mcp.NewPTCMCPHandler()
+	if err != nil {
+		if logger != nil {
+			logger.Errorf("[RestPublicHandler] PTC MCP endpoint unavailable: %v", err)
+		}
+		return nil
+	}
+	return handler
 }
