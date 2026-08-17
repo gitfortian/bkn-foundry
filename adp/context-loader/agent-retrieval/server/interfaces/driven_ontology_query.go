@@ -187,6 +187,78 @@ type QueryInstanceSubgraphResp struct {
 	Entries interface{} `json:"entries"`
 }
 
+// ExploreSubgraphReq 起点探索式子图查询，对应下游 SubGraphQueryBaseOnSource
+// （`POST /subgraph` 且 query_type 留空）。
+//
+// 与 QueryInstanceSubgraphReq 的路径模板模式互补，互不替代：那边要求调用方先把整条
+// 路径的对象类序列与关系类序列拼出来，适合「拓扑已知、批量取数」；这边只要起点对象类
+// + 方向 + 跳数，适合「拓扑未知、要发现关联」——后者才是 Agent 的默认提问形态。
+type ExploreSubgraphReq struct {
+	// 以下字段走 URL，不进请求体：整个结构体会被直接序列化成 body 发给下游。
+	KnID               string `json:"-" form:"kn_id"`
+	IncludeLogicParams bool   `json:"-" form:"include_logic_params"`
+	// ExcludeSystemProperties / IgnoringStoreCache 只供服务内部调用方使用，不进 MCP
+	// 工具 schema，理由与 QueryObjectInstancesReq 上的同名字段一致。
+	//
+	// 关于 ExcludeSystemProperties 在本接口是否生效：下游确实把嵌套的起点对象查询
+	// （startObjectQuery）里这行赋值注释掉了，但那**不代表参数无效**——子图的系统字段
+	// 由子图层自己生成而非起点查询带出（那行注释旁边写着这个原因），裁剪发生在
+	// expandObjectPathsBatch 组装 ObjectInfoInSubgraph 时，读的正是
+	// query.ExcludeSystemProperties。所以照常透传。
+	ExcludeSystemProperties []string `json:"-" form:"exclude_system_properties"`
+	IgnoringStoreCache      bool     `json:"-" form:"ignoring_store_cache"`
+
+	// SourceObjectTypeID 探索起点的对象类。
+	SourceObjectTypeID string `json:"source_object_type_id"`
+	// Direction 探索方向，取 forward / backward / bidirectional，由下游校验。
+	Direction string `json:"direction"`
+	// PathLength 最大跳数，取 1-3。
+	//
+	// 上界与下游 validateSubgraphSearchRequest 一致（超 3 回 400）；**下界必须钉在这里**：
+	// 0 是 int 零值，与「没传」不可区分，而下游对 0 不报错、只返回空子图——调用方会把
+	// 「参数漏填」读成「什么都没连上」。校验挂在结构体上而不是各入口里，REST 与 MCP
+	// 才共用同一条规则（MCP 侧另有一次显式检查，为的是把字段名点出来）。
+	PathLength int `json:"path_length" validate:"min=1,max=3"`
+	// ConceptGroups 按概念分组圈定探索范围，不传则不限。
+	ConceptGroups []string `json:"concept_groups,omitempty"`
+	// Cond 起点对象类的过滤条件，与 query_object_instance 的 condition 同构。
+	Cond *KnCondition `json:"condition,omitempty"`
+	// IncludeIncompletePath 是否返回「已走过至少一条边但类型路径没走完」的残缺路径，
+	// 默认 false。零边路径任何情况下都不返回。
+	IncludeIncompletePath bool `json:"include_incomplete_path,omitempty"`
+
+	// 以下四项作用于**起点对象类**，不是整张子图：下游 SubGraphQueryBaseOnSource
+	// 内嵌 PageQuery，分页与排序都只切起点集合。
+	Sort        []*SortSpec `json:"sort,omitempty"`
+	Limit       int         `json:"limit" validate:"min=1,max=10000" default:"10"`
+	Offset      int         `json:"offset,omitempty"`
+	SearchAfter []any       `json:"search_after,omitempty"`
+	// NeedTotal 由 driven adapter 无条件置 true，不对外开放，理由同对象查询。
+	NeedTotal bool `json:"need_total"`
+}
+
+// ExploreSubgraphResp 对应下游 ObjectSubGraph。
+//
+// 注意它与 QueryInstanceSubgraphResp 的关系：下游 PathsEntries 就是
+// `{ entries: []ObjectSubGraph }`，即路径模板模式返回的是本结构的**数组**，探索模式
+// 返回单个。两者元素同型，差别只在「一个」还是「一组」。
+type ExploreSubgraphResp struct {
+	// Objects 参与关系的对象，key 是对象 id。
+	Objects map[string]any `json:"objects"`
+	// IsolatedObjects 未与其余对象建立关系的孤立对象。**这是有效结论不是空结果**：
+	// 它明确回答了「这些起点之间/向外没有关联」。
+	IsolatedObjects map[string]any `json:"isolated_objects,omitempty"`
+	// RelationPaths 具体的关系路径集合。
+	RelationPaths []any `json:"relation_paths"`
+	// TotalCount 起点对象类的命中总数，三态语义与 QueryObjectInstancesResp.TotalCount
+	// 完全一致（有值 >0 / 有值 =0 / 缺失表示没算），见 resolveAbsentTotal。
+	TotalCount *int64 `json:"total_count,omitempty"`
+	// SearchAfter 起点对象类的下一页游标。
+	SearchAfter []any `json:"search_after,omitempty"`
+	// CurrentPathNumber 下游回填的当前路径序号。
+	CurrentPathNumber int `json:"current_path_number,omitempty"`
+}
+
 // DrivenOntologyQuery Ontology query interface
 type DrivenOntologyQuery interface {
 	// QueryObjectInstances retrieves detailed data of objects for a specified object class
@@ -201,8 +273,11 @@ type DrivenOntologyQuery interface {
 	GetActionExecution(ctx context.Context, req *GetActionExecutionRequest) (resp map[string]any, err error)
 	// ListActionExecutions lists action execution history with optional filters and pagination
 	ListActionExecutions(ctx context.Context, req *ListActionExecutionsRequest) (resp map[string]any, err error)
-	// QueryInstanceSubgraph queries object subgraph
+	// QueryInstanceSubgraph queries object subgraph along caller-supplied type paths
 	QueryInstanceSubgraph(ctx context.Context, req *QueryInstanceSubgraphReq) (resp *QueryInstanceSubgraphResp, err error)
+	// ExploreSubgraph explores an object subgraph from a source object type, by
+	// direction and hop count, without the caller having to know the topology
+	ExploreSubgraph(ctx context.Context, req *ExploreSubgraphReq) (resp *ExploreSubgraphResp, err error)
 	// QueryMetricData computes one metric by its own definition
 	// (POST .../metrics/{metric_id}/data)
 	QueryMetricData(ctx context.Context, knID, metricID string, fillNull bool,
