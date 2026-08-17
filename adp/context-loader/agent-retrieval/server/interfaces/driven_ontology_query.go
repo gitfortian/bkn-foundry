@@ -31,11 +31,41 @@ type QueryObjectInstancesReq struct {
 	Filters    []FlatFilter `json:"filters,omitempty"`
 	Limit      int          `json:"limit" validate:"min=1,max=10000" default:"10"` // Quantity limit, default 10, range 1-10000
 	Properties []string     `json:"properties"`                                    // 指定返回的对象属性字段列表，默认返回所有属性
+	// Sort 排序字段。下游 ObjectQueryBaseOnObjectType.Sort 是数组（可多字段排序），
+	// 不传则由下游按默认排序（对象索引路径为 _score + 主键，资源路径为 @timestamp desc）。
+	// field 是否存在于对象类由下游校验，此处只透传。
+	Sort []*SortSpec `json:"sort,omitempty"`
+	// NeedTotal 让下游回填 total_count。由 driven adapter 无条件置 true，不对外开放：
+	// 缺了它调用方只知道「还有没有下一页」，不知道命中总量，无从判断结果规模。
+	NeedTotal bool `json:"need_total"`
 	// SearchAfter 游标分页：传入上一页响应返回的 search_after，用于顺序拉取下一页；首次查询留空。
 	// 适用于对象索引 / 数据视图路径（顺翻，不跳页）。
 	SearchAfter []any `json:"search_after,omitempty"`
 	// Offset 偏移翻页：适用于资源（vega 表源）路径，支持跳到任意页；与 search_after 互斥。
 	Offset int `json:"offset,omitempty"`
+
+	// 以下两项是下游的 query 参数而非请求体字段，故标 json:"-"：整个 req 结构体会被
+	// 直接序列化成请求体发给 ontology-query，漏标会把它们混进 body。
+	// 两者都只供服务内部调用方使用，不进 MCP 工具 schema——见字段注释。
+
+	// ExcludeSystemProperties 裁剪返回实例里的系统字段，可选值 _instance_id /
+	// _instance_identity / _display。批量召回时这三个字段是纯 context 开销，但哪些能丢
+	// 取决于调用方后续要不要拿它们做下钻，不该交给模型判断。
+	ExcludeSystemProperties []string `json:"-" form:"exclude_system_properties"`
+	// IgnoringStoreCache 跳过索引查询直接走数据源。索引陈旧或异常时的逃生通道，
+	// 代价是慢一个数量级；暴露给模型会被当成「重试一次」滥用。
+	IgnoringStoreCache bool `json:"-" form:"ignoring_store_cache"`
+}
+
+// SortSpec 是单个排序字段。与下游 interfaces.SortParams 同形，direction 取 asc / desc。
+//
+// field 与 direction 的**取值**合法性由下游 validateObjectSearchRequest 校验并回 400——
+// 字段是否存在于对象类只有下游知道，在这里做一半校验只会让两侧规则漂移。
+// 但**结构性** nil 元素必须在本层拦（见 rejectNilSortEntries）：下游 validate.go 与
+// logics/common.go 都直接取 sp.Field，nil 元素不会换来 400 而是空指针 panic。
+type SortSpec struct {
+	Field     string `json:"field"`
+	Direction string `json:"direction"`
 }
 
 // FlatFilter is a single field-op-value comparison used by
@@ -50,7 +80,18 @@ type FlatFilter struct {
 type QueryObjectInstancesResp struct {
 	Data          []any          `json:"datas"`                 // List of object instances
 	ObjectConcept map[string]any `json:"object_type,omitempty"` // Object type definition，由 req.include_type_info 控制是否返回
-	TotalCount    int64          `json:"total_count,omitempty"` // 命中总数（need_total 时有效）
+	// TotalCount 满足过滤条件的实例总数，不受 limit 限制。
+	//
+	// 指针 + omitempty，三态：
+	//   有值且 > 0 —— 真实总数
+	//   有值且 = 0 —— 真实零命中（omitempty 对指针只吞 nil，不吞 0）
+	//   字段缺失   —— 下游没算，不是零命中
+	//
+	// 第三态是必须留的：driven adapter 虽然固定开 need_total，但下游
+	// （ontology-query logics/common.go 的 BuildDslQuery）在 search_after 非空时
+	// 会强制 NeedTotal=false，即游标翻页第二页起根本不计算总数。此时若按值类型
+	// 序列化成 0，就是拿「未计算」冒充「零命中」，而且会和非空 datas 自相矛盾。
+	TotalCount *int64 `json:"total_count,omitempty"`
 	// SearchAfter 下一页游标：非空时把它作为下次请求的 search_after 传入以取下一页；为空表示无更多数据。
 	SearchAfter []any `json:"search_after,omitempty"`
 }

@@ -37,8 +37,14 @@ var (
 )
 
 const (
-	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/object-types/:ot_id?include_type_info=true
-	queryObjectInstancesURI = "/in/v1/knowledge-networks/%s/object-types/%s?include_type_info=%v&include_logic_params=%v"
+	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/object-types/:ot_id
+	//
+	// Query parameters are assembled with url.Values at call time rather than baked
+	// into this format string: the set is no longer fixed (exclude_system_properties
+	// repeats, ignoring_store_cache is conditional), and ot_id reaches us straight
+	// from an agent, so an unescaped "?" or "&" in it would smuggle parameters into
+	// the downstream request — the same hazard queryMetricDataURI documents below.
+	queryObjectInstancesURI = "/in/v1/knowledge-networks/%s/object-types/%s"
 	// https://{host}:{port}/api/ontology-query/in/v1/knowledge-networks/:kn_id/object-types/:ot_id/properties
 	queryLogicPropertiesURI = "/in/v1/knowledge-networks/%s/object-types/%s/properties"
 	// https://{host}:{port}/api/ontology-query/v1/knowledge-networks/:kn_id/action-types/:at_id
@@ -102,16 +108,57 @@ func expandFilters(req *interfaces.QueryObjectInstancesReq) {
 	req.Filters = nil
 }
 
+// rejectNilSortEntries turns a null element in `sort` into a 400 here instead of
+// letting it become a panic downstream.
+//
+// A JSON `"sort": [null]` binds to []*SortSpec{nil} and is forwarded verbatim, and
+// ontology-query dereferences the element without a nil guard in two places —
+// driveradapters/validate.go (validateObjectSearchRequest reads sp.Field) and
+// logics/common.go (BuildDslQuery reads sp.Field/sp.Direction). So external input
+// crashes the downstream service rather than earning a 400.
+//
+// This is not the "validate half of it here" mistake the SortSpec comment warns
+// about: whether a field belongs to an object type is downstream's knowledge, but a
+// nil element is malformed structure that can produce no downstream verdict at all.
+func rejectNilSortEntries(ctx context.Context, req *interfaces.QueryObjectInstancesReq) error {
+	for i, sp := range req.Sort {
+		if sp == nil {
+			return infraErr.DefaultHTTPError(ctx, http.StatusBadRequest,
+				fmt.Sprintf("sort[%d] 不能为 null，每个排序项都必须带 field 与 direction", i))
+		}
+	}
+	return nil
+}
+
 func (o *ontologyQueryClient) QueryObjectInstances(ctx context.Context, req *interfaces.QueryObjectInstancesReq) (resp *interfaces.QueryObjectInstancesResp, err error) {
+	if err = rejectNilSortEntries(ctx, req); err != nil {
+		return nil, err
+	}
+
 	// Expand the flat `filters` sugar into a nested condition before forwarding.
 	expandFilters(req)
 
-	uri := fmt.Sprintf(queryObjectInstancesURI, req.KnID, req.OtID, req.IncludeTypeInfo, req.IncludeLogicParams)
-	url := fmt.Sprintf("%s%s", o.baseURL, uri)
+	// need_total is a body field, not a query parameter, and it is not optional here:
+	// without it ontology-query omits total_count, leaving the caller able to tell
+	// "is there a next page" but not "how many matched at all".
+	req.NeedTotal = true
+
+	uri := fmt.Sprintf(queryObjectInstancesURI, url.PathEscape(req.KnID), url.PathEscape(req.OtID))
+	query := url.Values{}
+	query.Set("include_type_info", strconv.FormatBool(req.IncludeTypeInfo))
+	query.Set("include_logic_params", strconv.FormatBool(req.IncludeLogicParams))
+	if req.IgnoringStoreCache {
+		query.Set("ignoring_store_cache", "true")
+	}
+	for _, prop := range req.ExcludeSystemProperties {
+		query.Add("exclude_system_properties", prop)
+	}
+	target := fmt.Sprintf("%s%s?%s", o.baseURL, uri, query.Encode())
+
 	header := common.GetHeaderForChildOperation(ctx, "ontology.object.query", 1)
 	header[rest.ContentTypeKey] = rest.ContentTypeJSON
 	header["x-http-method-override"] = "GET"
-	_, respBody, err := o.httpClient.Post(ctx, url, header, req)
+	_, respBody, err := o.httpClient.Post(ctx, target, header, req)
 	if err != nil {
 		o.logger.WithContext(ctx).Warnf("[OntologyQuery#QueryObjectInstances] QueryObjectInstances request failed, err: %v", err)
 		err = classifyQueryError(ctx, err)
@@ -125,7 +172,28 @@ func (o *ontologyQueryClient) QueryObjectInstances(ctx context.Context, req *int
 		err = infraErr.DefaultHTTPError(ctx, http.StatusInternalServerError, err.Error())
 		return
 	}
+	resolveTotalCount(req, resp)
 	return
+}
+
+// resolveTotalCount recovers the "zero hits" case that the wire format cannot carry.
+//
+// ontology-query's Objects.TotalCount is `json:"total_count,omitempty"`, so a real
+// total of 0 is dropped before it ever reaches us — indistinguishable, in the body
+// alone, from the total not having been computed. The request tells them apart:
+// need_total is forced on for every call, and the only thing downstream does with it
+// is turn it off when search_after is non-empty (logics/common.go BuildDslQuery). So
+// with no cursor in the request, an absent total means the count ran and came back 0;
+// with a cursor, it means no count ran and the caller must not read it as 0.
+func resolveTotalCount(req *interfaces.QueryObjectInstancesReq, resp *interfaces.QueryObjectInstancesResp) {
+	if resp == nil || resp.TotalCount != nil {
+		return
+	}
+	if req != nil && len(req.SearchAfter) > 0 {
+		return
+	}
+	zero := int64(0)
+	resp.TotalCount = &zero
 }
 
 // classifyQueryError re-classifies a downstream client error (4xx) from
