@@ -268,7 +268,7 @@ func buildTaskBuildKeyFields(buildTask *interfaces.BuildTask) []string {
 	return append([]string(nil), buildTask.IndexConfig.BuildKeyFields...)
 }
 
-// hasFulltextFeature 判断字段是否已带 fulltext 特性。
+// The hasFulltextFeature determines whether a field already has the fulltext feature.
 func hasFulltextFeature(prop *interfaces.Property) bool {
 	for _, f := range prop.Features {
 		if f.FeatureType == interfaces.PropertyFeatureType_Fulltext {
@@ -278,7 +278,7 @@ func hasFulltextFeature(prop *interfaces.Property) bool {
 	return false
 }
 
-// analyzerOf 取 fulltext 特性 config 里的分词器名，无则空串。
+// analyzerOf returns the analyzer name from fulltext feature configuration, or an empty string when absent.
 func analyzerOf(config map[string]any) string {
 	if config == nil {
 		return ""

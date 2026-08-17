@@ -56,7 +56,7 @@ func (bbw *batchBuildWorker) Run(ctx context.Context, buildTaskInfo *interfaces.
 	}
 	taskID := buildTaskInfo.ID
 	logger.Infof("Starting batch build task: %s", taskID)
-	// 异步任务无原始请求上下文，以任务创建者身份执行下游权限检查
+	// Asynchronous tasks have no original request context and perform downstream permission checks as the task creator
 	ctx = context.WithValue(ctx, interfaces.ACCOUNT_INFO_KEY, buildTaskInfo.Creator)
 
 	resourceID := buildTaskInfo.ResourceID
@@ -77,8 +77,8 @@ func (bbw *batchBuildWorker) Run(ctx context.Context, buildTaskInfo *interfaces.
 		return nil
 	}
 
-	// executeBuild 创建索引和连接数据源前先确认 Catalog；若排队期间 Catalog
-	// 已被删除，则直接取消任务。
+	// Before executeBuild creates the index and connects to the data source, confirm the Catalog first. If you Catalog during the queue
+	// If it has been deleted, the task will be cancelled directly.
 	catalog, err := bbw.cs.InternalGetByID(ctx, resource.CatalogID, true)
 	if err != nil {
 		if isNotFoundError(err) {
@@ -122,6 +122,7 @@ func batchBuildExecuteType(buildTask *interfaces.BuildTask) string {
 	return interfaces.BuildTaskExecuteTypeIncremental
 }
 
+// buildBatchCursorFilter builds a lexicographic cursor filter for composite keys.
 func buildBatchCursorFilter(keys []string, keyValues []interfaces.KeyValue) *interfaces.FilterCondCfg {
 	branches := make([]*interfaces.FilterCondCfg, 0, len(keys))
 	for i, key := range keys {
@@ -156,8 +157,8 @@ func (bbw *batchBuildWorker) executeBuild(ctx context.Context, catalog *interfac
 	lastSyncedMark := buildTaskInfo.SyncedMark
 	if executeType == interfaces.BuildTaskExecuteTypeFull {
 		lastSyncedMark = ""
-		// 全量重跑从头读、向量也整体重做，进度计数器一并清零，
-		// 否则跨运行累计出 synced > total 的显示
+		// All runs are redone from scratch, the vectors are also redone as a whole, and the progress counter is reset to zero at the same time.
+		// Otherwise, the display of synced > total will be accumulated across runs
 		buildTaskInfo.SyncedCount = 0
 		zero := int64(0)
 		emptyMark := ""

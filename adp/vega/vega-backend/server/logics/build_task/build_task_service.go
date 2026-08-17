@@ -46,7 +46,7 @@ type buildTaskService struct {
 	appSetting *common.AppSetting
 	bta        interfaces.BuildTaskAccess
 	cs         interfaces.CatalogService
-	lim        interfaces.LocalIndexManager // 删任务时 drop 其本地索引；测试注入 mock
+	lim        interfaces.LocalIndexManager // When deleting a task, drop its local index. Test Injection mock
 	mfs        interfaces.ModelFactoryService
 	rs         interfaces.ResourceService
 	ums        interfaces.UserMgmtService
@@ -497,8 +497,8 @@ func (bts *buildTaskService) InternalMarkCompleted(ctx context.Context, tx *sql.
 	return bts.bta.MarkCompleted(ctx, tx, id, time.Now().UnixMilli())
 }
 
-// populateBuildTaskReferences 批量补齐任务关联的资源与目录展示字段。它只查询当前
-// 返回的任务所引用的实体，避免任务列表由前端触发全量资源/目录加载。
+// PopulateBuildTaskReferences batch completion task related resources and show directory field. It only queries the current situation
+// The entity referenced by the returned task should be avoided to prevent the task list from being triggered by the front end to load the full resource/directory.
 func (bts *buildTaskService) populateBuildTaskReferences(ctx context.Context, buildTasks []*interfaces.BuildTask) error {
 	if len(buildTasks) == 0 {
 		return nil
@@ -653,7 +653,7 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 		span.SetStatus(codes.Error, "Build task not found")
 		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
 	}
-	// failed 也允许重启：否则失败任务成死胡同，只能删除重建
+	// Failed tasks may also be restarted; otherwise they become dead ends that must be deleted and rebuilt.
 	if buildTask.Status != interfaces.BuildTaskStatusStopped &&
 		buildTask.Status != interfaces.BuildTaskStatusFailed {
 		span.SetStatus(codes.Error, "Invalid state transition for start")
@@ -777,9 +777,9 @@ func (bts *buildTaskService) Stop(ctx context.Context, taskID string) error {
 			WithErrorDetails(fmt.Sprintf("cannot stop task in status: %s", buildTask.Status))
 	}
 
-	// running → stopping：通知 worker 在批间检查点退出。
-	// pending → stopped：排队中尚无 worker 观察 stopping，直接落停；
-	// 出队时 worker 检查到 stopped 即跳过，不会复活执行。
+	// running → stopping: Notifies the worker to exit at the inter-batch checkpoint.
+	// pending → stopped: If there are no workers in the queue to observe stopping, stop directly.
+	// When dequeuing, if the worker detects "stopped", it will skip and will not be revived for execution.
 	var updated bool
 	if buildTask.Status == interfaces.BuildTaskStatusPending {
 		updated, err = bts.bta.MarkStopped(ctx, taskID, time.Now().UnixMilli())
@@ -899,8 +899,8 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 
 	deleteIDs := make([]string, 0, len(toDelete))
 	for _, bt := range toDelete {
-		// 先 drop 索引（尽力，失败仅记日志），再删任务行——与删资源/删 catalog 的级联
-		// 语义一致，避免 UI 单任务删除留下孤儿索引（#66 只覆盖了资源/目录两条路径）。
+		// Drop the index on a best-effort basis before deleting the task row, consistent with resource and catalog cascades.
+		// Semantic consistency is maintained to prevent the deletion of a single UI task from leaving an orphan index (#66 only covers the two paths of resources and directories).
 		idx := interfaces.BuildIndexName(bt.ResourceID, bt.ID)
 		if err := bts.lim.DeleteIndex(ctx, idx); err != nil {
 			otellog.LogError(ctx, fmt.Sprintf("Drop index %s for build task %s failed", idx, bt.ID), err)

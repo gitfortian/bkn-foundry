@@ -13,7 +13,7 @@ import (
 
 var ErrModelNotFound = errors.New("model not found")
 
-// ModelFactoryAccess 定义模型工厂相关的访问接口
+// ModelFactoryAccess defines access operations for Model Factory.
 //
 //go:generate mockgen -source ../interfaces/model_factory_access.go -destination ../interfaces/mock/mock_model_factory_access.go
 type ModelFactoryAccess interface {
