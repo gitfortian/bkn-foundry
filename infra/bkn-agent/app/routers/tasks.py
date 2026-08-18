@@ -18,10 +18,12 @@ async def invoke(
     account: Account = Depends(get_account),
     session: AsyncSession = Depends(get_session),
 ):
-    """同步一次性执行，等到终态才返回。
+    """Run once synchronously and return only when the task reaches a terminal state.
 
-    仅 published agent 可调（draft 与不存在同响应）；chat/task 模式均可，
-    执行为无状态单轮，不落 thread。任务记录照常落库可监控。
+    Only a published agent may be called; a draft answers exactly like a missing
+    one. Both chat and task modes are accepted. Execution is a single stateless
+    turn and no thread is persisted, while the task record is still stored so the
+    run stays observable.
     """
     agent = await dao.get_agent(session, agent_id)
     if not agent or agent.status != "published":
@@ -36,7 +38,7 @@ async def invoke(
     }
     task = await dao.create_task(session, agent.agent_id, task_input, account.account_id)
     await runner.execute_task(task.task_id, agent, task_input, account.account_id, account.account_type)
-    session.expire_all()  # 终态由 runner 在独立 session 写入，绕过本 session 缓存
+    session.expire_all()  # The runner writes the terminal state in its own session, so bypass this cache.
     return await dao.get_task(session, task.task_id)
 
 
@@ -50,7 +52,7 @@ async def run(
     if not agent:
         raise not_found("agent", req.agent_id)
     if agent.mode != "task":
-        raise bad_request("Mode", "该 agent 不是一次性模式", f"agent {req.agent_id} mode={agent.mode}", "对话 agent 走 /chat。")
+        raise bad_request("BknAgent.Task.ModeMismatch", agent_id=req.agent_id, mode=agent.mode)
 
     task_input = {
         "message": req.message,
@@ -71,6 +73,6 @@ async def get_task(
     session: AsyncSession = Depends(get_session),
 ):
     task = await dao.get_task(session, task_id, account_id=account.account_id)
-    if not task:  # 非 owner 与不存在同响应，不泄露存在性
+    if not task:  # A non-owner answers like a missing task; existence is not disclosed.
         raise not_found("task", task_id)
     return task
