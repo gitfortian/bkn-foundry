@@ -61,6 +61,11 @@ type PTCTool struct {
 }
 
 const (
+	// PTC 暴露的两个工具名。并进业务工具面时要按名字挑出 run_code 换描述，
+	// 字面量散在两处容易改漏。
+	toolKeyRunCode  = "run_code"
+	toolKeyRunShell = "run_shell"
+
 	// ptcWrapHandler 见 PTCTool.Wrap。
 	ptcWrapHandler = "handler"
 	// ptcWrapCdWorkdir 见 PTCTool.Wrap。
@@ -73,6 +78,42 @@ var ptcSkipTools = map[string]bool{
 	"bkn_start_interaction":  true,
 	"bkn_finish_interaction": true,
 }
+
+// ptcToolSchemas 取 run_code / run_shell 的入参与出参声明。
+//
+// 读的是 PTC 自己那份 locale 资源，而不是在 schemas/ 下另放一份：同一个 schema
+// 存两处，改一处忘另一处时没有任何东西会报错，模型拿到的声明就和执行侧对不上。
+// 返回的入参已经带上 bkn_context：run_code 确实要这个参数，而 offerBKNContext
+// 正是业务工具那条路加它的方式，共用同一个函数才能保证两者逐字一致。
+func ptcToolSchemas(locale *mcpLocaleBundle, toolKey string) (json.RawMessage, json.RawMessage, bool) {
+	var inputResource string
+	switch toolKey {
+	case toolKeyRunCode:
+		inputResource = "ptc_run_code_schema.json"
+	case toolKeyRunShell:
+		inputResource = "ptc_run_shell_schema.json"
+	default:
+		return nil, nil, false
+	}
+	return offerBKNContext(json.RawMessage(locale.PTCResource(inputResource))),
+		json.RawMessage(locale.PTCResource("ptc_output_schema.json")), true
+}
+
+// ptcInlineDescriptions 渲染并进业务工具面时 PTC 工具的描述，按工具 key 返回。
+//
+// tools 是当前这一版的工具全表（含 PTC 工具自己，由 ptcUsableTools 剔除）。
+// /mcp 的 tools/list 与 /mcp/info 都从这里取，两处才不会各说一套。
+func ptcInlineDescriptions(locale *mcpLocaleBundle, tools []MCPToolInfo) map[string]string {
+	usable := ptcUsableTools(&MCPInfo{Tools: tools})
+	return map[string]string{
+		toolKeyRunCode:  renderPTCDigestForLocale(locale, usable, false),
+		toolKeyRunShell: locale.PTCResource("ptc_run_shell_description.txt"),
+	}
+}
+
+// PTC 工具在 digest 里不能列出自己：那份清单是给沙箱内的脚本看的可调函数表，
+// 把 run_code 写进去等于告诉模型可以在代码里再开一层沙箱。
+var ptcSelfTools = map[string]bool{toolKeyRunCode: true, toolKeyRunShell: true}
 
 // bkn_context 是会话生命周期管道，由 stub 的 _call 自动注入，不该出现在签名里。
 var ptcPlumbingParams = map[string]bool{"bkn_context": true}
@@ -256,10 +297,23 @@ func ptcItemKeys(raw json.RawMessage) string {
 	return strings.Join(names, " ")
 }
 
+// ptcToolNames 把工具名排成一行，供不带签名的那版 digest 使用。
+// 排序保证渲染可重复——Version 是内容哈希，顺序抖动会让客户端每次都以为工具面变了。
+func ptcToolNames(tools []MCPToolInfo) string {
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		if tool.Name != "" {
+			names = append(names, tool.Name)
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
 func ptcUsableTools(info *MCPInfo) []MCPToolInfo {
 	tools := make([]MCPToolInfo, 0, len(info.Tools))
 	for _, t := range info.Tools {
-		if t.Name == "" || ptcSkipTools[t.Name] {
+		if t.Name == "" || ptcSkipTools[t.Name] || ptcSelfTools[t.Name] {
 			continue
 		}
 		tools = append(tools, t)
@@ -301,11 +355,39 @@ func ptcGroupTitle(locale *mcpLocaleBundle, tool MCPToolInfo) string {
 }
 
 func renderPTCDigest(tools []MCPToolInfo) string {
-	return renderPTCDigestForLocale(loadMCPLocaleBundle(defaultMCPLocale), tools)
+	return renderPTCDigestForLocale(loadMCPLocaleBundle(defaultMCPLocale), tools, true)
 }
 
-func renderPTCDigestForLocale(locale *mcpLocaleBundle, tools []MCPToolInfo) string {
+// renderPTCDigestForLocale 渲染 run_code 的工具描述。
+//
+// withSignatures 决定要不要带那份函数签名清单，它占整份 digest 的 55%：
+//
+//   - 独立的 PTC 端点上工具面只有 run_code / run_shell，模型没有别处可看，必须带；
+//   - run_code 与业务工具并列在同一个工具面上时不带——那些工具的完整 schema 就在
+//     工具面里，再渲染一遍 Python 签名等于同一批工具描述两次。
+//
+// 不带签名时改用另一份前言：它不列函数，只说清「工具面上的工具已在作用域内」以及
+// 两处与 schema 不符的地方（bkn_context 由运行时注入、response_format 固定 json）。
+// 那两条靠「参数与 schema 一致」打发不掉——schema 里 bkn_context 是必填。
+func renderPTCDigestForLocale(locale *mcpLocaleBundle, tools []MCPToolInfo, withSignatures bool) string {
 	var b strings.Builder
+	if !withSignatures {
+		b.WriteString(locale.PTCResource("ptc_digest_prefix_inline.txt"))
+		// 只列名字，不列签名。参数与返回值让调用方去读工具面上的 schema——那份就在
+		// 眼前，重复渲染是浪费；但「哪些工具能在脚本里调」不该靠推断：条件注册的工具
+		// （execute_skill）存在与否、有没有漏掉某一个，列出来才没有歧义。
+		// 实测 21 个名字约 300 字符，而完整签名清单是 4897。
+		if names := ptcToolNames(tools); names != "" {
+			b.WriteString("\n")
+			b.WriteString(locale.PTCResource("ptc_digest_names_lead.txt"))
+			b.WriteString(names)
+			// 多一个换行：紧邻的 suffix 以 ## 标题开头，粘在同一段里 markdown 不成立。
+			b.WriteString("\n\n")
+		}
+		b.WriteString(locale.PTCResource("ptc_digest_suffix.txt"))
+		return b.String()
+	}
+
 	b.WriteString(locale.PTCResource("ptc_digest_prefix.txt"))
 	group := ""
 	for _, tool := range tools {
@@ -373,6 +455,25 @@ func BuildPTCToolkitForLocale(endpoint string, port int, locale string) (*PTCToo
 	return buildPTCToolkitFromLocale(ptcUsableTools(info), port, loadMCPLocaleBundle(locale))
 }
 
+// InlinePTCToolkit 渲染可以并进业务工具面的 PTC 工具包（run_code / run_shell）。
+//
+// 与 BuildPTCToolkit 的差别只在 run_code 的描述：那份签名清单被省掉了，因为并列时
+// 那些工具的完整 schema 就在同一个工具面上，再渲染一遍 Python 签名是重复。
+// 实测两种渲染 8852 vs 约 3800 字符。
+//
+// 其余部分（stub、沙箱回访地址、组装方式）完全一致——两条路最终拼出的脚本相同。
+//
+// 返回整个工具包而不只是工具表：执行侧还要 Stub 与 SandboxMCPURL 才能拼脚本。
+// 走的是同一条构建路径而非事后改描述，因此 Version 覆盖的是这一版的实际内容，
+// 不会出现两份不同的 digest 顶着同一个哈希。
+func InlinePTCToolkit(port int, locale string) (*PTCToolkit, error) {
+	info, err := BuildMCPInfoForLocale("", locale)
+	if err != nil {
+		return nil, err
+	}
+	return buildPTCToolkitVariant(ptcUsableTools(info), port, loadMCPLocaleBundle(locale), false)
+}
+
 // buildPTCToolkitFrom 从已筛好的工具目录渲染工具包。与 BuildPTCToolkit 分开，
 // 是为了让测试不必起一个真实端点就能覆盖工具表与版本号。
 func buildPTCToolkitFrom(tools []MCPToolInfo, port int) (*PTCToolkit, error) {
@@ -380,18 +481,27 @@ func buildPTCToolkitFrom(tools []MCPToolInfo, port int) (*PTCToolkit, error) {
 }
 
 func buildPTCToolkitFromLocale(tools []MCPToolInfo, port int, locale *mcpLocaleBundle) (*PTCToolkit, error) {
-	digest := renderPTCDigestForLocale(locale, tools)
+	return buildPTCToolkitVariant(tools, port, locale, true)
+}
+
+// buildPTCToolkitVariant 是两种 digest 渲染共用的构建路径。withSignatures 决定
+// run_code 的描述里带不带函数签名清单：独立端点上没有别的工具可参照，必须带；
+// 并进业务工具面时那些 schema 就在旁边，只留函数名。
+func buildPTCToolkitVariant(
+	tools []MCPToolInfo, port int, locale *mcpLocaleBundle, withSignatures bool,
+) (*PTCToolkit, error) {
+	digest := renderPTCDigestForLocale(locale, tools, withSignatures)
 	stub := renderPTCStub(tools)
 	exposed := []PTCTool{
 		{
-			Name:        "run_code",
+			Name:        toolKeyRunCode,
 			Description: digest,
 			InputSchema: json.RawMessage(locale.PTCResource("ptc_run_code_schema.json")),
 			Language:    "python",
 			Wrap:        ptcWrapHandler,
 		},
 		{
-			Name:        "run_shell",
+			Name:        toolKeyRunShell,
 			Description: locale.PTCResource("ptc_run_shell_description.txt"),
 			InputSchema: json.RawMessage(locale.PTCResource("ptc_run_shell_schema.json")),
 			Language:    "shell",
