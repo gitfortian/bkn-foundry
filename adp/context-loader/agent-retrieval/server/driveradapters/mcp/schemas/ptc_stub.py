@@ -11,10 +11,18 @@ _configure(event) injects credentials and lifecycle context before execution.
 import json
 import os
 import pathlib
+import sys
 import urllib.request
 
 _CFG = {}
 _SESSION = {}
+
+# 最近几次调用返回值的形状。脚本抛异常时随 traceback 一并打出——代码模式下调用方
+# 必须先写出取值路径再执行，猜错时 traceback 只说 "NoneType is not iterable"，不说
+# 真实结构，于是整整一轮被用来 print 原始数据找字段名，而那又把数据灌回了上下文，
+# 正好抵消代码模式省上下文的意义。这里只记形状不记值。
+_SHAPES = []
+_SHAPE_LIMIT = 6
 
 # /workspace is shared by all calls. Create and enter a conversation-specific
 # subdirectory so scripts can use relative paths without crossing sessions.
@@ -31,6 +39,7 @@ class ToolError(RuntimeError):
 
 def _configure(event):
     """Inject MCP endpoint, credentials, and lifecycle context; prepare workdir."""
+    _install_shape_hook()
     global WORKDIR
     _CFG.update(event)
     _SESSION.clear()
@@ -108,7 +117,86 @@ def _call(tool, args):
     if result.get("isError") or result.get("is_error"):
         raise ToolError(tool + ": " + text)
     try:
-        return json.loads(text)
+        value = json.loads(text)
     except json.JSONDecodeError:
         # Return non-JSON representations, such as response_format=toon, unchanged.
         return text
+    _remember_shape(tool, value)
+    return value
+
+
+def _describe(value, depth=0):
+    """把一个值压成形状描述。只留键名与条数，不留值。
+
+    深到 3 层：顶层 dict -> 数组 -> 元素 dict 的键名。字段名多半就在最后那层
+    （nodes[].object_type_name、object_types[].concept_name），折在前面就白记了。
+    """
+    if isinstance(value, dict):
+        if depth >= 3:
+            return "{%d 键}" % len(value)
+        inner = ", ".join(
+            "%s: %s" % (k, _describe(v, depth + 1)) for k, v in list(value.items())[:12]
+        )
+        more = ", …共 %d 键" % len(value) if len(value) > 12 else ""
+        return "{" + inner + more + "}"
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        return "[%d × %s]" % (len(value), _describe(value[0], depth + 1))
+    return type(value).__name__
+
+
+def _remember_shape(tool, value):
+    _SHAPES.append((tool, _describe(value)))
+    del _SHAPES[:-_SHAPE_LIMIT]
+
+
+def _shape_report():
+    """给失败的执行附上最近几次调用的返回结构。"""
+    if not _SHAPES:
+        return ""
+    lines = ["", "[最近的返回结构——按这个改，不必再跑一轮把数据打出来找字段名]"]
+    lines += ["  %s -> %s" % (tool, shape) for tool, shape in _SHAPES]
+    return "\n".join(lines)
+
+
+def _install_shape_hook():
+    """让脚本失败时带上最近几次调用的返回结构。
+
+    要挂两处，因为沙箱的两套 wrapper 对异常的处理不一样：
+
+      - subprocess runner 直接 `result = handler(event)`，异常未捕获，走 excepthook；
+      - bwrap runner 把它包在 try/except 里，打完 traceback 后 sys.exit(1)，
+        excepthook 永远不会被调用。
+
+    只挂 excepthook 的话，这段在开了 bwrap 的部署上完全不生效——而那是生产配置。
+    所以同时接管 sys.exit：非零退出即视为失败。
+
+    装在 stub 而不是 wrapper 里：wrapper 有三处实现（服务端 /mcp/ptc、studio、
+    沙箱 SDK），且改 wrapper 等于让沙箱运行时去认识 BKN 的东西。
+    """
+    if getattr(sys, "_bkn_shape_hook", False):
+        return
+
+    def emit():
+        report = _shape_report()
+        if report:
+            sys.stderr.write(report + "\n")
+
+    previous_hook = sys.excepthook
+
+    def hook(kind, value, tb):
+        previous_hook(kind, value, tb)
+        emit()
+
+    previous_exit = sys.exit
+
+    def guarded_exit(code=0):
+        # 只在失败时补报告：成功退出时它是噪音，而 stderr 会原样回到调用方。
+        if code:
+            emit()
+        previous_exit(code)
+
+    sys.excepthook = hook
+    sys.exit = guarded_exit
+    sys._bkn_shape_hook = True
