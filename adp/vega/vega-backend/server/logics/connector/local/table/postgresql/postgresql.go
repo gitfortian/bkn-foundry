@@ -59,6 +59,8 @@ type PostgresqlConnector struct {
 
 	connected bool
 	db        *sql.DB
+
+	compatibility postgresqlCompatibility
 }
 
 // NewPostgresqlConnector creates the PostgreSQL connector builder
@@ -186,8 +188,13 @@ func (c *PostgresqlConnector) Connect(ctx context.Context) error {
 		return err
 	}
 
-	c.db = db
-	c.connected = true
+	compatibility := detectPostgresqlCompatibility(ctx, db)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = db.Close()
+		return ctxErr
+	}
+
+	c.db, c.compatibility, c.connected = db, compatibility, true
 	return nil
 }
 

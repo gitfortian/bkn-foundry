@@ -186,7 +186,6 @@ func (c *MariaDBConnector) Connect(ctx context.Context) error {
 		_ = db.Close()
 		return err
 	}
-
 	c.db = db
 	c.connected = true
 
@@ -241,11 +240,14 @@ func (c *MariaDBConnector) validateDatabases(ctx context.Context) error {
 
 	existingDBs := make(map[string]bool)
 	for rows.Next() {
-		var dbName string
+		var dbName sql.NullString
 		if err := rows.Scan(&dbName); err != nil {
 			return fmt.Errorf("failed to scan database name: %w", err)
 		}
-		existingDBs[dbName] = true
+		if !dbName.Valid {
+			return fmt.Errorf("required schema metadata contains NULL")
+		}
+		existingDBs[dbName.String] = true
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("failed to iterate databases: %w", err)
