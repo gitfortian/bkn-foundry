@@ -322,7 +322,9 @@ func TestMariaDBConnectorConvertFilterConditionLike(t *testing.T) {
 	})
 	t.Run("convert like special chars", func(t *testing.T) {
 		c := &MariaDBConnector{}
-		cond := mustNewCond(t, "name", "like", "100%")
+		// A % in the value matches literally and the caller has to escape it; an unescaped one
+		// is rejected back in NewFilterCondition
+		cond := mustNewCond(t, "name", "like", `100\%`)
 		_, args := toSQL(t, c, cond)
 		argStr, ok := args[0].(string)
 		if !ok {

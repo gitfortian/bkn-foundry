@@ -464,10 +464,17 @@ func (c *OpenSearchConnector) ConvertFilterConditionLike(condition interfaces.Fi
 		return nil, err
 	}
 
-	vStr := c.replaceLikeWildcards(cond.Value)
+	if cond.LegacyWildcards {
+		return map[string]any{
+			"regexp": map[string]any{
+				fieldName + keyword: c.legacyLikeWildcardRegexp(cond.Value),
+			},
+		}, nil
+	}
+
 	return map[string]any{
-		"regexp": map[string]any{
-			fieldName + keyword: vStr,
+		"wildcard": map[string]any{
+			fieldName + keyword: c.likeContainsPattern(cond.Value),
 		},
 	}, nil
 }
@@ -490,14 +497,22 @@ func (c *OpenSearchConnector) ConvertFilterConditionNotLike(condition interfaces
 		return nil, err
 	}
 
-	vStr := c.replaceLikeWildcards(cond.Value)
+	inner := map[string]any{
+		"wildcard": map[string]any{
+			fieldName + keyword: c.likeContainsPattern(cond.Value),
+		},
+	}
+	if cond.LegacyWildcards {
+		inner = map[string]any{
+			"regexp": map[string]any{
+				fieldName + keyword: c.legacyLikeWildcardRegexp(cond.Value),
+			},
+		}
+	}
+
 	return map[string]any{
 		"bool": map[string]any{
-			"must_not": map[string]any{
-				"regexp": map[string]any{
-					fieldName + keyword: vStr,
-				},
-			},
+			"must_not": inner,
 		},
 	}, nil
 }
@@ -1099,8 +1114,26 @@ func (c *OpenSearchConnector) ConvertFilterConditionKnnVector(condition interfac
 	}, nil
 }
 
-// replaceLikeWildcards, replace the wildcard of like with the character in the regular expression
-func (c *OpenSearchConnector) replaceLikeWildcards(input string) string {
+// likeContainsPattern 把 like / not_like 的字面子串转成 OpenSearch 的 wildcard 模式。
+//
+// like 的契约是子串包含，值里的 % 与 _ 已在 filter_condition.ParseLikeValue 拦下，
+// 到这里的都是要原样匹配的字面量，因此只需转义 wildcard 自己的元字符 * ? \ 后两端补 *。
+func (c *OpenSearchConnector) likeContainsPattern(input string) string {
+	var escaped strings.Builder
+	for _, r := range input {
+		if r == '*' || r == '?' || r == '\\' {
+			escaped.WriteRune('\\')
+		}
+		escaped.WriteRune(r)
+	}
+	return "*" + escaped.String() + "*"
+}
+
+// legacyLikeWildcardRegexp reproduces how the index path handled a like value before this
+// change: % -> .*, _ -> ., backslash escapes preserved. It is used only for conditions marked
+// as legacy (see filter_condition.MarkLegacyLikeWildcards), so stored view definitions return
+// the same rows as before; new values go through likeContainsPattern's literal semantics.
+func (c *OpenSearchConnector) legacyLikeWildcardRegexp(input string) string {
 	if input == "" {
 		return input
 	}
@@ -1113,23 +1146,18 @@ func (c *OpenSearchConnector) replaceLikeWildcards(input string) string {
 		r := runes[i]
 
 		if escaped {
-			// The character after the escape character
 			switch r {
 			case '%', '_', '\\':
 				result.WriteRune(r)
 			default:
-				// If non-special characters are escaped, retain the escape character and the characters
 				result.WriteRune('\\')
 				result.WriteRune(r)
 			}
 			escaped = false
 		} else if r == '\\' {
-			// When encountering an escape character, check if it is the last character
 			if i == len(runes)-1 {
-				// The escape character is at the end and is output directly
 				result.WriteRune(r)
 			} else {
-				// Mark the escape status but do not immediately output the escape character
 				escaped = true
 			}
 		} else if r == '%' {
@@ -1141,7 +1169,6 @@ func (c *OpenSearchConnector) replaceLikeWildcards(input string) string {
 		}
 	}
 
-	// Handle cases ending with an escape character
 	if escaped {
 		result.WriteRune('\\')
 	}

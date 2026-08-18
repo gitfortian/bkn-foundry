@@ -279,6 +279,15 @@ func (g *logicViewDSLGenerator) buildDSLQuery(ctx context.Context, view *interfa
 // Construct filtering conditions
 func (g *logicViewDSLGenerator) buildDSLCondition(ctx context.Context, filters *interfaces.FilterCondCfg,
 	fieldMap map[string]*interfaces.Property) (map[string]any, error) {
+	// filters comes from the node config stored in the view definition: server-side data the
+	// caller cannot edit. Applying the new like contract to it would let one upgrade break an
+	// existing view, so those conditions keep their pre-change behaviour and only get a warning.
+	if marked := filter_condition.MarkLegacyLikeWildcards(filters); marked > 0 {
+		logger.Warnf("%d stored like/not_like condition(s) in this logic view use '%%' as a wildcard; "+
+			"kept on the pre-change behaviour of this backend. Escape it as '\\%%' or switch the condition to [regex] in the view definition.",
+			marked)
+	}
+
 	// Concatenate the filter conditions into the query of the dsl
 	filterCond, err := filter_condition.NewFilterCondition(ctx, filters, fieldMap)
 	if err != nil {

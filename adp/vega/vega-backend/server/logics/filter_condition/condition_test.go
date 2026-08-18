@@ -349,15 +349,31 @@ func TestInCond(t *testing.T) {
 
 func TestLikeCond(t *testing.T) {
 	t.Run("like cond valid", func(t *testing.T) {
-		cfg := constCfg("name", "like", "ali%")
+		cfg := constCfg("name", "like", "ali")
 		cond, err := NewFilterCondition(context.Background(), cfg, testFieldsMap())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		like := cond.(*LikeCond)
-		if like.Value != "ali%" {
-			t.Errorf("expected value 'ali%%', got '%s'", like.Value)
+		if like.Value != "ali" {
+			t.Errorf("expected value 'ali', got '%s'", like.Value)
 		}
+	})
+	// The value of a like is a literal substring. When a caller writes "%ali%" out of SQL habit
+	// the SQL connectors escape the % into a literal and the query returns nothing, without an
+	// error — which is why this has to be said at the entry point.
+	t.Run("like cond rejects SQL wildcards", func(t *testing.T) {
+		cfg := constCfg("name", "like", "%ali%")
+		_, err := NewFilterCondition(context.Background(), cfg, testFieldsMap())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "literal substring")
+		assert.Contains(t, err.Error(), "[regex]")
+	})
+	t.Run("not_like cond rejects SQL wildcards", func(t *testing.T) {
+		cfg := constCfg("name", "not_like", "ali%")
+		_, err := NewFilterCondition(context.Background(), cfg, testFieldsMap())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "literal substring")
 	})
 	t.Run("like cond non string field", func(t *testing.T) {
 		cfg := constCfg("age", "like", "test")
@@ -379,6 +395,42 @@ func TestLikeCond(t *testing.T) {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestParseLikeValue(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		want       string
+		errContain string
+	}{
+		{name: "plain substring", value: "Indirect", want: "Indirect"},
+		{name: "empty value", value: "", want: ""},
+		{name: "cjk substring", value: "吹塑风管", want: "吹塑风管"},
+		{name: "escaped percent is a literal", value: `50\%`, want: "50%"},
+		{name: "escaped underscore is a literal", value: `a\_b`, want: "a_b"},
+		{name: "escaped backslash is a literal", value: `a\\b`, want: `a\b`},
+		{name: "backslash before a plain char is kept", value: `a\nb`, want: `a\nb`},
+		{name: "trailing backslash is kept", value: `ab\`, want: `ab\`},
+		{name: "leading and trailing percent rejected", value: "%Indirect%", errContain: "literal substring"},
+		// _ was literal on every path before this change, so rejecting it is collateral damage:
+		// search terms containing an underscore are far too common
+		{name: "bare underscore is a literal", value: "object_type", want: "object_type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseLikeValue(OperationLike, tt.value)
+
+			if tt.errContain != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errContain)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestRangeCond(t *testing.T) {
@@ -656,4 +708,58 @@ func advancedFieldsMap() map[string]*interfaces.Property {
 	fields := testFieldsMap()
 	fields["embedding"] = &interfaces.Property{Name: "embedding", Type: interfaces.DataType_Vector}
 	return fields
+}
+
+// A legacy spelling stored in a view definition must not stop working under the new contract:
+// once marked, each connector renders it with its own pre-change semantics — a literal on the
+// SQL side, a wildcard regexp on the index side — instead of returning 400 on every query.
+func TestMarkLegacyLikeWildcards(t *testing.T) {
+	t.Run("marks an unescaped percent without touching the value", func(t *testing.T) {
+		cfg := constCfg("name", "like", "%ali%")
+
+		marked := MarkLegacyLikeWildcards(cfg)
+
+		assert.Equal(t, 1, marked)
+		assert.True(t, cfg.LegacyLikeWildcards)
+		// The value is left alone: translation belongs to the connectors, and rewriting it here
+		// uniformly would throw away the wildcard semantics the index path had
+		assert.Equal(t, "%ali%", cfg.Value)
+
+		cond, err := NewFilterCondition(context.Background(), cfg, testFieldsMap())
+		require.NoError(t, err)
+		like := cond.(*LikeCond)
+		assert.True(t, like.LegacyWildcards)
+		assert.Equal(t, "%ali%", like.Value)
+	})
+
+	t.Run("leaves already valid values untouched", func(t *testing.T) {
+		cfg := constCfg("name", "like", `object_type\%`)
+
+		marked := MarkLegacyLikeWildcards(cfg)
+
+		assert.Equal(t, 0, marked)
+		assert.False(t, cfg.LegacyLikeWildcards)
+	})
+
+	t.Run("walks nested conditions and skips other operations", func(t *testing.T) {
+		cfg := &interfaces.FilterCondCfg{
+			Operation: OperationAnd,
+			SubConds: []*interfaces.FilterCondCfg{
+				constCfg("name", "like", "%a"),
+				constCfg("name", "not_like", "b%"),
+				constCfg("name", "==", "100%"),
+			},
+		}
+
+		marked := MarkLegacyLikeWildcards(cfg)
+
+		assert.Equal(t, 2, marked)
+		assert.True(t, cfg.SubConds[0].LegacyLikeWildcards)
+		assert.True(t, cfg.SubConds[1].LegacyLikeWildcards)
+		assert.False(t, cfg.SubConds[2].LegacyLikeWildcards)
+	})
+
+	t.Run("tolerates a nil condition", func(t *testing.T) {
+		assert.Equal(t, 0, MarkLegacyLikeWildcards(nil))
+	})
 }

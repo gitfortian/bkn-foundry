@@ -283,14 +283,27 @@ func TestLogicViewDSLConvertFilterCondition(t *testing.T) {
 			want: map[string]any{"bool": map[string]any{"must_not": map[string]any{"terms": map[string]any{"title.keyword": []any{"a", "b"}}}}},
 		},
 		{
-			name: "like converts wildcards to regexp",
-			cfg:  dslConditionCfg("title", filter_condition.OperationLike, interfaces.ValueFrom_Const, `a\_%`),
+			name: "like matches an escaped underscore literally",
+			cfg:  dslConditionCfg("title", filter_condition.OperationLike, interfaces.ValueFrom_Const, `a\_b`),
+			want: map[string]any{"wildcard": map[string]any{"title.keyword": "*a_b*"}},
+		},
+		{
+			// Legacy spelling from a stored view definition: the DSL side still renders it as a
+			// wildcard regexp, matching what it returned before. This path had no test, and it is
+			// precisely the half whose behaviour differs from the SQL side.
+			name: "legacy like keeps the wildcard regexp",
+			cfg:  dslLegacyCfg("title", filter_condition.OperationLike, `a\_%`),
 			want: map[string]any{"regexp": map[string]any{"title.keyword": "a_.*"}},
 		},
 		{
-			name: "not like",
-			cfg:  dslConditionCfg("title", filter_condition.OperationNotLike, interfaces.ValueFrom_Const, `a%`),
+			name: "legacy not like keeps the wildcard regexp",
+			cfg:  dslLegacyCfg("title", filter_condition.OperationNotLike, `a%`),
 			want: map[string]any{"bool": map[string]any{"must_not": map[string]any{"regexp": map[string]any{"title.keyword": "a.*"}}}},
+		},
+		{
+			name: "not like",
+			cfg:  dslConditionCfg("title", filter_condition.OperationNotLike, interfaces.ValueFrom_Const, `ab`),
+			want: map[string]any{"bool": map[string]any{"must_not": map[string]any{"wildcard": map[string]any{"title.keyword": "*ab*"}}}},
 		},
 		{
 			name: "contain",
@@ -581,4 +594,11 @@ func mustDSLCondition(t *testing.T, cfg *interfaces.FilterCondCfg, fields map[st
 	cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, fields)
 	require.NoError(t, err)
 	return cond
+}
+
+// dslLegacyCfg builds a like/not_like marked as legacy, i.e. one using % as a wildcard
+func dslLegacyCfg(name string, op string, value any) *interfaces.FilterCondCfg {
+	cfg := dslConditionCfg(name, op, interfaces.ValueFrom_Const, value)
+	cfg.LegacyLikeWildcards = true
+	return cfg
 }

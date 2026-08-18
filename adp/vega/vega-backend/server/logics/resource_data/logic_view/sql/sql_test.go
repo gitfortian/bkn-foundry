@@ -360,7 +360,7 @@ func TestLogicViewSQLConvertFilterCondition(t *testing.T) {
 			Operation: filter_condition.OperationLike,
 			ValueOptCfg: interfaces.ValueOptCfg{
 				ValueFrom: interfaces.ValueFrom_Const,
-				Value:     "a_%'b",
+				Value:     `a\_\%'b`,
 			},
 		}, fields)
 
@@ -386,7 +386,7 @@ func TestLogicViewSQLConvertFilterCondition(t *testing.T) {
 		{name: "gte field", cfg: sqlConditionCfg("age", filter_condition.OperationGte, interfaces.ValueFrom_Field, "score"), wantSQL: "`age` >= `score`"},
 		{name: "in const slice", cfg: sqlConditionCfg("name", filter_condition.OperationIn, interfaces.ValueFrom_Const, []any{"alice", "bob"}), wantSQL: "`name` IN (?,?)", wantArg: []any{"alice", "bob"}},
 		{name: "not in const slice", cfg: sqlConditionCfg("name", filter_condition.OperationNotIn, interfaces.ValueFrom_Const, []any{"alice", "bob"}), wantSQL: "`name` NOT IN (?,?)", wantArg: []any{"alice", "bob"}},
-		{name: "not like escapes special chars", cfg: sqlConditionCfg("name", filter_condition.OperationNotLike, interfaces.ValueFrom_Const, "a_%"), wantSQL: "`name` NOT LIKE ?", wantArg: []any{`%a\_\%%`}},
+		{name: "not like escapes special chars", cfg: sqlConditionCfg("name", filter_condition.OperationNotLike, interfaces.ValueFrom_Const, `a\_\%`), wantSQL: "`name` NOT LIKE ?", wantArg: []any{`%a\_\%%`}},
 		{name: "contain values", cfg: sqlConditionCfg("tags", filter_condition.OperationContain, interfaces.ValueFrom_Const, []any{"core", "pii"}), wantSQL: "(FIND_IN_SET(?, `tags`) > 0 AND FIND_IN_SET(?, `tags`) > 0)", wantArg: []any{"core", "pii"}},
 		{name: "not contain values", cfg: sqlConditionCfg("tags", filter_condition.OperationNotContain, interfaces.ValueFrom_Const, []any{"core", "pii"}), wantSQL: "(FIND_IN_SET(?, `tags`) = 0 OR FIND_IN_SET(?, `tags`) = 0)", wantArg: []any{"core", "pii"}},
 		{name: "range values", cfg: sqlConditionCfg("age", filter_condition.OperationRange, interfaces.ValueFrom_Const, []any{18, 30}), wantSQL: "(`age` >= ? AND `age` <= ?)", wantArg: []any{18, 30}},
@@ -605,4 +605,53 @@ func mustSQLCondition(t *testing.T, cfg *interfaces.FilterCondCfg, fields map[st
 	cond, err := filter_condition.NewFilterCondition(context.Background(), cfg, fields)
 	require.NoError(t, err)
 	return cond
+}
+
+// Node filter conditions of an existing composite view also live in the view definition, out
+// of the caller's reach. The new like contract must not make those views fail every query after
+// an upgrade — they keep their pre-change behaviour instead of erroring.
+func TestBuildFilterSQLKeepsLegacyLikeWildcards(t *testing.T) {
+	generator := NewlogicDefinitionSQLGenerator(testSQLView())
+	fields := testSQLConditionFieldMap()
+
+	t.Run("stored like with unescaped wildcards still builds", func(t *testing.T) {
+		filters := &interfaces.FilterCondCfg{
+			Name:      "name",
+			Operation: filter_condition.OperationLike,
+			ValueOptCfg: interfaces.ValueOptCfg{
+				ValueFrom: interfaces.ValueFrom_Const,
+				Value:     "%abc%",
+			},
+		}
+
+		sqlizer, _, err := generator.buildFilterSQL(context.Background(), filters, fields)
+
+		require.NoError(t, err)
+		require.NotNil(t, sqlizer)
+		sqlText, sqlArgs, err := sqlizer.ToSql()
+		require.NoError(t, err)
+		assert.Equal(t, "`name` LIKE ?", sqlText)
+		// Same as before this change: % lands as a literal
+		assert.Equal(t, []any{`%\%abc\%%`}, sqlArgs)
+	})
+
+	t.Run("stored condition tree is marked in place", func(t *testing.T) {
+		filters := &interfaces.FilterCondCfg{
+			Operation: filter_condition.OperationAnd,
+			SubConds: []*interfaces.FilterCondCfg{
+				{
+					Name:        "name",
+					Operation:   filter_condition.OperationLike,
+					ValueOptCfg: interfaces.ValueOptCfg{ValueFrom: interfaces.ValueFrom_Const, Value: "a%"},
+				},
+			},
+		}
+
+		_, _, err := generator.buildFilterSQL(context.Background(), filters, fields)
+
+		require.NoError(t, err)
+		assert.True(t, filters.SubConds[0].LegacyLikeWildcards)
+		// The value is untouched; each connector translates it with its own pre-change semantics
+		assert.Equal(t, "a%", filters.SubConds[0].Value)
+	})
 }

@@ -195,6 +195,16 @@ func (lvs *logicViewService) queryDerivedLogicView(ctx context.Context, view *in
 			WithErrorDetails(fmt.Sprintf("failed to decode resource node config: %v", err))
 	}
 	fromResourceFilterCond := nodeCfg.Filters
+	// Filter conditions stored in the view definition are server-side data the caller cannot
+	// edit. Applying the new like contract to them would let one upgrade break an existing view,
+	// so they keep their pre-change behaviour and only get a warning; conditions the caller sent
+	// are still rejected.
+	if marked := filter_condition.MarkLegacyLikeWildcards(fromResourceFilterCond); marked > 0 {
+		otellog.LogWarn(ctx, fmt.Sprintf(
+			"View %s has %d stored like/not_like condition(s) using '%%' as a wildcard; kept on the pre-change behaviour of this backend. "+
+				"Escape it as '\\%%' or switch the condition to [regex] in the view definition.",
+			view.ID, marked))
+	}
 
 	fromResource, err := lvs.rs.GetByID(ctx, nodeCfg.ResourceID)
 	if err != nil {
@@ -259,9 +269,32 @@ func (lvs *logicViewService) queryDerivedLogicView(ctx context.Context, view *in
 		mergedFilterCond = params.FilterCondCfg
 	}
 
+	// The two halves have different owners, so the status code has to follow the source: a
+	// failure in the half stored in the view definition is a server-side configuration problem,
+	// and reporting 400 sends the caller hunting through parameters they never supplied while
+	// hiding the view definition that actually needs fixing.
+	if fromResourceFilterCond != nil {
+		if _, err := filter_condition.NewFilterCondition(ctx, fromResourceFilterCond, fieldMap); err != nil {
+			otellog.LogError(ctx, "Create filter condition from view definition failed", err)
+			return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError).
+				WithErrorDetails(fmt.Sprintf("view %s has an invalid stored filter condition: %v", view.ID, err))
+		}
+	}
+	if params.FilterCondCfg != nil {
+		if _, err := filter_condition.NewFilterCondition(ctx, params.FilterCondCfg, fieldMap); err != nil {
+			// Sent by the caller: a missing field, a wrong value type or a misused operator are
+			// all request errors, and a 500 would say the service is broken when the request is
+			// what needs fixing.
+			otellog.LogError(ctx, "Create filter condition failed", err)
+			return nil, 0, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
+				WithErrorDetails(err.Error())
+		}
+	}
+
 	actualFilterCond, err := filter_condition.NewFilterCondition(ctx, mergedFilterCond, fieldMap)
 	if err != nil {
-		otellog.LogError(ctx, "Create filter condition failed", err)
+		// Both halves validated on their own, so a failure here can only be server-side
+		otellog.LogError(ctx, "Create merged filter condition failed", err)
 		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError).
 			WithErrorDetails(err.Error())
 	}

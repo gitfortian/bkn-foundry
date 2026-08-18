@@ -16,6 +16,7 @@ import (
 
 	sq "github.com/Masterminds/squirrel"
 	"github.com/mitchellh/mapstructure"
+	"github.com/openbkn-ai/bkn-foundry/comm-go/logger"
 
 	"vega-backend/interfaces"
 	"vega-backend/logics/filter_condition"
@@ -222,6 +223,16 @@ func (g *logicViewSQLGenerator) buildFilterSQL(ctx context.Context, filters *int
 
 	if filters == nil {
 		return nil, nil, nil
+	}
+
+	// filters comes from the node config stored in the view definition — resource, join and
+	// union nodes all land here — which is server-side data the caller cannot edit. Applying
+	// the new like contract to it would let one upgrade break an existing view, so those
+	// conditions keep their pre-change behaviour and only get a warning.
+	if marked := filter_condition.MarkLegacyLikeWildcards(filters); marked > 0 {
+		logger.Warnf("%d stored like/not_like condition(s) in this logic view use '%%' as a wildcard; "+
+			"kept on the pre-change behaviour of this backend. Escape it as '\\%%' or switch the condition to [regex] in the view definition.",
+			marked)
 	}
 
 	filterCond, err := filter_condition.NewFilterCondition(ctx, filters, fieldMap)

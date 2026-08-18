@@ -167,8 +167,11 @@ func (rds *resourceDataService) query(ctx context.Context, resource *interfaces.
 	}
 	actualFilterCond, err := filter_condition.NewFilterCondition(ctx, params.FilterCondCfg, fieldMap)
 	if err != nil {
+		// The condition came from the caller: a missing field, a wrong value type or a misused
+		// operator are all request errors, and a 500 would say the service is broken when the
+		// request is what needs fixing.
 		otellog.LogError(ctx, "Create filter condition failed", err)
-		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError).
+		return nil, 0, rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InvalidParameter).
 			WithErrorDetails(err.Error())
 	}
 	params.ActualFilterCond = actualFilterCond
