@@ -557,6 +557,55 @@ func (t *transaction) ListOperationCallFactsByTraceID(traceID string) []sessionv
 	return result
 }
 
+func (t *transaction) ListFirstOperationSourceModulesByTraceIDs(traceIDs []string) map[string]string {
+	if t.err != nil {
+		return nil
+	}
+	uniqueTraceIDs := make([]string, 0, len(traceIDs))
+	seen := make(map[string]struct{}, len(traceIDs))
+	for _, traceID := range traceIDs {
+		if traceID == "" {
+			continue
+		}
+		if _, found := seen[traceID]; found {
+			continue
+		}
+		seen[traceID] = struct{}{}
+		uniqueTraceIDs = append(uniqueTraceIDs, traceID)
+	}
+	if len(uniqueTraceIDs) == 0 {
+		return map[string]string{}
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(uniqueTraceIDs)), ",")
+	args := make([]any, len(uniqueTraceIDs))
+	for index, traceID := range uniqueTraceIDs {
+		args[index] = traceID
+	}
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT trace_id, source_module
+		FROM bkn_trace_operation_call_facts
+		WHERE trace_id IN (`+placeholders+`) AND source_module <> ''
+		ORDER BY trace_id, started_at, operation_id, attempt_no`, args...)
+	if err != nil {
+		t.err = err
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	result := make(map[string]string, len(uniqueTraceIDs))
+	for rows.Next() {
+		var traceID, sourceModule string
+		if err := rows.Scan(&traceID, &sourceModule); err != nil {
+			t.err = err
+			return nil
+		}
+		if _, found := result[traceID]; !found {
+			result[traceID] = sourceModule
+		}
+	}
+	t.err = rows.Err()
+	return result
+}
+
 func (t *transaction) SaveOperationCallFact(fact sessionvo.OperationCallFact) {
 	if t.err != nil {
 		return

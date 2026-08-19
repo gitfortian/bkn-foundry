@@ -240,6 +240,53 @@ func (tx memoryTransaction) ListOperationCallFactsByTraceID(traceID string) []se
 	return result
 }
 
+func (tx memoryTransaction) ListFirstOperationSourceModulesByTraceIDs(traceIDs []string) map[string]string {
+	requested := make(map[string]struct{}, len(traceIDs))
+	for _, traceID := range traceIDs {
+		if traceID != "" {
+			requested[traceID] = struct{}{}
+		}
+	}
+	if len(requested) == 0 {
+		return map[string]string{}
+	}
+
+	type candidate struct {
+		startedAt    time.Time
+		operationID  string
+		attempt      uint32
+		sourceModule string
+	}
+	candidates := make(map[string]candidate, len(requested))
+	for _, fact := range tx.s.operationCalls {
+		if _, requestedTrace := requested[fact.TraceID]; !requestedTrace || fact.SourceModule == "" {
+			continue
+		}
+		current, found := candidates[fact.TraceID]
+		if !found || operationCallFactPrecedes(fact, current.startedAt, current.operationID, current.attempt) {
+			candidates[fact.TraceID] = candidate{
+				startedAt: fact.StartedAt, operationID: fact.OperationID,
+				attempt: fact.Attempt, sourceModule: fact.SourceModule,
+			}
+		}
+	}
+	result := make(map[string]string, len(candidates))
+	for traceID, value := range candidates {
+		result[traceID] = value.sourceModule
+	}
+	return result
+}
+
+func operationCallFactPrecedes(fact sessionvo.OperationCallFact, startedAt time.Time, operationID string, attempt uint32) bool {
+	if fact.StartedAt.Equal(startedAt) {
+		if fact.OperationID == operationID {
+			return fact.Attempt < attempt
+		}
+		return fact.OperationID < operationID
+	}
+	return fact.StartedAt.Before(startedAt)
+}
+
 func sortOperationCallFacts(result []sessionvo.OperationCallFact) {
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].StartedAt.Equal(result[j].StartedAt) {

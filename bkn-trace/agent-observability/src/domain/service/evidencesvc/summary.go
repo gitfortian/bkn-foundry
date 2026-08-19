@@ -861,6 +861,19 @@ func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evid
 	}
 	return s.sessionStore.WithinTransaction(ctx, func(tx isessionstore.Transaction) error {
 		byConversation := map[string]sessionvo.Conversation{}
+		traceIDs := make([]string, 0, len(traces))
+		seenTraceIDs := map[string]struct{}{}
+		for _, trace := range traces {
+			if trace.TraceID == "" {
+				continue
+			}
+			if _, seen := seenTraceIDs[trace.TraceID]; seen {
+				continue
+			}
+			seenTraceIDs[trace.TraceID] = struct{}{}
+			traceIDs = append(traceIDs, trace.TraceID)
+		}
+		sourceModulesByTraceID := tx.ListFirstOperationSourceModulesByTraceIDs(traceIDs)
 		for index := range traces {
 			conversationID := traces[index].ConversationID
 			if conversationID != "" {
@@ -878,11 +891,8 @@ func (s *Service) applyCanonicalTraceIdentity(ctx context.Context, traces []evid
 					traces[index].EffectiveSubjectID = conversation.Owner.EffectiveSubjectID
 				}
 			}
-			for _, fact := range tx.ListOperationCallFactsByTraceID(traces[index].TraceID) {
-				if fact.SourceModule != "" {
-					traces[index].RootService = fact.SourceModule
-					break
-				}
+			if sourceModule := sourceModulesByTraceID[traces[index].TraceID]; sourceModule != "" {
+				traces[index].RootService = sourceModule
 			}
 		}
 		return nil
