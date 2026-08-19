@@ -188,9 +188,9 @@ async def _delete_sessions(http_client: httpx.AsyncClient, session_ids: Set[str]
 @pytest.fixture(scope="session")
 def event_loop_policy():
     """
-    为整个测试会话创建一个事件循环策略。
+    Create an event loop policy for the entire test session.
 
-    这有助于避免异步测试中的事件循环问题。
+    This helps avoid event loop issues in async tests.
     """
     import asyncio
     policy = asyncio.get_event_loop_policy()
@@ -200,16 +200,17 @@ def event_loop_policy():
 @pytest.fixture(scope="function", autouse=True)
 async def auto_cleanup_sessions(http_client: httpx.AsyncClient, request):
     """
-    每个测试函数完成后自动清理所有测试 session。
+    Automatically clean up test sessions after each test function.
 
-    autouse=True 确保此 fixture 在每个测试函数后自动运行。
+    autouse=True ensures this fixture runs automatically after each test function.
     """
-    # 记录测试开始前已存在的 sessions。清理时只删除本测试新增的
-    # sessions，避免误删运行环境中已有的手工 session。
+    # Record sessions that existed before the test starts. During cleanup, delete only
+    # sessions created by this test to avoid deleting manual sessions that already existed
+    # in the runtime environment.
     sessions_before_test = await _list_session_ids(http_client)
     tracked_before_test = set(_created_sessions)
 
-    yield  # 测试运行
+    yield  # Run the test.
 
     tracked_new_sessions = _created_sessions - tracked_before_test
 
@@ -275,7 +276,7 @@ async def test_template_id(http_client: httpx.AsyncClient) -> str:
 
     Returns the template ID for testing.
     """
-    # Try to get existing template
+    # Try to get existing template.
     response = await http_client.get(f"/templates/{TEST_TEMPLATE_ID}")
     if response.status_code == 200:
         return TEST_TEMPLATE_ID

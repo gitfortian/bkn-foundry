@@ -14,7 +14,7 @@ The system adopts a **Control Plane + Container Scheduler** separation architect
 
 ```mermaid
 flowchart TD
-    %% 定义全局样式
+    %% Define global styles
     classDef external fill:#f9f9f9,stroke:#666,stroke-width:2px,color:#333;
     classDef control fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#01579b;
     classDef scheduler fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#e65100;
@@ -22,38 +22,38 @@ flowchart TD
     classDef runtime fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px,color:#1b5e20;
     classDef database fill:#ede7f6,stroke:#311b92,stroke-width:2px,color:#311b92;
 
-    subgraph External ["🌐 外部系统 (External)"]
-        Client(["📱 客户端应用"])
-        Developer(["👨‍💻 开发者 SDK/API"])
+    subgraph External ["🌐 External systems (External)"]
+        Client(["📱 Client application"])
+        Developer(["👨‍💻 Developer SDK/API"])
     end
 
-    subgraph ControlPlane ["⚙️ 控制平面 (Control Plane)"]
+    subgraph ControlPlane ["⚙️ Control Plane (Control Plane)"]
         direction TB
         API[["🚀 API Gateway (FastAPI)"]]
-        Scheduler{{"📅 调度器 (Scheduler)"}}
-        SessionMgr["📂 会话管理器"]
-        TemplateMgr["📝 模板管理器"]
-        HealthProbe["🩺 健康检查"]
-        Cleanup["🧹 会话清理"]
-        StateSync["🔄 状态同步"]
+        Scheduler{{"📅 Scheduler (Scheduler)"}}
+        SessionMgr["📂 Session Manager"]
+        TemplateMgr["📝 Template Manager"]
+        HealthProbe["🩺 Health Check"]
+        Cleanup["🧹 Session Cleanup"]
+        StateSync["🔄 State Sync"]
     end
 
-    subgraph ContainerScheduler ["📦 容器编排 (Scheduler)"]
+    subgraph ContainerScheduler ["📦 Container Orchestration (Scheduler)"]
         DockerRuntime["Docker Runtime"]
         K8sRuntime["Kubernetes"]
     end
 
-    subgraph Storage ["💾 存储层 (Storage)"]
+    subgraph Storage ["💾 Storage Layer (Storage)"]
         MariaDB[("🗄️ MariaDB")]
         S3[("☁️ S3 Storage")]
     end
 
-    subgraph Runtime ["🛡️ 沙箱运行时 (Sandbox)"]
-        Executor["⚡ 执行器 (Executor)"]
-        Container["📦 容器实例"]
+    subgraph Runtime ["🛡️ Sandbox Runtime (Sandbox)"]
+        Executor["⚡ Executor (Executor)"]
+        Container["📦 Container Instance"]
     end
 
-    %% 这里的连接线逻辑
+    %% Connection line logic
     Client & Developer --> API
     API --> Scheduler
     Scheduler --> SessionMgr & ContainerScheduler
@@ -66,7 +66,7 @@ flowchart TD
     Cleanup --> SessionMgr
     API -.-> S3
 
-    %% 应用样式
+    %% Apply styles
     class Client,Developer external;
     class API,Scheduler,SessionMgr,TemplateMgr,HealthProbe,Cleanup,StateSync control;
     class DockerRuntime,K8sRuntime scheduler;

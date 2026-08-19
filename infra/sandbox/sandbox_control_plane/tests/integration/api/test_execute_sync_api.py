@@ -2,7 +2,8 @@
 Execute-Sync API Integration Tests
 
 Tests for synchronous code execution endpoint.
-覆盖正确传参、异常传参、代码正确执行、代码抛出异常、代码输出标准错误、代码正确返回结果、代码执行使用标准库、代码执行使用第三方库等情况。
+Covers valid parameters, invalid parameters, successful code execution, runtime exceptions,
+stderr output, return values, standard library usage, and third-party library usage.
 """
 import pytest
 import asyncio
@@ -13,7 +14,7 @@ from httpx import AsyncClient
 class TestExecuteSyncAPI:
     """Execute-Sync API integration tests."""
 
-    # ==================== 正确传参测试 ====================
+    # ==================== Valid parameter tests ====================
 
     async def test_execute_sync_valid_parameters(
         self,
@@ -57,7 +58,7 @@ def handler(event):
             "timeout": 10
         }
 
-        # 使用默认的 poll_interval 和 sync_timeout
+        # Use the default poll_interval and sync_timeout.
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data
@@ -269,7 +270,7 @@ def handler(event):
             "timeout": 10
         }
 
-        # 测试最小 poll_interval
+        # Test the minimum poll_interval.
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data,
@@ -277,7 +278,7 @@ def handler(event):
         )
         assert response.status_code == 200
 
-        # 测试最大 poll_interval
+        # Test the maximum poll_interval.
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data,
@@ -285,7 +286,7 @@ def handler(event):
         )
         assert response.status_code == 200
 
-    # ==================== 异常传参测试 ====================
+    # ==================== Invalid parameter tests ====================
 
     async def test_execute_sync_invalid_poll_interval_too_low(
         self,
@@ -302,7 +303,7 @@ def handler(event):
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data,
-            params={"poll_interval": 0.05}  # 低于最小值 0.1
+            params={"poll_interval": 0.05}  # Below the minimum value 0.1.
         )
 
         assert response.status_code == 422
@@ -322,7 +323,7 @@ def handler(event):
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data,
-            params={"poll_interval": 15.0}  # 高于最大值 10.0
+            params={"poll_interval": 15.0}  # Above the maximum value 10.0.
         )
 
         assert response.status_code == 422
@@ -342,7 +343,7 @@ def handler(event):
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data,
-            params={"sync_timeout": 5}  # 低于最小值 10
+            params={"sync_timeout": 5}  # Below the minimum value 10.
         )
 
         assert response.status_code == 422
@@ -362,7 +363,7 @@ def handler(event):
         response = await http_client.post(
             f"/executions/sessions/{test_session_id}/execute-sync",
             json=request_data,
-            params={"sync_timeout": 4000}  # 高于最大值 3600
+            params={"sync_timeout": 4000}  # Above the maximum value 3600.
         )
 
         assert response.status_code == 422
@@ -431,7 +432,7 @@ def handler(event):
         request_data = {
             "code": "print('test')",
             "language": "python",
-            "timeout": 0  # 低于最小值 1
+            "timeout": 0  # Below the minimum value 1.
         }
 
         response = await http_client.post(
@@ -450,7 +451,7 @@ def handler(event):
         request_data = {
             "code": "print('test')",
             "language": "python",
-            "timeout": 4000  # 高于最大值 3600
+            "timeout": 4000  # Above the maximum value 3600.
         }
 
         response = await http_client.post(
@@ -478,7 +479,7 @@ def handler(event):
 
         assert response.status_code in (400, 404)
 
-    # ==================== 代码正确执行测试 ====================
+    # ==================== Successful code execution tests ====================
 
     async def test_execute_sync_simple_execution(
         self,
@@ -536,7 +537,7 @@ def handler(event):
         assert data["status"] in ("success", "completed")
         assert data["exit_code"] == 0
 
-    # ==================== 代码抛出异常测试 ====================
+    # ==================== Runtime exception tests ====================
 
     async def test_execute_sync_runtime_exception(
         self,
@@ -650,7 +651,7 @@ def handler(event):
         assert "CustomError" in data["stderr"]
         assert "custom error" in data["stderr"].lower()
 
-    # ==================== 代码输出标准错误测试 ====================
+    # ==================== stderr output tests ====================
 
     async def test_execute_sync_stderr_output(
         self,
@@ -709,10 +710,10 @@ def handler(event):
         assert response.status_code == 200
         data = response.json()
         assert data["status"] in ("success", "completed")
-        # 警告信息通常输出到 stderr
+        # Warning messages are usually written to stderr.
         assert "stderr" in data
 
-    # ==================== 代码正确返回结果测试 ====================
+    # ==================== Return value tests ====================
 
     async def test_execute_sync_return_dict(
         self,
@@ -860,7 +861,7 @@ def handler(event):
         assert data["return_value"]["user"]["tags"] == ["admin", "tester"]
         assert data["return_value"]["items"][0]["value"] == "first"
 
-    # ==================== 代码执行使用标准库测试 ====================
+    # ==================== Standard library execution tests ====================
 
     async def test_execute_sync_use_json_stdlib(
         self,
@@ -1031,7 +1032,7 @@ def handler(event):
         assert 3.14 < data["return_value"]["pi"] < 3.15
         assert data["return_value"]["sqrt_2"] == 2 ** 0.5
 
-    # ==================== 代码执行使用第三方库测试 ====================
+    # ==================== Third-party dependency execution tests ====================
 
     async def test_execute_sync_use_requests_third_party(
         self,
@@ -1043,7 +1044,7 @@ def handler(event):
         This test creates a session with requests dependency pre-installed,
         then executes code that uses the requests library.
         """
-        # Step 1: 创建会话时传入 dependencies 参数安装 requests 库
+        # Step 1: create a session with the requests dependency.
         session_data = {
             "template_id": test_template_id,
             "timeout": 300,
@@ -1069,7 +1070,7 @@ def handler(event):
         track_session(session_id)
 
         try:
-            # Step 2: 等待会话就绪（包括依赖安装完成）
+            # Step 2: wait for the session to become ready, including dependency installation.
             max_wait = 120
             for i in range(max_wait):
                 response = await http_client.get(f"/sessions/{session_id}")
@@ -1085,13 +1086,13 @@ def handler(event):
             else:
                 pytest.fail(f"Session did not become ready with dependencies in {max_wait} seconds")
 
-            # Step 3: 使用已安装 requests 库的会话执行代码
+            # Step 3: execute code in the session with requests installed.
             request_data = {
                 "code": '''
 import requests
 
 def handler(event):
-    # 测试 requests 库可导入且核心对象可用，不依赖外网
+    # Verify that the requests library is importable and usable without external network access.
     request = requests.Request("GET", "https://example.com/api", params={"q": "sandbox"})
     prepared = request.prepare()
     return {
@@ -1132,7 +1133,7 @@ def handler(event):
         then executes code that uses the click library.
         Note: Using click instead of numpy as it's much lighter (<2MB vs >100MB).
         """
-        # Step 1: 创建会话时传入 dependencies 参数安装 click 库
+        # Step 1: create a session with the click dependency.
         session_data = {
             "template_id": test_template_id,
             "timeout": 300,
@@ -1143,7 +1144,7 @@ def handler(event):
             "dependencies": [
                 {"name": "click"}
             ],
-            "install_timeout": 60  # click 安装很快
+            "install_timeout": 60  # click installs quickly.
         }
 
         create_response = await http_client.post("/sessions", json=session_data)
@@ -1158,7 +1159,7 @@ def handler(event):
         track_session(session_id)
 
         try:
-            # Step 2: 等待会话就绪（包括依赖安装完成）
+            # Step 2: wait for the session to become ready, including dependency installation.
             max_wait = 60
             for i in range(max_wait):
                 response = await http_client.get(f"/sessions/{session_id}")
@@ -1174,7 +1175,7 @@ def handler(event):
             else:
                 pytest.fail(f"Session did not become ready with dependencies in {max_wait} seconds")
 
-            # Step 3: 使用已安装 click 库的会话执行代码
+            # Step 3: execute code in the session with click installed.
             request_data = {
                 "code": '''
 import click
@@ -1207,7 +1208,7 @@ def handler(event):
             from tests.integration.conftest import untrack_session
             untrack_session(session_id)
 
-    # ==================== 其他边界情况测试 ====================
+    # ==================== Additional edge-case tests ====================
 
     async def test_execute_sync_execution_timeout(
         self,
@@ -1220,11 +1221,11 @@ def handler(event):
 import time
 
 def handler(event):
-    time.sleep(15)  # 超过 timeout 设置
+    time.sleep(15)  # Exceed the timeout setting.
     return {"should_not_reach": "here"}
 ''',
             "language": "python",
-            "timeout": 5  # 5秒超时
+            "timeout": 5  # 5-second timeout.
         }
 
         response = await http_client.post(
@@ -1248,7 +1249,7 @@ def handler(event):
         request_data = {
             "code": '''
 def handler(event):
-    # 返回一个较大的数据结构（限制在TEXT列范围内）
+    # Return a large data structure within the TEXT column limit.
     return {
         "items": [{"id": i, "data": "x" * 100} for i in range(400)],
         "metadata": {
