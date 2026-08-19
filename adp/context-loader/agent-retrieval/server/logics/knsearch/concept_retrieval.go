@@ -39,6 +39,7 @@ func (s *localSearchImpl) conceptRetrieval(
 	config *interfaces.KnSearchConceptRetrievalConfig,
 ) (*interfaces.KnSearchConceptResult, error) {
 	var err error
+	var unmatchedObjectTypes []string
 	ctx, _ = oteltrace.StartInternalSpan(ctx)
 	defer oteltrace.EndSpan(ctx, err)
 
@@ -54,6 +55,15 @@ func (s *localSearchImpl) conceptRetrieval(
 
 	s.logger.WithContext(ctx).Debugf("[ConceptRetrieval] Network detail: object_types=%d, relation_types=%d, action_types=%d",
 		len(networkDetail.ObjectTypes), len(networkDetail.RelationTypes), len(networkDetail.ActionTypes))
+
+	// Apply the caller's object type scope here, on the raw candidate pool: everything below
+	// (scoring, relation ranking, the TopK cut) must only ever see object types that are in
+	// scope, or a pinned object type ranking below TopK would be cut before the filter runs.
+	scope := newObjectTypeScope(config.ObjectTypes, config.ExcludeObjectTypes)
+	networkDetail.ObjectTypes, unmatchedObjectTypes = scope.apply(networkDetail.ObjectTypes)
+	networkDetail.RelationTypes, networkDetail.ActionTypes = scope.applyToConcepts(
+		networkDetail.ObjectTypes, networkDetail.RelationTypes, networkDetail.ActionTypes)
+	s.logScopeOutcome(ctx, "", scope, networkDetail.ObjectTypes, unmatchedObjectTypes)
 
 	// 2. Rough recall (optional, for large-scale knowledge networks)
 	coarseScored := false
@@ -96,9 +106,10 @@ func (s *localSearchImpl) conceptRetrieval(
 	}
 
 	return &interfaces.KnSearchConceptResult{
-		ObjectTypes:   objectTypesLocal,
-		RelationTypes: relationTypesLocal,
-		ActionTypes:   actionTypesLocal,
+		ObjectTypes:          objectTypesLocal,
+		RelationTypes:        relationTypesLocal,
+		ActionTypes:          actionTypesLocal,
+		UnmatchedObjectTypes: unmatchedObjectTypes,
 	}, nil
 }
 
@@ -177,6 +188,17 @@ func (s *localSearchImpl) conceptRetrievalByGroups(
 		return nil, err
 	}
 
+	// Scope after endpoint completion, not before. Two reasons pull the same way:
+	//   - completion appends every object type a relation or action points at and is not already
+	//     in the pool, so filtering first would let it fetch the excluded ones straight back in;
+	//   - an object type the caller pinned may sit outside the concept groups and reach the pool
+	//     only through completion, so filtering first would report it as non-existent.
+	// It still runs before ranking and the TopK cut, which is the ordering the scope requires.
+	scope := newObjectTypeScope(config.ObjectTypes, config.ExcludeObjectTypes)
+	objects, unmatchedObjectTypes := scope.apply(objects)
+	relations, actions = scope.applyToConcepts(objects, relations, actions)
+	s.logScopeOutcome(ctx, "[Groups]", scope, objects, unmatchedObjectTypes)
+
 	rankedRelations := s.rankRelationTypes(ctx, req.Query, objects, relations, config.TopK, req.EnableRerank, req.RerankModel)
 	selectedObjects := s.selectObjectTypesForConceptRetrieval(objects, rankedRelations, config.TopK)
 
@@ -190,9 +212,10 @@ func (s *localSearchImpl) conceptRetrievalByGroups(
 	}
 
 	return &interfaces.KnSearchConceptResult{
-		ObjectTypes:   objectTypesLocal,
-		RelationTypes: relationTypesLocal,
-		ActionTypes:   actionTypesLocal,
+		ObjectTypes:          objectTypesLocal,
+		RelationTypes:        relationTypesLocal,
+		ActionTypes:          actionTypesLocal,
+		UnmatchedObjectTypes: unmatchedObjectTypes,
 	}, nil
 }
 
