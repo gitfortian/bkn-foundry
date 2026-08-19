@@ -37,6 +37,8 @@ type MCPInfo struct {
 	Protocol            string          `json:"protocol"`
 	Transport           string          `json:"transport"`
 	Auth                string          `json:"auth"`
+	Language            string          `json:"language"`
+	SupportedLanguages  []string        `json:"supported_languages"`
 	ToolCount           int             `json:"tool_count"`
 	Tools               []MCPToolInfo   `json:"tools"`
 	ClientConfigExample json.RawMessage `json:"client_config_example"`
@@ -65,10 +67,10 @@ func tryLoadToolSchemas(locale *mcpLocaleBundle, toolKey string) (input, output 
 	return locale.OverlaySchemas(toolKey, wrapper.InputSchema, wrapper.OutputSchema)
 }
 
-// BuildMCPInfo builds the MCP self-description with the process default locale.
-// New request-facing callers should use BuildMCPInfoForLocale.
+// BuildMCPInfo builds the MCP self-description in the baseline locale.
+// Request-facing callers use BuildMCPInfoForLocale.
 func BuildMCPInfo(endpoint string) (*MCPInfo, error) {
-	return BuildMCPInfoForLocale(endpoint, mcpLocaleFromEnv())
+	return BuildMCPInfoForLocale(endpoint, defaultMCPLocale)
 }
 
 // BuildMCPInfoForLocale builds the MCP self-description using the requested
@@ -164,12 +166,16 @@ func BuildMCPInfoForLocale(endpoint, localeName string) (*MCPInfo, error) {
 		tools = append(tools, e.info)
 	}
 
+	// Accept-Language belongs in the example because this block is what an
+	// integrator copies. MCP defines no locale field, so the transport header is
+	// the only channel; omitting it falls back to the service default language.
 	cfg, _ := json.Marshal(map[string]any{
 		"mcpServers": map[string]any{
 			serverName: map[string]any{
 				"url": endpoint,
 				"headers": map[string]string{
-					"Authorization": "Bearer <access-token>",
+					"Authorization":   "Bearer <access-token>",
+					"Accept-Language": locale.locale,
 				},
 			},
 		},
@@ -181,6 +187,8 @@ func BuildMCPInfoForLocale(endpoint, localeName string) (*MCPInfo, error) {
 		Protocol:            "MCP / JSON-RPC 2.0 (initialize → tools/list → tools/call)",
 		Transport:           "Streamable HTTP",
 		Auth:                "Bearer credential via Authorization header — an OAuth access token, or a long-lived user-issued AppKey (prefix bak_). No other headers required.",
+		Language:            locale.locale,
+		SupportedLanguages:  []string{defaultMCPLocale, "en-US"},
 		ToolCount:           len(tools),
 		Tools:               tools,
 		ClientConfigExample: cfg,
