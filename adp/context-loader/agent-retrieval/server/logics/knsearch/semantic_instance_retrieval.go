@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -66,24 +67,93 @@ func (s *localSearchImpl) semanticInstanceRetrieval(
 	instanceConfig := config.SemanticInstanceRetrieval
 	propertyConfig := config.PropertyFilter
 
-	var allNodes []*interfaces.KnSearchNode
-	var maxScore float64
+	// Hold instance recall to the number of object types the caller asked for.
+	//
+	// Concept recall deliberately returns more than top_k: it pulls in the endpoints of the relations
+	// it selected so the schema it hands back has no dangling references, which can double the list.
+	// That is right for the schema half of the answer and wrong for this half — every extra object
+	// type here is at least one more downstream query, and with a vector channel one more embedding
+	// call. Left uncapped, max_object_types=10 issued queries against 20 object types, so the knob
+	// that is supposed to bound the cost understated it by half.
+	if limit := conceptTopK(config); limit > 0 && len(objectTypes) > limit {
+		s.logger.WithContext(ctx).Debugf(
+			"[SemanticInstanceRetrieval] Capping instance recall at max_object_types=%d (concept recall selected %d)",
+			limit, len(objectTypes))
+		objectTypes = objectTypes[:limit]
+	}
 
+	// The relevance gate: a request may override the deployment's calibrated threshold.
+	minRerankerScore := instanceConfig.MinRerankerScore
+	if minRerankerScore <= 0 && s.config != nil {
+		minRerankerScore = s.config.InstanceSearchConfig.MinRerankerScore
+	}
+	if minRerankerScore > 0 && normalizeRerankMode(instanceConfig.InstanceRerankMode) == InstanceRerankModeOff {
+		// Turning the gate on implies paying for the model: it is the only score in this pipeline that
+		// judges relevance in absolute terms. The fusion score cannot serve — a channel's top row
+		// scores 1.0 whether or not anything in the object type has to do with the query.
+		gated := *instanceConfig
+		gated.InstanceRerankMode = InstanceRerankModeOn
+		instanceConfig = &gated
+		s.logger.WithContext(ctx).Infof(
+			"[SemanticInstanceRetrieval] min_reranker_score=%.4f is set, enabling rerank for this query",
+			minRerankerScore)
+	}
+
+	// One lookup of what each object type indexed for semantic recall, reused by reranking so the
+	// document it sends the model leads with those fields.
+	searchableByType := make(map[string][]searchableField, len(objectTypes))
 	for _, objType := range objectTypes {
-		nodes, err := s.retrieveInstancesForObjectType(ctx, req, objType, instanceConfig, knnAllowedFor(objType, instanceConfig))
-		if err != nil {
-			s.logger.WithContext(ctx).Warnf("[SemanticInstanceRetrieval] Failed to retrieve instances for %s: %v",
-				objType.ConceptID, err)
+		if objType == nil {
 			continue
 		}
+		searchableByType[objType.ConceptID] = findSemanticSearchableFields(objType)
+	}
 
-		// Update high score.
+	// Query the object types concurrently, bounded. Serially, latency was the sum of every object
+	// type's round trip: each one issues its channel queries and, where a vector channel applies,
+	// waits on its own embedding call for the same query string.
+	//
+	// Results are collected per position, not appended as they arrive, so the response does not depend
+	// on which object type happened to answer first.
+	perType := make([][]*interfaces.KnSearchNode, len(objectTypes))
+	concurrency := instanceConfig.ObjectTypeConcurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	if concurrency > len(objectTypes) {
+		concurrency = len(objectTypes)
+	}
+
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, concurrency)
+	for i, objType := range objectTypes {
+		wg.Add(1)
+		go func(idx int, objType *interfaces.KnSearchObjectType) {
+			defer wg.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+
+			nodes, err := s.retrieveInstancesForObjectType(ctx, req, objType, instanceConfig, knnAllowedFor(objType, instanceConfig))
+			if err != nil {
+				// One object type failing keeps the others: a single bad index or a knn 400 on a field
+				// whose declared operators lie must not empty the whole result.
+				s.logger.WithContext(ctx).Warnf("[SemanticInstanceRetrieval] Failed to retrieve instances for %s: %v",
+					objType.ConceptID, err)
+				return
+			}
+			perType[idx] = nodes
+		}(i, objType)
+	}
+	wg.Wait()
+
+	var allNodes []*interfaces.KnSearchNode
+	var maxScore float64
+	for _, nodes := range perType {
 		for _, node := range nodes {
 			if node.Score > maxScore {
 				maxScore = node.Score
 			}
 		}
-
 		allNodes = append(allNodes, nodes...)
 	}
 
@@ -117,7 +187,12 @@ func (s *localSearchImpl) semanticInstanceRetrieval(
 
 	// Fine ranking (default off). Placed before attribute filtering: filterNodeProperties will reduce the number of attributes and truncate the value.
 	// Sending truncated text to the model would judge relevance from incomplete text.
-	allNodes = s.rerankInstances(ctx, req.Query, allNodes, instanceConfig)
+	allNodes, rerank := s.rerankInstances(ctx, req.Query, allNodes, instanceConfig, searchableByType)
+
+	var gateMessage string
+	if minRerankerScore > 0 {
+		allNodes, gateMessage = s.applyRelevanceGate(ctx, allNodes, minRerankerScore, rerank)
+	}
 
 	// Property filtering.
 	if boolValue(propertyConfig.EnablePropertyFilter) {
@@ -134,11 +209,76 @@ func (s *localSearchImpl) semanticInstanceRetrieval(
 		Nodes: allNodes,
 	}
 
-	if len(allNodes) == 0 {
+	switch {
+	case gateMessage != "":
+		// The gate has more to say than "nothing matched": it either rejected a batch it did judge, or
+		// could not judge at all. Both readings change what the caller should do next.
+		result.Message = gateMessage
+	case len(allNodes) == 0:
 		result.Message = infraErr.LocalizedDetail(ctx, "NoMatchingInstances")
 	}
 
 	return result, nil
+}
+
+// conceptTopK reports how many object types the caller allowed into instance recall, or 0 when the
+// request carries no concept retrieval config to read it from.
+func conceptTopK(config *interfaces.KnSearchRetrievalConfig) int {
+	if config == nil || config.ConceptRetrieval == nil {
+		return 0
+	}
+	return config.ConceptRetrieval.TopK
+}
+
+// applyRelevanceGate drops the instances the reranker scored below the threshold, and returns the
+// message the caller has to be told when the outcome is not a plain list of results.
+//
+// Three outcomes, and they must stay distinguishable:
+//   - the model judged and nothing cleared the bar: return empty, and say the batch was rejected;
+//   - the model never ran, or scored every candidate identically: do not filter, and say the gate did
+//     not run. Filtering on a judgement we do not have would be inventing one;
+//   - rows the model never saw (past the rerank window) are dropped when the gate is on: the gate
+//     means "only what the model vouched for", and an unjudged row is not that.
+func (s *localSearchImpl) applyRelevanceGate(
+	ctx context.Context,
+	nodes []*interfaces.KnSearchNode,
+	threshold float64,
+	rerank rerankOutcome,
+) ([]*interfaces.KnSearchNode, string) {
+	if len(nodes) == 0 {
+		return nodes, ""
+	}
+	if !rerank.scored || rerank.unavailable || rerank.degenerate {
+		reason := "unavailable"
+		if rerank.degenerate {
+			reason = "degenerate score distribution"
+		}
+		s.logger.WithContext(ctx).Warnf(
+			"[RelevanceGate] Skipped (%s): returning %d unfiltered instances", reason, len(nodes))
+		return nodes, infraErr.LocalizedDetail(ctx, "InstanceRelevanceGateSkipped",
+			formatScore(threshold))
+	}
+
+	kept := make([]*interfaces.KnSearchNode, 0, len(nodes))
+	for _, node := range nodes {
+		if node.RerankerScore >= threshold {
+			kept = append(kept, node)
+		}
+	}
+	s.logger.WithContext(ctx).Infof(
+		"[RelevanceGate] threshold=%.4f top=%.4f kept=%d/%d", threshold, rerank.top, len(kept), len(nodes))
+
+	if len(kept) == 0 {
+		return nil, infraErr.LocalizedDetail(ctx, "InstanceRelevanceGateRejected",
+			formatScore(threshold), formatScore(rerank.top))
+	}
+	return kept, ""
+}
+
+// formatScore renders a score for a message: short enough to read, precise enough to compare with
+// the reranker_score values in the same response.
+func formatScore(v float64) string {
+	return strconv.FormatFloat(v, 'f', 4, 64)
 }
 
 // retrieveInstancesForObjectType performs semantic retrieval of individual object types.
