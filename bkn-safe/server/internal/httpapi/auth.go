@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	hydra "github.com/ory/hydra-client-go/v2"
 
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/accesslog"
 	"github.com/openbkn-ai/bkn-foundry/bkn-safe/server/internal/auth"
@@ -147,6 +148,8 @@ type authPageText struct {
 	PasswordPlaceholder        string
 	LoginButton                string
 	ChangePasswordTitle        string
+	PasswordUpdatedTitle       string
+	PasswordUpdatedExpiredNote string
 	FirstLoginPrompt           string
 	CurrentPasswordPlaceholder string
 	NewPasswordPlaceholder     string
@@ -194,6 +197,8 @@ func localizedAuthPageData(c *gin.Context) authPageData {
 		PasswordPlaceholder:        message("PasswordPlaceholder"),
 		LoginButton:                message("LoginButton"),
 		ChangePasswordTitle:        message("ChangePasswordTitle"),
+		PasswordUpdatedTitle:       message("PasswordUpdatedTitle"),
+		PasswordUpdatedExpiredNote: message("PasswordUpdatedExpiredNote"),
 		FirstLoginPrompt:           message("FirstLoginPrompt"),
 		CurrentPasswordPlaceholder: message("CurrentPasswordPlaceholder"),
 		NewPasswordPlaceholder:     message("NewPasswordPlaceholder"),
@@ -247,6 +252,11 @@ var changePasswordPage = template.Must(template.New("changepw").Parse(`<!doctype
   <input name="confirm_password" type="password" placeholder="{{.Text.ConfirmPasswordPlaceholder}}" autocomplete="new-password">
   <button class="primary" type="submit">{{.Text.ChangeAndLoginButton}}</button>
 </form></div></body></html>`))
+
+var changePasswordExpiredPage = template.Must(template.New("changepwexpired").Parse(`<!doctype html><html lang="{{.Language}}"><head><meta charset="utf-8">` + pageCSS + `</head><body>
+<div class="card">` + localeSwitcher + brand("BKN Studio") + `<h3>{{.Text.PasswordUpdatedTitle}}</h3>
+<div class="note">{{.Text.PasswordUpdatedExpiredNote}}</div>
+</div></body></html>`))
 
 var consentPage = template.Must(template.New("consent").Parse(`<!doctype html><html lang="{{.Language}}"><head><meta charset="utf-8">` + pageCSS + `</head><body>
 <div class="card">` + localeSwitcher + brand("BKN Studio") + `<h3>{{.Text.AuthorizeClient}} {{.ClientName}}</h3>
@@ -307,8 +317,17 @@ func isExpiredLoginRequest(err error) bool {
 	if err == nil {
 		return false
 	}
+	var hydraErr *hydra.GenericOpenAPIError
+	if errors.As(err, &hydraErr) {
+		oauthErr, ok := hydraErr.Model().(hydra.ErrorOAuth2)
+		if !ok || oauthErr.GetError() != "request_unauthorized" {
+			return false
+		}
+		reason, _ := oauthErr.AdditionalProperties["reason"].(string)
+		return strings.Contains(strings.ToLower(reason), "login request has expired")
+	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "request_unauthorized") ||
+	return strings.Contains(msg, "request_unauthorized") &&
 		strings.Contains(msg, "login request has expired")
 }
 
@@ -428,7 +447,8 @@ func doChangePassword(c *gin.Context, p *auth.Provider, accessStore *accesslog.S
 		}
 		slog.Error("change-password: failed", "err", err)
 		if isExpiredLoginRequest(err) {
-			reRender("LoginRequestExpired")
+			clearChangePasswordAccount(c)
+			renderHTML(c, changePasswordExpiredPage, localizedAuthPageDataFor(c, "/change-password", nil))
 			return
 		}
 		replyLocalizedAuthText(c, http.StatusInternalServerError, "BknSafe.InternalError.Description")
