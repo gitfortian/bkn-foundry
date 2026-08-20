@@ -104,6 +104,14 @@ func TestPrepareVersionDefinesMappingsRequiredByEmptyReceiptQuery(t *testing.T) 
 	if !ok || requestID["fields"].(map[string]any)["keyword"].(map[string]any)["type"] != "keyword" {
 		t.Fatalf("request_id must retain the exact keyword subfield used by summary queries: %#v", requestID)
 	}
+	receiptStatus, ok := properties["receipt_status"].(map[string]any)
+	if !ok || receiptStatus["fields"].(map[string]any)["keyword"].(map[string]any)["type"] != "keyword" {
+		t.Fatalf("receipt_status must retain the exact keyword subfield used by runtime logs: %#v", receiptStatus)
+	}
+	terminalAt, ok := properties["terminal_at"].(map[string]any)
+	if !ok || terminalAt["type"] != "date" {
+		t.Fatalf("terminal_at must be mapped as date for runtime-log sorting: %#v", terminalAt)
+	}
 }
 
 func TestEnsureBootstrapCreatesVersionedIndexAndAliasWhenNeitherExists(t *testing.T) {

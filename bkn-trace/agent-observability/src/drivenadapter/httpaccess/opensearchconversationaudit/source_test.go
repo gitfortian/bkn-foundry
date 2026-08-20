@@ -13,9 +13,11 @@ type fakeSearchClient struct {
 	index  string
 	body   []byte
 	result []byte
+	calls  int
 }
 
 func (client *fakeSearchClient) Search(_ context.Context, index string, body []byte) ([]byte, error) {
+	client.calls++
 	client.index, client.body = index, append([]byte(nil), body...)
 	return client.result, nil
 }
@@ -71,6 +73,16 @@ func TestSearchProjectsConversationCreatedFromAuthoritativeProjection(t *testing
 		if !containsString(string(encoded), expected) {
 			t.Fatalf("trusted projection filter %q missing from %s", expected, encoded)
 		}
+	}
+}
+
+func TestSearchReturnsExactEmptyForRequestRuntimeCorrelation(t *testing.T) {
+	backend := &fakeSearchClient{}
+	page, err := New(backend, "openbkn-core-projection").Search(context.Background(), observabilityvo.LogQuery{
+		AuthorizedTenantID: "tenant-a", AuthorizedBusinessDomain: "domain-a", RequestID: "req-a",
+	})
+	if err != nil || backend.calls != 0 || len(page.Records) != 0 || page.Count != 0 || page.CountAccuracy != "exact" {
+		t.Fatalf("page=%+v calls=%d err=%v", page, backend.calls, err)
 	}
 }
 
