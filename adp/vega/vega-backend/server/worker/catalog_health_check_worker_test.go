@@ -13,7 +13,6 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 
 	"vega-backend/common"
@@ -36,6 +35,7 @@ func newCatalogHealthCheckWorker(appSetting *common.AppSetting, cs interfaces.Ca
 		defaultCronSchedule: defaultCronSchedule,
 		cs:                  cs,
 		chcsa:               chcsa,
+		stopCh:              make(chan struct{}),
 	}
 }
 
@@ -49,7 +49,7 @@ func TestCatalogHealthCheckWorkerRunDue(t *testing.T) {
 		{CatalogID: "catalog-1", Mode: interfaces.CatalogHealthCheckScheduleModeDisabled},
 	}, nil)
 
-	w.runDue()
+	w.runDue(context.Background())
 }
 
 func TestCatalogHealthCheckWorkerRunDueRecoversAccessPanic(t *testing.T) {
@@ -61,7 +61,7 @@ func TestCatalogHealthCheckWorkerRunDueRecoversAccessPanic(t *testing.T) {
 		func(context.Context, int64) { panic("access panic") },
 	)
 
-	assert.NotPanics(t, w.runDue)
+	assert.NotPanics(t, func() { w.runDue(context.Background()) })
 }
 
 func TestCatalogHealthCheckWorkerRunDueContinuesAfterSchedulePanic(t *testing.T) {
@@ -83,7 +83,7 @@ func TestCatalogHealthCheckWorkerRunDueContinuesAfterSchedulePanic(t *testing.T)
 		cs.EXPECT().InternalTestConnection(gomock.Any(), "catalog-2").Return(&interfaces.CatalogHealthCheckStatus{}, nil),
 	)
 
-	assert.NotPanics(t, w.runDue)
+	assert.NotPanics(t, func() { w.runDue(context.Background()) })
 }
 
 func TestCatalogHealthCheckWorkerRunSchedule(t *testing.T) {
@@ -183,7 +183,7 @@ func TestCatalogHealthCheckWorkerStart(t *testing.T) {
 		t.Cleanup(ctrl.Finish)
 		w := newCatalogHealthCheckWorker(&common.AppSetting{}, vmock.NewMockCatalogService(ctrl), vmock.NewMockCatalogHealthCheckScheduleAccess(ctrl))
 
-		require.NoError(t, w.Start())
+		w.Start()
 	})
 
 	t.Run("reschedules future inherit checks before running", func(t *testing.T) {
@@ -214,15 +214,16 @@ func TestCatalogHealthCheckWorkerStart(t *testing.T) {
 				}),
 		)
 
-		require.NoError(t, w.Start())
+		w.Start()
 		select {
 		case <-runStarted:
 		case <-time.After(time.Second):
 			t.Fatal("worker did not start")
 		}
+		w.Stop()
 	})
 
-	t.Run("does not start when rescheduling fails", func(t *testing.T) {
+	t.Run("starts when rescheduling fails", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		t.Cleanup(ctrl.Finish)
 		sa := vmock.NewMockCatalogHealthCheckScheduleAccess(ctrl)
@@ -233,9 +234,19 @@ func TestCatalogHealthCheckWorkerStart(t *testing.T) {
 		)
 		updateErr := errors.New("database unavailable")
 		sa.EXPECT().UpdateInheritedNextRun(gomock.Any(), gomock.Any(), gomock.Any()).Return(updateErr)
+		runStarted := make(chan struct{})
+		sa.EXPECT().ListDue(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(context.Context, int64) ([]*interfaces.CatalogHealthCheckSchedule, error) {
+				close(runStarted)
+				return nil, errors.New("stop test run")
+			})
 
-		err := w.Start()
-
-		require.ErrorIs(t, err, updateErr)
+		w.Start()
+		select {
+		case <-runStarted:
+		case <-time.After(time.Second):
+			t.Fatal("worker did not start after rescheduling failed")
+		}
+		w.Stop()
 	})
 }
