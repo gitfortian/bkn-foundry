@@ -93,6 +93,13 @@ func (dts *discoverTaskService) Create(ctx context.Context, req *interfaces.Crea
 		accountInfo = ai
 	}
 
+	// 探查任务是对目录的写操作（#269）。
+	if err := dts.cs.CheckTaskPermission(ctx, req.CatalogID,
+		interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return "", err
+	}
+
 	now := time.Now().UnixMilli()
 	task := &interfaces.DiscoverTask{
 		ID:          xid.New().String(),
@@ -135,6 +142,12 @@ func (dts *discoverTaskService) GetByID(ctx context.Context, id string) (*interf
 		span.SetStatus(codes.Error, "Discover task not found")
 		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_DiscoverTask_NotFound)
 	}
+	// 一个探查任务是通过它所属的目录被看见的（#269）。
+	if err := dts.cs.CheckTaskPermission(ctx, task.CatalogID,
+		interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return nil, err
+	}
 	if err := dts.populateDiscoverTaskReferences(ctx, []*interfaces.DiscoverTask{task}); err != nil {
 		span.RecordError(err)
 		logger.Warnf("Failed to populate discover task references: %v", err)
@@ -162,12 +175,41 @@ func (dts *discoverTaskService) List(ctx context.Context, params interfaces.Disc
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "DiscoverTaskService.List")
 	defer span.End()
 
+	// 与构建任务列表同一口径:可见集下推进查询,而不是对取回的页过滤。页内过滤会
+	// 让 total 计入看不到的行,还会出现中间空页而后面仍有可见行——按空页停会漏
+	// 数据,按 total 翻又会请求大量全被滤掉的页(#269 / #472)。
+	if params.CatalogID != "" {
+		if err := dts.cs.CheckTaskPermission(ctx, params.CatalogID,
+			interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+			if !interfaces.IsPermissionRefusal(err) {
+				span.SetStatus(codes.Error, "Check catalog permission failed")
+				return nil, 0, err
+			}
+			span.SetStatus(codes.Ok, "")
+			return []*interfaces.DiscoverTaskSummary{}, 0, nil
+		}
+	} else {
+		visible, unrestricted, excluded, err := dts.cs.AuthorizedCatalogsForTasks(ctx,
+			interfaces.OPERATION_TYPE_TASK_MANAGE)
+		if err != nil {
+			span.SetStatus(codes.Error, "Resolve authorized catalogs failed")
+			return nil, 0, err
+		}
+		if !unrestricted && len(visible) == 0 {
+			span.SetStatus(codes.Ok, "")
+			return []*interfaces.DiscoverTaskSummary{}, 0, nil
+		}
+		params.CatalogIDs = visible
+		params.ExcludeCatalogIDs = excluded
+	}
+
 	tasks, total, err := dts.dta.List(ctx, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List discover tasks failed")
 		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_DiscoverTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
+
 	if err := dts.populateDiscoverTaskSummaryReferences(ctx, tasks); err != nil {
 		span.RecordError(err)
 		logger.Warnf("Failed to populate discover task references: %v", err)
@@ -336,6 +378,14 @@ func (dts *discoverTaskService) DeleteByIDs(ctx context.Context, ids []string, i
 		if task == nil {
 			missingIDs = append(missingIDs, id)
 			continue
+		}
+		// Checked before anything is deleted, and before the status verdicts are
+		// reported: a batch is one transaction, and telling an unauthorized caller
+		// which ids are running is already a disclosure (#269).
+		if err := dts.cs.CheckTaskPermission(ctx, task.CatalogID,
+			interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+			span.SetStatus(codes.Error, "Permission denied")
+			return err
 		}
 		if task.Status == interfaces.DiscoverTaskStatusPending || task.Status == interfaces.DiscoverTaskStatusRunning {
 			runningIDs = append(runningIDs, id)

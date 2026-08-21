@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -315,7 +316,13 @@ func (cs *catalogService) Create(ctx context.Context, req *interfaces.CatalogReq
 			WithErrorDetails("failed to create catalog")
 	}
 
-	// Register resources
+	// Register resources.
+	//
+	// The creator also gets resource_manage and query_data (#801): both are now
+	// judged on the catalog, so without them they could not add a table to the
+	// catalog they just created — and the connection config and credentials are
+	// theirs to begin with. Both are in COMMON_OPERATIONS, so the whole set is
+	// what the creator receives.
 	err = cs.ps.CreateResources(ctx, []interfaces.PermissionResource{{
 		ID:   catalog.ID,
 		Type: authType,
@@ -342,7 +349,231 @@ func (cs *catalogService) createHealthCheckSchedule(ctx context.Context, tx *sql
 	return err
 }
 
-// Get retrieves a Catalog by ID.
+// filterAuthorizedCatalogs keeps the ids the caller may perform op on. The ids
+// come from a page the caller already fetched, so the question stays bounded by
+// the page rather than by the size of the grant.
+func (cs *catalogService) filterAuthorizedCatalogs(ctx context.Context, ids []string,
+	op string) (map[string]bool, error) {
+
+	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "CatalogService.filterAuthorizedCatalogs")
+	defer span.End()
+
+	unique := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return map[string]bool{}, nil
+	}
+
+	internalSet, err := cs.internalCatalogIDSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	allowed, err := cs.filterCatalogResources(ctx, unique, internalSet, []string{op}, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(allowed))
+	for id := range allowed {
+		out[id] = true
+	}
+	return out, nil
+}
+
+// AuthorizedCatalogsForTasks resolves the catalogs a listing may show.
+//
+// The set goes into the query rather than over the fetched page, because the
+// alternative gets pagination wrong in a way callers cannot work around: total
+// would count rows the caller may not see, and a page could come back empty
+// while later pages still hold visible ones. Stopping on an empty page then
+// loses data, and paging to total requests pages that are entirely filtered.
+//
+// It is affordable here precisely because the task surface judges catalogs. A
+// deployment has tens of catalogs, not thousands of tables — the largest set
+// observed on a live cluster is 12, against 731 for per-table grants.
+func (cs *catalogService) AuthorizedCatalogsForTasks(ctx context.Context,
+	op string) (ids []string, unrestricted bool, excluded []string, err error) {
+
+	typeWide, err := cs.hasTypeWideGrant(ctx, op)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	if typeWide {
+		// catalog:* is a grant on the business type; the platform's own
+		// directories are a separate type, so they are excluded unless granted
+		// there too. Bounded by the number of internal catalogs, which is a
+		// handful.
+		excluded, err = cs.unreachableInternalCatalogs(ctx, op)
+		if err != nil {
+			return nil, false, nil, err
+		}
+		return nil, true, excluded, nil
+	}
+
+	all, err := cs.ca.ListIDs(ctx, interfaces.CatalogsQueryParams{})
+	if err != nil {
+		return nil, false, nil, rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			verrors.VegaBackend_Catalog_InternalError_GetFailed).WithErrorDetails(err.Error())
+	}
+	if len(all) == 0 {
+		return nil, false, nil, nil
+	}
+	allowed, err := cs.filterAuthorizedCatalogs(ctx, all, op)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	out := make([]string, 0, len(allowed))
+	for _, id := range all {
+		if allowed[id] {
+			out = append(out, id)
+		}
+	}
+	return out, false, nil, nil
+}
+
+// unreachableInternalCatalogs lists the internal directories a holder of
+// catalog:* may not act on.
+func (cs *catalogService) unreachableInternalCatalogs(ctx context.Context, op string) ([]string, error) {
+	if err := cs.ps.CheckPermission(ctx, interfaces.PermissionResource{
+		Type: interfaces.AUTH_RESOURCE_TYPE_INTERNAL_CATALOG,
+		ID:   interfaces.RESOURCE_ID_ALL,
+	}, []string{op}); err == nil {
+		return nil, nil
+	}
+	internalSet, err := cs.internalCatalogIDSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(internalSet) == 0 {
+		return nil, nil
+	}
+	internalIDs := make([]string, 0, len(internalSet))
+	for id := range internalSet {
+		internalIDs = append(internalIDs, id)
+	}
+	sort.Strings(internalIDs) // 集合无序,排一下让 SQL 与用例可比对
+	granted, err := cs.filterAuthorizedCatalogs(ctx, internalIDs, op)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(internalIDs))
+	for _, id := range internalIDs {
+		if !granted[id] {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+// CheckTaskPermission authorizes an operation on something that hangs off a
+// catalog — a build, discover or semantic task — and is the only check those
+// three should use.
+//
+// Deleting a catalog does not delete its tasks; they are marked cancelled and
+// the rows stay. Judging those on a catalog that is no longer there answers 403
+// forever, including for a super administrator, because the lookup fails before
+// casbin is ever consulted. The tasks would then be invisible to every listing
+// and deletable by nobody — dead rows that still count towards total.
+//
+// So a missing catalog steps up to the type-wide grant instead. Holding
+// catalog:* already means seeing every catalog, and a task whose parent is gone
+// discloses nothing further; without this it is simply stranded.
+func (cs *catalogService) CheckTaskPermission(ctx context.Context, catalogID string, op string) error {
+	if catalogID != "" {
+		catalog, err := cs.InternalGetByID(ctx, catalogID, false)
+		switch {
+		case err == nil && catalog != nil:
+			return cs.checkCatalogPermission(ctx, catalogID, op)
+		case err != nil && !isCatalogNotFound(err):
+			// Only "the catalog is gone" opens the fallback below. A database or
+			// service failure must travel up instead: stepping up to the type-wide
+			// grant there would hide the fault behind a permission decision, and
+			// hand a catalog:* holder an answer the real state might contradict.
+			return err
+		}
+	}
+	typeWide, err := cs.hasTypeWideGrant(ctx, op)
+	if err != nil {
+		return err
+	}
+	if typeWide {
+		return nil
+	}
+	return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
+		WithErrorDetails(fmt.Sprintf("Access denied: insufficient permissions for[%v]", op))
+}
+
+// hasTypeWideGrant reports a grant written against the catalog type itself.
+// Only one caller needs it: a task whose parent catalog has been deleted has no
+// object left to judge, and leaving those unreachable would strand them forever.
+func (cs *catalogService) hasTypeWideGrant(ctx context.Context, op string) (bool, error) {
+	err := cs.ps.CheckPermission(ctx, interfaces.PermissionResource{
+		Type: interfaces.AUTH_RESOURCE_TYPE_CATALOG,
+		ID:   interfaces.RESOURCE_ID_ALL,
+	}, []string{op})
+	if err == nil {
+		return true, nil
+	}
+	// A refusal answers "no", but anything else is the authorization service
+	// failing to answer at all. Reading that as "no" would turn an outage into a
+	// silent permission decision, so it goes back up.
+	if interfaces.IsPermissionRefusal(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// isCatalogNotFound reports the one error that means the catalog is gone, as
+// opposed to the read having failed. InternalGetByID answers a 404 HTTPError
+// rather than (nil, nil) for a missing catalog.
+func isCatalogNotFound(err error) bool {
+	var httpErr *rest.HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	return httpErr.HTTPCode == http.StatusNotFound ||
+		httpErr.BaseError.ErrorCode == verrors.VegaBackend_Catalog_NotFound
+}
+
+// checkCatalogPermission authorizes an operation on one catalog for callers that
+// hold only its id. A missing catalog is reported as forbidden rather than as
+// "not found": the caller has not proven it may see the catalog, and saying
+// which ids exist is itself a disclosure.
+func (cs *catalogService) checkCatalogPermission(ctx context.Context, catalogID string, op string) error {
+	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "CatalogService.CheckCatalogPermission")
+	defer span.End()
+
+	if catalogID == "" {
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+			WithErrorDetails("catalog_id is required")
+	}
+	catalog, err := cs.ca.GetByID(ctx, catalogID)
+	if err != nil {
+		span.SetStatus(codes.Error, "Get catalog failed")
+		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			verrors.VegaBackend_Catalog_InternalError_GetFailed).WithErrorDetails(err.Error())
+	}
+	if catalog == nil {
+		return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
+			WithErrorDetails(fmt.Sprintf("Access denied: insufficient permissions for[%v]", op))
+	}
+	if catalog.Internal && interfaces.IsS2SInternalAccess(ctx) {
+		// Mirrors GetByID: internal catalogs reached over the S2S face belong to
+		// the platform, not to any account.
+		return nil
+	}
+	return cs.ps.CheckPermission(ctx, interfaces.PermissionResource{
+		Type: catalogAuthResourceType(catalog.Internal),
+		ID:   catalog.ID,
+	}, []string{op})
+}
+
 func (cs *catalogService) GetByID(ctx context.Context, id string, withSensitiveFields bool) (*interfaces.Catalog, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Get catalog")
 	defer span.End()

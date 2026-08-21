@@ -102,6 +102,14 @@ func (suts *semanticUnderstandingTaskService) CreateResourceTask(ctx context.Con
 		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
 
+	// InternalGetByID above deliberately skips authorization, so this is the only
+	// thing standing between an unauthorized caller and a task that reads the
+	// table's unmasked sample rows (bkn-studio#342).
+	if err := suts.cs.CheckTaskPermission(ctx, resource.CatalogID, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return nil, err
+	}
+
 	task, err := normalizeResourceSemanticUnderstandingRequest(resource, req)
 	if err != nil {
 		span.SetStatus(codes.Error, "Invalid semantic understanding task request")
@@ -109,6 +117,16 @@ func (suts *semanticUnderstandingTaskService) CreateResourceTask(ctx context.Con
 			WithErrorDetails(err.Error())
 	}
 	if req.IncludeSampleRows {
+		// Sample rows are the table's actual contents, sent unmasked to the
+		// semantic service and then kept in the task's input snapshot. Asking for
+		// them is a data read, so it needs query_data on top of task_manage —
+		// otherwise task_manage alone would be a way around the read permission
+		// (#571).
+		if err := suts.rs.CheckResourcePermission(ctx, resourceID,
+			interfaces.OPERATION_TYPE_QUERY_DATA); err != nil {
+			span.SetStatus(codes.Error, "Permission denied")
+			return nil, err
+		}
 		if _, err := resourcelogic.EnsureResourceQueryable(ctx, resource); err != nil {
 			logger.Warnf("Skipping semantic sample rows because resource is not queryable: resource_id=%s, category=%s, error=%v", resource.ID, resource.Category, err)
 		} else if err := suts.attachUnmaskedSampleRows(ctx, resource, task); err != nil {
@@ -146,6 +164,13 @@ func (suts *semanticUnderstandingTaskService) CreateCatalogTask(ctx context.Cont
 			WithErrorDetails(err.Error())
 	}
 
+	// Same hole as the resource path: the catalog was fetched internally, which
+	// skips authorization (bkn-studio#342).
+	if err := suts.cs.CheckTaskPermission(ctx, catalogID, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return nil, err
+	}
+
 	task, err := normalizeCatalogSemanticUnderstandingRequest(catalog, resources, req)
 	if err != nil {
 		span.SetStatus(codes.Error, "Invalid semantic understanding task request")
@@ -181,6 +206,22 @@ func (suts *semanticUnderstandingTaskService) createTask(ctx context.Context, ta
 	return task, nil
 }
 
+// checkTaskPermission authorizes an operation on one semantic-understanding task
+// through whatever it was created against: a resource-scoped task is judged on
+// its table, a catalog-scoped one on its catalog.
+//
+// Reads matter as much as writes here. The task's input snapshot holds the
+// table's unmasked sample rows, so an unguarded detail endpoint hands out
+// exactly what the creation guard was added to protect (#571).
+func (suts *semanticUnderstandingTaskService) checkTaskPermission(ctx context.Context,
+	task *interfaces.SemanticUnderstandingTask, op string) error {
+
+	// 两种 scope 都判在目录上,与列表口径一致。资源域的任务落库时也写了
+	// catalog_id,所以不需要回查资源表——而按表判会让「列表里看不到、按 id 却读
+	// 得到」这种矛盾重新出现。目录被删之后的兜底在 CheckTaskPermission 里。
+	return suts.cs.CheckTaskPermission(ctx, task.CatalogID, op)
+}
+
 func (suts *semanticUnderstandingTaskService) GetByID(ctx context.Context, id string) (*interfaces.SemanticUnderstandingTask, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "SemanticUnderstandingTaskService.GetByID")
 	defer span.End()
@@ -194,6 +235,10 @@ func (suts *semanticUnderstandingTaskService) GetByID(ctx context.Context, id st
 	if task == nil {
 		span.SetStatus(codes.Error, "Semantic understanding task not found")
 		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_SemanticUnderstandingTask_NotFound)
+	}
+	if err := suts.checkTaskPermission(ctx, task, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return nil, err
 	}
 	if err := suts.populateSemanticUnderstandingTaskReferences(ctx, []*interfaces.SemanticUnderstandingTask{task}); err != nil {
 		span.RecordError(err)
@@ -230,12 +275,31 @@ func (suts *semanticUnderstandingTaskService) List(ctx context.Context, params i
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "SemanticUnderstandingTaskService.List")
 	defer span.End()
 
+	// A task is listed through the catalog it belongs to (#269), with the same
+	// verb every other task endpoint uses. The visible set goes into the query so
+	// that total counts what the caller can see and pages keep their size —
+	// filtering after LIMIT breaks both, and the set is small enough to push down
+	// because it is catalogs rather than tables.
+	visible, unrestricted, excluded, err := suts.cs.AuthorizedCatalogsForTasks(ctx,
+		interfaces.OPERATION_TYPE_TASK_MANAGE)
+	if err != nil {
+		span.SetStatus(codes.Error, "Resolve authorized catalogs failed")
+		return nil, 0, err
+	}
+	if !unrestricted && len(visible) == 0 {
+		span.SetStatus(codes.Ok, "")
+		return []*interfaces.SemanticUnderstandingTaskSummary{}, 0, nil
+	}
+	params.CatalogIDs = visible
+	params.ExcludeCatalogIDs = excluded
+
 	tasks, total, err := suts.suta.List(ctx, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List semantic understanding tasks failed")
 		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
 	}
+
 	if err := suts.populateSemanticUnderstandingTaskSummaryReferences(ctx, tasks); err != nil {
 		span.RecordError(err)
 		logger.Warnf("Failed to populate semantic understanding task references: %v", err)
@@ -385,6 +449,15 @@ func (suts *semanticUnderstandingTaskService) DeleteByIDs(ctx context.Context, i
 		span.SetStatus(codes.Error, "Get semantic understanding tasks failed")
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_InternalError_FilterResourcesFailed).
 			WithErrorDetails(err.Error())
+	}
+
+	// Checked before anything is deleted: a batch is one transaction, so one
+	// unauthorized id stops the whole request rather than deleting the rest.
+	for _, task := range tasks {
+		if err := suts.checkTaskPermission(ctx, task, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+			span.SetStatus(codes.Error, "Permission denied")
+			return err
+		}
 	}
 
 	toDelete := make([]string, 0, len(tasks))

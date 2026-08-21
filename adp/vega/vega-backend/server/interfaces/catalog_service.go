@@ -45,6 +45,20 @@ type CatalogService interface {
 	// ListAuthResources lists catalog auth resources with filters.
 	ListAuthResources(ctx context.Context, params AuthResourceQueryParams) ([]*AuthResourceEntry, int64, error)
 
+	// AuthorizedCatalogsForTasks resolves which catalogs the caller may act on,
+	// for listings to push into their query. unrestricted reports a type-wide
+	// grant, in which case ids is empty and only excluded has to be filtered out
+	// — "sees everything" and "sees nothing" would otherwise be the same empty
+	// slice. Both slices are bounded by the number of catalogs a deployment has,
+	// which is why this belongs in the SQL rather than in a pass over the page.
+	AuthorizedCatalogsForTasks(ctx context.Context, op string) (ids []string, unrestricted bool, excluded []string, err error)
+
+	// CheckTaskPermission authorizes an operation on something that hangs off a
+	// catalog. Unlike CheckCatalogPermission it survives the catalog's deletion:
+	// tasks outlive their catalog, and judging them on an object that is gone
+	// would strand them beyond anyone's reach.
+	CheckTaskPermission(ctx context.Context, catalogID string, op string) error
+
 	// InternalGetByID retrieves a Catalog by ID for internal workers.
 	InternalGetByID(ctx context.Context, id string, withSensitiveFields bool) (*Catalog, error)
 	// InternalGetByIDs retrieves Catalogs for internal callers without permission filtering.

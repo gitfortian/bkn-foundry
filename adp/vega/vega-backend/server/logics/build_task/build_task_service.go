@@ -106,6 +106,16 @@ func (bts *buildTaskService) Create(ctx context.Context, req *interfaces.CreateB
 		return "", rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
 
+	// Creating a task is a write on the table it builds, so it needs task_manage —
+	// GetByID above only proves the caller may see the table (#472). The verb lives
+	// on the catalog, and the resource we just read carries its id, so ask there
+	// directly rather than through the table: fewer reads, and the code says which
+	// object decides.
+	if err := bts.cs.CheckTaskPermission(ctx, resource.CatalogID, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return "", err
+	}
+
 	if resource.Category != interfaces.ResourceCategoryTable {
 		span.SetStatus(codes.Error, "Resource category is not table")
 		return "", rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_Resource_InternalError_InvalidCategory).
@@ -413,6 +423,14 @@ func (bts *buildTaskService) GetByID(ctx context.Context, id string) (*interface
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
+	if buildTask != nil {
+		// A task is read through the table it builds (#472).
+		if err := bts.cs.CheckTaskPermission(ctx, buildTask.CatalogID,
+			interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+			span.SetStatus(codes.Error, "Permission denied")
+			return nil, err
+		}
+	}
 	if buildTask == nil {
 		span.SetStatus(codes.Error, "Build task not found")
 		return nil, rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
@@ -613,12 +631,48 @@ func (bts *buildTaskService) List(ctx context.Context, params interfaces.BuildTa
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "List build tasks")
 	defer span.End()
 
+	// A task is judged on the catalog it belongs to, with task_manage (#472) —
+	// reading a task is reading the catalog's management surface, so the same
+	// verb decides the listing and every single-task endpoint.
+	//
+	// The visible set goes into the query, not over the fetched page. Filtering
+	// after LIMIT would leave total counting rows the caller may not see and let
+	// a page come back empty while later ones still hold visible rows — a caller
+	// stopping on the empty page loses data, one paging to total asks for pages
+	// that are entirely filtered. It is affordable because the set is catalogs:
+	// tens per deployment, against hundreds of tables.
+	if params.CatalogID != "" {
+		if err := bts.cs.CheckTaskPermission(ctx, params.CatalogID,
+			interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+			if !interfaces.IsPermissionRefusal(err) {
+				span.SetStatus(codes.Error, "Check catalog permission failed")
+				return nil, 0, err
+			}
+			span.SetStatus(codes.Ok, "")
+			return []*interfaces.BuildTaskSummary{}, 0, nil
+		}
+	} else {
+		visible, unrestricted, excluded, err := bts.cs.AuthorizedCatalogsForTasks(ctx,
+			interfaces.OPERATION_TYPE_TASK_MANAGE)
+		if err != nil {
+			span.SetStatus(codes.Error, "Resolve authorized catalogs failed")
+			return nil, 0, err
+		}
+		if !unrestricted && len(visible) == 0 {
+			span.SetStatus(codes.Ok, "")
+			return []*interfaces.BuildTaskSummary{}, 0, nil
+		}
+		params.CatalogIDs = visible
+		params.ExcludeCatalogIDs = excluded
+	}
+
 	buildTasks, total, err := bts.bta.List(ctx, params)
 	if err != nil {
 		span.SetStatus(codes.Error, "List build tasks failed")
 		return nil, 0, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
 			WithErrorDetails(err.Error())
 	}
+
 	if err := bts.populateBuildTaskSummaryReferences(ctx, buildTasks); err != nil {
 		span.RecordError(err)
 		logger.Warnf("Failed to populate build task references: %v", err)
@@ -652,6 +706,10 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 	if buildTask == nil {
 		span.SetStatus(codes.Error, "Build task not found")
 		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
+	}
+	if err := bts.cs.CheckTaskPermission(ctx, buildTask.CatalogID, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return err
 	}
 	// Failed tasks may also be restarted; otherwise they become dead ends that must be deleted and rebuilt.
 	if buildTask.Status != interfaces.BuildTaskStatusStopped &&
@@ -770,6 +828,10 @@ func (bts *buildTaskService) Stop(ctx context.Context, taskID string) error {
 		span.SetStatus(codes.Error, "Build task not found")
 		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound)
 	}
+	if err := bts.cs.CheckTaskPermission(ctx, buildTask.CatalogID, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+		span.SetStatus(codes.Error, "Permission denied")
+		return err
+	}
 	if buildTask.Status != interfaces.BuildTaskStatusRunning &&
 		buildTask.Status != interfaces.BuildTaskStatusPending {
 		span.SetStatus(codes.Error, "Invalid state transition for stop")
@@ -842,6 +904,14 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 		if buildTask == nil {
 			missingIDs = append(missingIDs, id)
 			continue
+		}
+		// Checked before anything is deleted AND before the status verdicts are
+		// reported: a batch is one transaction, so one unauthorized id stops the
+		// whole request; and answering "this one is running" to a caller with no
+		// grant would let it enumerate task ids and their state (#472).
+		if err := bts.cs.CheckTaskPermission(ctx, buildTask.CatalogID, interfaces.OPERATION_TYPE_TASK_MANAGE); err != nil {
+			span.SetStatus(codes.Error, "Permission denied")
+			return err
 		}
 		if buildTask.Status == interfaces.BuildTaskStatusRunning || buildTask.Status == interfaces.BuildTaskStatusStopping {
 			runningIDs = append(runningIDs, id)

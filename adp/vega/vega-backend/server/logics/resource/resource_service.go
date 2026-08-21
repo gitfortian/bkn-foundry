@@ -100,13 +100,23 @@ func resourceAuthResourceType(internal bool) string {
 //
 // Intentional absence of authorize: The person holding the authorization right of the directory should not be granted the right to delegate each table under the directory as a result
 // Ability. Operations without entries stop here and do not ask upwards.
+// resourceOwnOperations is what the permission service still declares on the
+// resource type. The management verbs were withdrawn when they converged onto
+// the catalog, so a p-line that still answers one can only be residue from
+// before the convergence: the grant console no longer offers those verbs, which
+// means it can neither hand them out nor take them back. Asking the resource
+// about a withdrawn verb would let that residue keep deciding, invisibly and
+// irrevocably — so those questions go straight to the catalog.
+var resourceOwnOperations = map[string]bool{
+	interfaces.OPERATION_TYPE_VIEW_DETAIL: true,
+	interfaces.OPERATION_TYPE_QUERY_DATA:  true,
+}
+
 var resourceOpOnCatalog = map[string]string{
 	interfaces.OPERATION_TYPE_VIEW_DETAIL: interfaces.OPERATION_TYPE_VIEW_DETAIL,
 	interfaces.OPERATION_TYPE_QUERY_DATA:  interfaces.OPERATION_TYPE_QUERY_DATA,
-	interfaces.OPERATION_TYPE_CREATE:      interfaces.OPERATION_TYPE_RESOURCE_MANAGE,
 	interfaces.OPERATION_TYPE_MODIFY:      interfaces.OPERATION_TYPE_RESOURCE_MANAGE,
 	interfaces.OPERATION_TYPE_DELETE:      interfaces.OPERATION_TYPE_RESOURCE_MANAGE,
-	interfaces.OPERATION_TYPE_TASK_MANAGE: interfaces.OPERATION_TYPE_TASK_MANAGE,
 }
 
 // catalogAuthResourceType returns the resource type of the data directory in the permission service, and
@@ -128,22 +138,34 @@ func catalogAuthResourceType(internal bool) string {
 func (rs *resourceService) checkResourceOrCatalog(ctx context.Context,
 	resourceID, catalogID string, parentInternal bool, op string) error {
 
-	err := rs.ps.CheckPermission(ctx, interfaces.PermissionResource{
-		Type: resourceAuthResourceType(parentInternal),
-		ID:   resourceID,
-	}, []string{op})
-	if err == nil {
-		return nil
+	// err stays nil when the resource is never asked, which is how the code below
+	// tells "the resource refused" from "the resource was not entitled to answer".
+	var err error
+	if resourceOwnOperations[op] {
+		err = rs.ps.CheckPermission(ctx, interfaces.PermissionResource{
+			Type: resourceAuthResourceType(parentInternal),
+			ID:   resourceID,
+		}, []string{op})
+		if err == nil {
+			return nil
+		}
 	}
 	catalogOp, ok := resourceOpOnCatalog[op]
 	if !ok || catalogID == "" {
-		return err
+		if err != nil {
+			return err
+		}
+		return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
+			WithErrorDetails(fmt.Sprintf("Access denied: insufficient permissions for[%v]", op))
 	}
 	if err2 := rs.ps.CheckPermission(ctx, interfaces.PermissionResource{
 		Type: catalogAuthResourceType(parentInternal),
 		ID:   catalogID,
 	}, []string{catalogOp}); err2 != nil {
-		return err // Return the error of the old caliber and keep the existing error message semantics unchanged
+		if err != nil {
+			return err // Return the error of the old caliber and keep the existing error message semantics unchanged
+		}
+		return err2
 	}
 	return nil
 }
@@ -329,6 +351,17 @@ func (rs *resourceService) filterResourcePermissions(ctx context.Context, ids []
 
 	normalIDs, internalIDs := partitionResourceIDs(ids, internalSet)
 
+	// Same rule the single check follows: only ask the resource about verbs it
+	// still declares. A batch asked about a withdrawn one would be answered by
+	// pre-convergence p-lines alone, which is how a legacy role kept deleting
+	// tables through this path while the single check already refused it.
+	askResource := make([]string, 0, len(ops))
+	for _, op := range ops {
+		if resourceOwnOperations[op] {
+			askResource = append(askResource, op)
+		}
+	}
+
 	result := make(map[string]interfaces.PermissionResourceOps, len(ids))
 	for _, group := range []struct {
 		authType string
@@ -337,10 +370,10 @@ func (rs *resourceService) filterResourcePermissions(ctx context.Context, ids []
 		{interfaces.AUTH_RESOURCE_TYPE_RESOURCE, normalIDs},
 		{interfaces.AUTH_RESOURCE_TYPE_INTERNAL_RESOURCE, internalIDs},
 	} {
-		if len(group.ids) == 0 {
+		if len(group.ids) == 0 || len(askResource) == 0 {
 			continue
 		}
-		matched, err := rs.ps.FilterResources(ctx, group.authType, group.ids, ops,
+		matched, err := rs.ps.FilterResources(ctx, group.authType, group.ids, askResource,
 			allowOperation, interfaces.COMMON_OPERATIONS)
 		if err != nil {
 			return nil, err
@@ -370,20 +403,22 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 	_, parentInternal := internalCatalogs[req.CatalogID]
 	authType := resourceAuthResourceType(parentInternal)
 
-	// Determine whether the userid has the permission to create data resources (policy decision). When the table was created, the resource did not exist yet. What was judged was
-	// resource:* This wildcard object - it cannot answer "which directory should this table be created in", so the person who holds it
-	// Tables can be created in any directory. Reject and then ask the resource_manage of the target directory (#817).
-	err = rs.ps.CheckPermission(ctx, interfaces.PermissionResource{
-		Type: authType,
-		ID:   interfaces.RESOURCE_ID_ALL,
-	}, []string{interfaces.OPERATION_TYPE_CREATE})
-	if err != nil {
-		if err2 := rs.ps.CheckPermission(ctx, interfaces.PermissionResource{
-			Type: catalogAuthResourceType(parentInternal),
-			ID:   req.CatalogID,
-		}, []string{interfaces.OPERATION_TYPE_RESOURCE_MANAGE}); err2 != nil {
-			return nil, err // Return the error of the old caliber and keep the existing error message semantics unchanged
-		}
+	// Creating a table is authorised by the target catalog's resource_manage
+	// (#801). A table is always created INSIDE a catalog, so "may create a table"
+	// and "may act on this catalog" are the same question — and the old check
+	// could not answer it: it asked resource:* + create, and a wildcard object
+	// does not say which catalog the table lands in, so whoever held it could
+	// create a table anywhere.
+	//
+	// The legacy verb is deliberately NOT asked as a second chance. A custom role
+	// still carrying resource:*/create loses table creation on upgrade, and that
+	// is the intended outcome: it is the grant that could not name a catalog.
+	// Re-grant those roles resource_manage on the catalogs they should manage.
+	if err = rs.ps.CheckPermission(ctx, interfaces.PermissionResource{
+		Type: catalogAuthResourceType(parentInternal),
+		ID:   req.CatalogID,
+	}, []string{interfaces.OPERATION_TYPE_RESOURCE_MANAGE}); err != nil {
+		return nil, err
 	}
 
 	// Get account info from context
@@ -506,12 +541,20 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 		}
 	}
 
-	// Register resources
+	// Register resources.
+	//
+	// The creator gets view_detail alone (#801). Management — modify, delete,
+	// task_manage — is decided on the owning catalog, so a second object-level
+	// management grant would only give the two sides different answers.
+	// query_data is withheld for the same reason the split was made: handing it
+	// to the creator would erase the line between "may manage" and "may see the
+	// contents" exactly where it was drawn. Read access is granted explicitly,
+	// on the catalog or on this table.
 	err = rs.ps.CreateResources(ctx, []interfaces.PermissionResource{{
 		ID:   resource.ID,
 		Type: authType,
 		Name: resource.Name,
-	}}, interfaces.COMMON_OPERATIONS)
+	}}, []string{interfaces.OPERATION_TYPE_VIEW_DETAIL})
 	if err != nil {
 		logger.Errorf("CreateResources error: %s", err.Error())
 		span.SetStatus(codes.Error, "failed to create resource")
@@ -584,6 +627,41 @@ func (rs *resourceService) GetByID(ctx context.Context, id string) (*interfaces.
 
 	span.SetStatus(codes.Ok, "")
 	return resource, nil
+}
+
+func (rs *resourceService) CheckResourcePermission(ctx context.Context, resourceID string, op string) error {
+	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "ResourceService.CheckResourcePermission")
+	defer span.End()
+
+	if resourceID == "" {
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
+			WithErrorDetails("resource_id is required")
+	}
+	resource, err := rs.ra.GetByID(ctx, resourceID)
+	if err != nil {
+		span.SetStatus(codes.Error, "Get resource failed")
+		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			verrors.VegaBackend_Resource_InternalError_GetFailed).WithErrorDetails(err.Error())
+	}
+	if resource == nil {
+		return rest.NewHTTPError(ctx, http.StatusForbidden, rest.PublicError_Forbidden).
+			WithErrorDetails(fmt.Sprintf("Access denied: insufficient permissions for[%v]", op))
+	}
+
+	internalCatalogs, err := rs.internalCatalogIDSet(ctx)
+	if err != nil {
+		return err
+	}
+	_, parentInternal := internalCatalogs[resource.CatalogID]
+	if parentInternal && interfaces.IsS2SInternalAccess(ctx) {
+		// Same exemption GetByID makes: an internal-catalog resource reached over
+		// the in-cluster S2S face is infrastructure, never granted to business
+		// roles, so a per-account check there can only refuse a caller that is
+		// acting for the platform itself. Without this the guard would break the
+		// Context Loader's reads of internal datasets.
+		return nil
+	}
+	return rs.checkResourceOrCatalog(ctx, resource.ID, resource.CatalogID, parentInternal, op)
 }
 
 func (rs *resourceService) InternalGetByID(ctx context.Context, id string) (*interfaces.Resource, error) {

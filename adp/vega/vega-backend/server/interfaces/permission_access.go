@@ -8,6 +8,10 @@ package interfaces
 
 import (
 	"context"
+	"errors"
+	"net/http"
+
+	"github.com/openbkn-ai/bkn-foundry/comm-go/rest"
 )
 
 const (
@@ -47,6 +51,11 @@ const (
 )
 
 var (
+	// COMMON_OPERATIONS is the set every authorization answer is asked to report
+	// on. It grants nothing by itself — a verb missing here is simply never
+	// mentioned back, which is how query_data and resource_manage stayed
+	// invisible to the caller after #801 introduced them: the API kept answering
+	// that nobody held either, including the accounts that did.
 	COMMON_OPERATIONS = []string{
 		OPERATION_TYPE_VIEW_DETAIL,
 		OPERATION_TYPE_CREATE,
@@ -54,8 +63,23 @@ var (
 		OPERATION_TYPE_DELETE,
 		OPERATION_TYPE_AUTHORIZE,
 		OPERATION_TYPE_TASK_MANAGE,
+		OPERATION_TYPE_QUERY_DATA,
+		OPERATION_TYPE_RESOURCE_MANAGE,
 	}
 )
+
+// IsPermissionRefusal reports whether an authorization error is the service
+// saying no, as opposed to the service failing to answer.
+//
+// The distinction decides what a listing does with the error. A refusal means
+// an empty result; an outage or a database failure must travel up as an error,
+// because answering 200 with an empty page turns "we could not tell" into
+// "there is nothing here" — the caller sees a table with no tasks and a
+// monitor sees a successful request.
+func IsPermissionRefusal(err error) bool {
+	var httpErr *rest.HTTPError
+	return errors.As(err, &httpErr) && httpErr.HTTPCode == http.StatusForbidden
+}
 
 // Check permissions
 type PermissionCheck struct {
@@ -85,11 +109,15 @@ type PermissionResource struct {
 
 // Filter/Delete
 type PermissionResourcesFilter struct {
-	Accessor       PermissionAccessor   `json:"accessor,omitempty"`
-	Resources      []PermissionResource `json:"resources,omitempty"`
-	Operations     []string             `json:"operation,omitempty"`
-	AllowOperation bool                 `json:"allow_operation"`
-	Method         string               `json:"method,omitempty"`
+	Accessor   PermissionAccessor   `json:"accessor,omitempty"`
+	Resources  []PermissionResource `json:"resources,omitempty"`
+	Operations []string             `json:"operation,omitempty"`
+	// CandidateOperations is what the answer should report on, as opposed to what
+	// makes a resource visible. Callers render buttons from it, so leaving it
+	// unset means the answer can only ever name the visibility operation itself.
+	CandidateOperations []string `json:"candidate_operations,omitempty"`
+	AllowOperation      bool     `json:"allow_operation"`
+	Method              string   `json:"method,omitempty"`
 }
 
 // Set permissions
