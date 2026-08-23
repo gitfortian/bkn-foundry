@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -121,7 +122,19 @@ func (s *adminWriteServices) GrantRolePermission(ctx context.Context, roleID, re
 	if resourceType == adminConsoleResourceType {
 		return adminwrite.ErrAdminConsolePermission
 	}
-	return s.e.GrantRolePermission(role.ID, resourceType, resourceID, op)
+	// A role granted resource_manage gets view_detail with it (#1121): the
+	// management routes load their target first, so without it the role holds a
+	// verb it can never reach.
+	ops, err := impliedOps(s.db.WithContext(ctx), resourceType, []string{op})
+	if err != nil {
+		return err
+	}
+	for _, granted := range ops {
+		if err := s.e.GrantRolePermission(role.ID, resourceType, resourceID, granted); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // RevokeRolePermission revokes a custom role's op over a resource pattern.
@@ -130,7 +143,62 @@ func (s *adminWriteServices) RevokeRolePermission(ctx context.Context, roleID, r
 	if err != nil {
 		return err
 	}
+	// An operation stays if another operation the role still holds implies it
+	// (#1121): revoking view_detail while resource_manage remains would leave a
+	// verb whose every route answers 403, the grant this rule exists to prevent.
+	//
+	// Retaining is what the whole-set object-grant surface already does for the
+	// same edit — a console that clears view_detail while leaving resource_manage
+	// ticked gets view_detail back — and it is the only shape that does not
+	// depend on the order a caller sends its pair of requests in. Revoking the
+	// implying verb as well would mean a console saving "add resource_manage,
+	// drop view_detail" as two calls ends up with NEITHER, silently discarding
+	// the grant it had just made.
+	//
+	// So this route only ever removes the operation it was given, and only when
+	// nothing the role retains implies it. To drop view_detail, revoke
+	// resource_manage first; that revoke is honoured immediately, because
+	// view_detail implies nothing.
+	implying, err := impliedBy(s.db.WithContext(ctx), resourceType, []string{op})
+	if err != nil {
+		return err
+	}
+	if len(implying) > 1 {
+		held, err := s.roleOperationsOn(role.ID, resourceType, resourceID)
+		if err != nil {
+			return err
+		}
+		for _, other := range implying {
+			if other == op || !held[other] {
+				continue
+			}
+			slog.Info("kept an operation the role still implies",
+				"role_id", role.ID, "resource_type", resourceType, "resource_id", resourceID,
+				"operation", op, "implied_by", other)
+			return nil
+		}
+	}
 	return s.e.RevokeRolePermission(role.ID, resourceType, resourceID, op)
+}
+
+// roleOperationsOn returns the operations the role holds on exactly one
+// resource pattern, as a set.
+func (s *adminWriteServices) roleOperationsOn(roleID, resourceType, resourceID string) (map[string]bool, error) {
+	grants, err := s.e.RolePermissions(roleID)
+	if err != nil {
+		return nil, err
+	}
+	want := resourceType + ":" + resourceID
+	out := map[string]bool{}
+	for _, g := range grants {
+		if g.Object != want {
+			continue
+		}
+		for _, op := range g.Operations {
+			out[op] = true
+		}
+	}
+	return out, nil
 }
 
 // loadCustomRole fetches a role and rejects built-ins. It maps to the
