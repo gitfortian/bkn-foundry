@@ -106,6 +106,7 @@ func (c *Client) EnsureTraceTimestampPipeline(ctx context.Context, name string, 
 	if traceIndex == "" {
 		return errors.New("trace index is required when trace timestamp pipeline is enabled")
 	}
+	c.deleteLegacyTraceTimestampTemplate(ctx)
 	body, err := json.Marshal(map[string]any{
 		"description": "Repair zero @timestamp on OpenTelemetry SS4O trace spans from startTime.",
 		"processors": []map[string]any{{
@@ -142,73 +143,84 @@ func (c *Client) EnsureTraceTimestampPipeline(ctx context.Context, name string, 
 	}
 
 	indexSettings := map[string]string{"index.default_pipeline": name}
-	indexTemplate, err := json.Marshal(map[string]any{
-		"index_patterns": []string{traceIndex},
-		// Generic SS4O templates may also match the Trace index. Keep this
-		// narrowly scoped template above their default priority so the repair
-		// pipeline cannot be displaced by an unrelated template.
-		"priority": 500,
-		"template": map[string]any{
-			"settings": indexSettings,
-		},
-	})
-	if err != nil {
-		return fmt.Errorf("encode trace index default pipeline template: %w", err)
-	}
-	templateURL := fmt.Sprintf("%s/_index_template/bkn-trace-timestamp-default", c.baseURL)
-	templateRequest, err := http.NewRequestWithContext(ctx, http.MethodPut, templateURL, bytes.NewReader(indexTemplate))
-	if err != nil {
-		return fmt.Errorf("create trace index default pipeline template request: %w", err)
-	}
-	templateRequest.Header.Set("Content-Type", "application/json")
-	if c.auth.Enabled {
-		templateRequest.SetBasicAuth(c.auth.Username, c.auth.Password)
-	}
-	templateResponse, err := c.httpClient.Do(templateRequest)
-	if err != nil {
-		return fmt.Errorf("execute trace index default pipeline template request: %w", err)
-	}
-	defer func() { _ = templateResponse.Body.Close() }()
-	templateBody, err := io.ReadAll(templateResponse.Body)
-	if err != nil {
-		return fmt.Errorf("read trace index default pipeline template response: %w", err)
-	}
-	if templateResponse.StatusCode < http.StatusOK || templateResponse.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("opensearch trace index default pipeline template failed with status %d: %s", templateResponse.StatusCode, string(templateBody))
-	}
-
 	indexSettingsBody, err := json.Marshal(indexSettings)
 	if err != nil {
 		return fmt.Errorf("encode trace index default pipeline setting: %w", err)
 	}
 	settingsURL := fmt.Sprintf("%s/%s/_settings", c.baseURL, url.PathEscape(traceIndex))
-	settingsRequest, err := http.NewRequestWithContext(ctx, http.MethodPut, settingsURL, bytes.NewReader(indexSettingsBody))
+	settingsStatus, settingsBody, err := c.putIndexSettings(ctx, settingsURL, indexSettingsBody)
 	if err != nil {
-		return fmt.Errorf("create trace index default pipeline setting request: %w", err)
+		return err
 	}
-	settingsRequest.Header.Set("Content-Type", "application/json")
-	if c.auth.Enabled {
-		settingsRequest.SetBasicAuth(c.auth.Username, c.auth.Password)
-	}
-	settingsResponse, err := c.httpClient.Do(settingsRequest)
-	if err != nil {
-		return fmt.Errorf("execute trace index default pipeline setting request: %w", err)
-	}
-	defer func() { _ = settingsResponse.Body.Close() }()
-	settingsBody, err := io.ReadAll(settingsResponse.Body)
-	if err != nil {
-		return fmt.Errorf("read trace index default pipeline setting response: %w", err)
-	}
-	// On a fresh installation the Collector creates the trace index later. The
-	// template above binds the pipeline then; only an existing index needs this
-	// immediate update.
-	if settingsResponse.StatusCode == http.StatusNotFound {
+	// On a fresh installation create the exact Trace index before the Collector
+	// sends its first document. This preserves any generic SS4O template's
+	// mappings while avoiding a second, higher-priority settings-only template.
+	if settingsStatus == http.StatusNotFound {
+		indexDefinition, err := json.Marshal(map[string]any{"settings": indexSettings})
+		if err != nil {
+			return fmt.Errorf("encode trace index default pipeline definition: %w", err)
+		}
+		if err := c.EnsureIndex(ctx, traceIndex, indexDefinition); err != nil {
+			return fmt.Errorf("create trace index default pipeline: %w", err)
+		}
+		settingsStatus, settingsBody, err = c.putIndexSettings(ctx, settingsURL, indexSettingsBody)
+		if err != nil {
+			return err
+		}
+		if settingsStatus < http.StatusOK || settingsStatus >= http.StatusMultipleChoices {
+			return fmt.Errorf("opensearch trace index default pipeline retry failed with status %d: %s", settingsStatus, string(settingsBody))
+		}
 		return nil
 	}
-	if settingsResponse.StatusCode < http.StatusOK || settingsResponse.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("opensearch trace index default pipeline setting failed with status %d: %s", settingsResponse.StatusCode, string(settingsBody))
+	if settingsStatus < http.StatusOK || settingsStatus >= http.StatusMultipleChoices {
+		return fmt.Errorf("opensearch trace index default pipeline setting failed with status %d: %s", settingsStatus, string(settingsBody))
 	}
 	return nil
+}
+
+// deleteLegacyTraceTimestampTemplate removes the settings-only template used
+// by the first index-level repair implementation. It could suppress matching
+// SS4O mappings because OpenSearch applies only the highest-priority template.
+func (c *Client) deleteLegacyTraceTimestampTemplate(ctx context.Context) {
+	requestURL := fmt.Sprintf("%s/_index_template/bkn-trace-timestamp-default", c.baseURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL, nil)
+	if err != nil {
+		return
+	}
+	if c.auth.Enabled {
+		req.SetBasicAuth(c.auth.Username, c.auth.Password)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+	_ = body
+}
+
+func (c *Client) putIndexSettings(ctx context.Context, requestURL string, body []byte) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, requestURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, fmt.Errorf("create trace index default pipeline setting request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.auth.Enabled {
+		req.SetBasicAuth(c.auth.Username, c.auth.Password)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, fmt.Errorf("execute trace index default pipeline setting request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, fmt.Errorf("read trace index default pipeline setting response: %w", err)
+	}
+	return resp.StatusCode, responseBody, nil
 }
 
 func (c *Client) Search(ctx context.Context, index string, query []byte) ([]byte, error) {
@@ -461,6 +473,15 @@ func (c *Client) EnsureIndex(ctx context.Context, index string, mapping []byte) 
 		return nil
 	}
 	if resp.StatusCode == http.StatusBadRequest && strings.Contains(string(body), "resource_already_exists_exception") {
+		var definition struct {
+			Mappings json.RawMessage `json:"mappings"`
+		}
+		if err := json.Unmarshal(mapping, &definition); err != nil {
+			return fmt.Errorf("decode opensearch index definition: %w", err)
+		}
+		if len(definition.Mappings) == 0 {
+			return nil
+		}
 		return c.ensureMapping(ctx, index, mapping)
 	}
 
