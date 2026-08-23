@@ -103,6 +103,10 @@ exporters:
 
 注意：官方 `opensearchexporter` 当前支持 `traces` 和 `logs`，默认不为 `metrics` 创建 OpenSearch 导出 pipeline。
 
+Trace 时间戳修复使用 OpenSearch 的 `index.default_pipeline`：由 `agent-observability` 在启动时先创建修复 pipeline，再绑定到 Trace 索引及其模板。不要向 Collector 的 `opensearch` exporter 注入 `pipeline` 字段；当前交付的 Collector 不支持该配置，启动会失败。
+
+`scripts/test_config_rollout.sh` 默认使用交付中的 SWR Collector 镜像执行 `validate`；可通过 `OTELCOL_RUNTIME_IMAGE` 覆盖镜像。该校验不会因未设置环境变量而跳过。
+
 ### 4C8G 最小部署基线
 
 默认单副本 Collector 限制为 `500m CPU / 768MiB`，适配 OpenBKN `4C8G` 最小环境：
