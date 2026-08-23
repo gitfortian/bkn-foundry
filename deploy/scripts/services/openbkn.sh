@@ -985,11 +985,13 @@ except (json.JSONDecodeError, TypeError):
     sys.exit(2)
 core = values.get("core", {})
 evidence = values.get("evidence", {})
+opensearch = values.get("opensearch", {})
 durable = (
     core.get("store") == "mariadb"
     and core.get("projection", {}).get("enabled") is True
     and evidence.get("store") == "opensearch"
     and bool(evidence.get("ingestAuth", {}).get("existingSecret"))
+    and bool(opensearch.get("traceTimestampPipeline"))
 )
 sys.exit(0 if durable else 1)
 ' <<<"${values}"

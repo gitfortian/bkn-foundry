@@ -95,9 +95,16 @@ fi
 
 HELM_VALUES='{"core":{"store":"mariadb","projection":{"enabled":true}},"evidence":{"store":"opensearch","ingestAuth":{"existingSecret":"bkn-trace-evidence-ingest"}}}'
 if _openbkn_should_skip_upgrade agent-observability openbkn agent-observability 0.1.4; then
+    fail "installer must reconcile a durable profile that lacks the timestamp pipeline"
+else
+    ok
+fi
+
+HELM_VALUES='{"core":{"store":"mariadb","projection":{"enabled":true}},"evidence":{"store":"opensearch","ingestAuth":{"existingSecret":"bkn-trace-evidence-ingest"}},"opensearch":{"traceTimestampPipeline":"bkn-trace-span-timestamp-v1"}}'
+if _openbkn_should_skip_upgrade agent-observability openbkn agent-observability 0.1.4; then
     ok
 else
-    fail "installer should retain the version-skip optimization for a durable runtime profile"
+    fail "installer should retain the version-skip optimization for a fully reconciled runtime profile"
 fi
 
 CORE_SET_VALUES=("core.store=memory")
@@ -106,6 +113,13 @@ if _openbkn_should_skip_upgrade agent-observability openbkn agent-observability 
     ok
 else
     fail "an explicit volatile override must retain the normal version-skip decision"
+fi
+CORE_SET_VALUES=("opensearch.traceTimestampPipeline=custom-trace-pipeline")
+HELM_VALUES='{"core":{"store":"memory","projection":{"enabled":false}},"evidence":{"store":"memory"},"opensearch":{"traceTimestampPipeline":"custom-trace-pipeline"}}'
+if _openbkn_should_skip_upgrade agent-observability openbkn agent-observability 0.1.4; then
+    fail "a custom timestamp pipeline must not bypass durable Core profile reconciliation"
+else
+    ok
 fi
 CORE_SET_VALUES=("")
 
@@ -180,7 +194,7 @@ else
     fail "repository installer must upgrade a volatile runtime profile"
 fi
 
-HELM_VALUES='{"core":{"store":"mariadb","projection":{"enabled":true}},"evidence":{"store":"opensearch","ingestAuth":{"existingSecret":"bkn-trace-evidence-ingest"}}}'
+HELM_VALUES='{"core":{"store":"mariadb","projection":{"enabled":true}},"evidence":{"store":"opensearch","ingestAuth":{"existingSecret":"bkn-trace-evidence-ingest"}},"opensearch":{"traceTimestampPipeline":"bkn-trace-span-timestamp-v1"}}'
 _install_openbkn_release_local agent-observability /tmp openbkn
 _install_openbkn_release_repo agent-observability openbkn openbkn 0.1.4
 if [[ "${UPGRADE_CALLS}" -eq 2 ]]; then
