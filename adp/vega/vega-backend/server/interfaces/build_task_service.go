@@ -26,8 +26,8 @@ type BuildTaskService interface {
 	// Stop transitions pending to stopped, or running to stopping (then asynchronously stopped by the worker).
 	Stop(ctx context.Context, taskID string) error
 	// DeleteByIDs atomically deletes build tasks by IDs.
-	// Pre-validates: any missing id returns 404 unless ignoreMissing=true; any running/stopping id returns 409 (cannot be skipped).
-	DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool, deleteActiveIndex bool) error
+	// Pre-validates: any missing id returns 404 unless ignoreMissing=true; any pending/running/stopping id returns 409 (cannot be skipped).
+	DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool) error
 
 	// InternalGetByID retrieves a build task by ID for internal workers.
 	InternalGetByID(ctx context.Context, id string) (*BuildTask, error)
@@ -41,9 +41,9 @@ type BuildTaskService interface {
 	// InternalSetProgress persists execution progress without changing task status.
 	InternalSetProgress(ctx context.Context, tx *sql.Tx, id string, progress BuildTaskProgress) (bool, error)
 	// InternalMarkRunning transitions a pending build task to running.
-	InternalMarkRunning(ctx context.Context, id string) (bool, error)
+	InternalMarkRunning(ctx context.Context, tx *sql.Tx, id string) (bool, error)
 	// InternalMarkFailed fails an active build task.
-	InternalMarkFailed(ctx context.Context, id, detail string) (bool, error)
+	InternalMarkFailed(ctx context.Context, tx *sql.Tx, id, detail string) (bool, error)
 	// InternalMarkCancelled cancels an active build task.
 	InternalMarkCancelled(ctx context.Context, id, detail string) (bool, error)
 	// InternalMarkStopped transitions a stopping build task to stopped.

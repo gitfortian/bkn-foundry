@@ -61,6 +61,33 @@ func newTestService(t *testing.T) (*resourceService,
 	return rs, mockRA, mockPS, mockDS, mockUMS, mockCS, mockBTA
 }
 
+func TestResourceServiceInternalLocalIndexTransaction(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockRA := vmock.NewMockResourceAccess(ctrl)
+	service := &resourceService{ra: mockRA}
+	tx := &sql.Tx{}
+	resource := &interfaces.Resource{ID: "resource-1"}
+	mockRA.EXPECT().GetByID(gomock.Any(), tx, "resource-1").Return(resource, nil)
+	mockRA.EXPECT().UpdateLocalIndexState(
+		gomock.Any(), tx, "resource-1",
+		interfaces.ResourceLocalIndexStatusAvailable,
+		"index-v1",
+		`{"mode":"batch","cursor":[10]}`,
+	).Return(true, nil)
+
+	got, err := service.InternalGetByID(context.Background(), tx, "resource-1")
+	require.NoError(t, err)
+	assert.Same(t, resource, got)
+	updated, err := service.InternalUpdateLocalIndexState(
+		context.Background(), tx, "resource-1",
+		interfaces.ResourceLocalIndexStatusAvailable,
+		"index-v1",
+		`{"mode":"batch","cursor":[10]}`,
+	)
+	require.NoError(t, err)
+	assert.True(t, updated)
+}
+
 func expectResourceServiceTransaction(t *testing.T, rs *resourceService, commit bool) {
 	t.Helper()
 	db, mock, err := sqlmock.New()
@@ -108,11 +135,14 @@ func TestResourceServiceInternalMetadataUpdateConflict(t *testing.T) {
 	t.Run("discovery metadata", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
 		expectedUpdateTime := int64(42)
-		resource := &interfaces.Resource{ID: "r1", UpdateTime: 43}
-		mockRA.EXPECT().UpdateDiscoveryMetadata(gomock.Any(), nil, resource, expectedUpdateTime).
+		resource := &interfaces.Resource{ID: "r1", UpdateTime: 43, SchemaDefinition: []*interfaces.Property{{Name: "id"}}}
+		current := &interfaces.Resource{ID: "r1", UpdateTime: expectedUpdateTime, SchemaDefinition: []*interfaces.Property{{Name: "id"}}}
+		tx := &sql.Tx{}
+		mockRA.EXPECT().GetByID(gomock.Any(), tx, "r1").Return(current, nil)
+		mockRA.EXPECT().UpdateDiscoveryMetadata(gomock.Any(), tx, resource, expectedUpdateTime).
 			Return(int64(0), nil)
 
-		err := rs.InternalUpdateDiscoveryMetadata(context.Background(), nil, resource, expectedUpdateTime)
+		err := rs.InternalUpdateDiscoveryMetadata(context.Background(), tx, resource, expectedUpdateTime)
 		httpErr := requireResourceHTTPError(t, err, verrors.VegaBackend_Resource_UpdateConflict)
 		assert.Equal(t, http.StatusConflict, httpErr.HTTPCode)
 	})
@@ -162,7 +192,7 @@ func TestValidateIndexConfigBuildKeyFields(t *testing.T) {
 func TestResourceServiceCheckExistByID(t *testing.T) {
 	t.Run("check exist by idfound", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		mockRA.EXPECT().GetByID(gomock.Any(), "r1").
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(&interfaces.Resource{ID: "r1"}, nil)
 
 		exists, err := rs.CheckExistByID(context.Background(), "r1")
@@ -175,7 +205,7 @@ func TestResourceServiceCheckExistByID(t *testing.T) {
 	})
 	t.Run("check exist by idnot found", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		mockRA.EXPECT().GetByID(gomock.Any(), "missing").
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "missing").
 			Return(nil, nil)
 
 		exists, err := rs.CheckExistByID(context.Background(), "missing")
@@ -188,7 +218,7 @@ func TestResourceServiceCheckExistByID(t *testing.T) {
 	})
 	t.Run("check exist by iderror", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		mockRA.EXPECT().GetByID(gomock.Any(), "r1").
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(nil, fmt.Errorf("db error"))
 
 		_, err := rs.CheckExistByID(context.Background(), "r1")
@@ -230,7 +260,7 @@ func TestResourceServiceCheckExistByName(t *testing.T) {
 func TestResourceServiceGetByID(t *testing.T) {
 	t.Run("keeps resource when account name lookup fails", func(t *testing.T) {
 		rs, mockRA, mockPS, _, mockUMS, _, _ := newTestService(t)
-		mockRA.EXPECT().GetByID(gomock.Any(), "r1").
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(&interfaces.Resource{ID: "r1", Name: "test"}, nil)
 		mockPS.EXPECT().FilterResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE,
 			[]string{"r1"}, gomock.Any(), true, gomock.Any()).
@@ -249,7 +279,7 @@ func TestResourceServiceGetByID(t *testing.T) {
 	})
 	t.Run("get by idnot found", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		mockRA.EXPECT().GetByID(gomock.Any(), "missing").
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "missing").
 			Return(nil, nil)
 
 		_, err := rs.GetByID(context.Background(), "missing")
@@ -259,7 +289,7 @@ func TestResourceServiceGetByID(t *testing.T) {
 	})
 	t.Run("get by iddberror", func(t *testing.T) {
 		rs, mockRA, _, _, _, _, _ := newTestService(t)
-		mockRA.EXPECT().GetByID(gomock.Any(), "r1").
+		mockRA.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(nil, fmt.Errorf("db error"))
 
 		_, err := rs.GetByID(context.Background(), "r1")
@@ -269,7 +299,7 @@ func TestResourceServiceGetByID(t *testing.T) {
 	})
 	t.Run("bypasses view detail permission for internal resource with S2S marker", func(t *testing.T) {
 		rs, ra, _, ums := newS2STestService(t, []string{"cat-int"})
-		ra.EXPECT().GetByID(gomock.Any(), "r1").
+		ra.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(&interfaces.Resource{ID: "r1", CatalogID: "cat-int"}, nil)
 		ums.EXPECT().GetAccountNames(gomock.Any(), gomock.Any()).Return(nil)
 
@@ -283,7 +313,7 @@ func TestResourceServiceGetByID(t *testing.T) {
 	})
 	t.Run("rejects internal resource without S2S marker when permission filter returns empty", func(t *testing.T) {
 		rs, ra, ps, _ := newS2STestService(t, []string{"cat-int"})
-		ra.EXPECT().GetByID(gomock.Any(), "r1").
+		ra.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(&interfaces.Resource{ID: "r1", CatalogID: "cat-int"}, nil)
 		ps.EXPECT().FilterResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_INTERNAL_RESOURCE,
 			gomock.Any(), gomock.Any(), true, gomock.Any()).
@@ -302,7 +332,7 @@ func TestResourceServiceGetByID(t *testing.T) {
 	})
 	t.Run("keeps per-account auth for non-internal resource with S2S marker", func(t *testing.T) {
 		rs, ra, ps, _ := newS2STestService(t, []string{})
-		ra.EXPECT().GetByID(gomock.Any(), "r1").
+		ra.EXPECT().GetByID(gomock.Any(), nil, "r1").
 			Return(&interfaces.Resource{ID: "r1", CatalogID: "cat-user"}, nil)
 		ps.EXPECT().FilterResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE,
 			gomock.Any(), gomock.Any(), true, gomock.Any()).
@@ -836,13 +866,17 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 	})
 	t.Run("delete by ids success", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, _, mockBTA := newTestService(t)
+		ctrl := gomock.NewController(t)
+		mockLIM := vmock.NewMockLocalIndexManager(ctrl)
+		rs.lim = mockLIM
 		expectDeleteGrantedByCatalog(mockRA, mockPS, []string{"r1"}, "cat1")
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).
-			Return([]*interfaces.Resource{{ID: "r1", Category: "table"}}, nil)
+			Return([]*interfaces.Resource{{ID: "r1", Category: "table", LocalIndexName: "vega-build-r1-t1"}}, nil)
 		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
 		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil)
 		// 级联：无构建任务时 List 返回空，不再走 GetByResourceID 拦截
 		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return([]*interfaces.BuildTaskSummary{}, nil)
+		mockLIM.EXPECT().DeleteIndex(gomock.Any(), "vega-build-r1-t1").Return(nil)
 		err := rs.DeleteByIDs(context.Background(), []string{"r1"})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -855,11 +889,11 @@ func TestResourceServiceDeleteByIDs(t *testing.T) {
 		rs.lim = mockLIM
 		expectDeleteGrantedByCatalog(mockRA, mockPS, []string{"r1"}, "cat1")
 		mockRA.EXPECT().GetByIDs(gomock.Any(), []string{"r1"}).
-			Return([]*interfaces.Resource{{ID: "r1", Category: "table"}}, nil)
+			Return([]*interfaces.Resource{{ID: "r1", Category: "table", LocalIndexName: "vega-build-r1-t1"}}, nil)
 		// 一个已完成任务 t1 → 期望 drop 其索引并删任务行
 		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).
 			Return([]*interfaces.BuildTaskSummary{{ID: "t1", ResourceID: "r1", Status: "completed"}}, nil)
-		mockLIM.EXPECT().DeleteIndex(gomock.Any(), interfaces.BuildIndexName("r1", "t1")).Return(nil)
+		mockLIM.EXPECT().DeleteIndex(gomock.Any(), "vega-build-r1-t1").Return(nil)
 		mockBTA.EXPECT().DeleteByIDs(gomock.Any(), []string{"t1"}).Return(int64(1), nil)
 		mockRA.EXPECT().DeleteByIDs(gomock.Any(), []string{"r1"}).Return(nil)
 		mockPS.EXPECT().DeleteResources(gomock.Any(), interfaces.AUTH_RESOURCE_TYPE_RESOURCE, []string{"r1"}).Return(nil)
@@ -1125,7 +1159,7 @@ func TestResourceServiceUpdate(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
-	t.Run("update clears local index name when build relevant fields change", func(t *testing.T) {
+	t.Run("update marks available local index stale when build relevant fields change", func(t *testing.T) {
 		rs, mockRA, mockPS, _, _, mockCS, mockBTA := newTestService(t)
 		expectResourceServiceTransaction(t, rs, true)
 		mockPS.EXPECT().CheckPermission(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
@@ -1139,21 +1173,27 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
 		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any(), int64(0)).
 			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) (int64, error) {
-				if got.LocalIndexName != "" {
-					t.Fatalf("expected LocalIndexName to be cleared, got %q", got.LocalIndexName)
+				if got.LocalIndexName != "vega-build-r1-task-1" {
+					t.Fatalf("expected LocalIndexName to be preserved, got %q", got.LocalIndexName)
 				}
 				if len(got.SchemaDefinition) != 1 || len(got.SchemaDefinition[0].Features) != 1 {
 					t.Fatalf("expected updated schema features, got %#v", got.SchemaDefinition)
 				}
 				return 1, nil
 			})
-		mockRA.EXPECT().UpdateLocalIndexName(gomock.Any(), gomock.Not(nil), "r1", "").Return(nil)
+		mockRA.EXPECT().UpdateLocalIndexState(
+			gomock.Any(), gomock.Not(nil), "r1",
+			interfaces.ResourceLocalIndexStatusStale,
+			"vega-build-r1-task-1", "",
+		).Return(true, nil)
 		err := rs.Update(context.Background(), &interfaces.Resource{
 			ID:               "r1",
 			CatalogID:        "cat1",
 			Category:         interfaces.ResourceCategoryTable,
 			Name:             "table",
+			LocalIndexStatus: interfaces.ResourceLocalIndexStatusAvailable,
 			LocalIndexName:   "vega-build-r1-task-1",
+			SyncMark:         `{"mode":"batch","cursor":[1]}`,
 			SourceIdentifier: "public.orders",
 			SchemaDefinition: []*interfaces.Property{{Name: "id", Type: interfaces.DataType_String}},
 		}, &interfaces.ResourceRequest{
@@ -1227,16 +1267,14 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
 		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any(), int64(0)).
 			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) (int64, error) {
-				if got.LocalIndexName != "" {
-					t.Fatalf("expected LocalIndexName to be cleared, got %q", got.LocalIndexName)
+				if got.LocalIndexName != "vega-build-r1-task-1" {
+					t.Fatalf("expected LocalIndexName to be preserved, got %q", got.LocalIndexName)
 				}
 				if got.IndexConfig == nil || len(got.IndexConfig.BuildKeyFields) != 2 {
 					t.Fatalf("expected updated index config, got %#v", got.IndexConfig)
 				}
 				return 1, nil
 			})
-		mockRA.EXPECT().UpdateLocalIndexName(gomock.Any(), gomock.Not(nil), "r1", "").Return(nil)
-
 		err := rs.Update(context.Background(), &interfaces.Resource{
 			ID:               "r1",
 			CatalogID:        "cat1",
@@ -1320,8 +1358,6 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockBTA.EXPECT().InternalList(gomock.Any(), gomock.Any()).Return(nil, nil)
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
 		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any(), int64(0)).Return(int64(1), nil)
-		mockRA.EXPECT().UpdateLocalIndexName(gomock.Any(), gomock.Not(nil), "r1", "").Return(nil)
-
 		err := rs.Update(context.Background(), &interfaces.Resource{
 			ID:               "r1",
 			CatalogID:        "cat1",
@@ -1517,16 +1553,14 @@ func TestResourceServiceUpdate(t *testing.T) {
 		mockCS.EXPECT().CheckExistByID(gomock.Any(), "cat1").Return(true, nil)
 		mockRA.EXPECT().Update(gomock.Any(), gomock.Not(nil), gomock.Any(), int64(0)).
 			DoAndReturn(func(_ context.Context, _ *sql.Tx, got *interfaces.Resource, _ int64) (int64, error) {
-				if got.LocalIndexName != "" {
-					t.Fatalf("expected LocalIndexName to be cleared, got %q", got.LocalIndexName)
+				if got.LocalIndexName != "vega-build-r1-task-1" {
+					t.Fatalf("expected LocalIndexName to be preserved, got %q", got.LocalIndexName)
 				}
 				if len(got.SchemaDefinition) != 2 || got.SchemaDefinition[1].Name != "title" {
 					t.Fatalf("expected added dataset property, got %#v", got.SchemaDefinition)
 				}
 				return 1, nil
 			})
-		mockRA.EXPECT().UpdateLocalIndexName(gomock.Any(), gomock.Not(nil), "r1", "").Return(nil)
-
 		err := rs.Update(context.Background(), &interfaces.Resource{
 			ID:               "r1",
 			CatalogID:        "cat1",

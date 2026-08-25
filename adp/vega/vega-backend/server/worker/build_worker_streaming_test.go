@@ -31,7 +31,7 @@ func TestStreamingBuildWorkerRun(t *testing.T) {
 		task := &interfaces.BuildTask{
 			ID: "t1", ResourceID: "r1", Status: interfaces.BuildTaskStatusPending, Creator: creator,
 		}
-		rs.EXPECT().InternalGetByID(gomock.Any(), "r1").Return(&interfaces.Resource{ID: "r1", CatalogID: "c1"}, nil)
+		rs.EXPECT().InternalGetByID(gomock.Any(), nil, "r1").Return(&interfaces.Resource{ID: "r1", CatalogID: "c1"}, nil)
 
 		var gotAccount interfaces.AccountInfo
 		var hasAccount bool
@@ -58,7 +58,7 @@ func TestStreamingBuildWorkerRun(t *testing.T) {
 		task := &interfaces.BuildTask{
 			ID: "t1", ResourceID: "r1", Status: interfaces.BuildTaskStatusPending,
 		}
-		rs.EXPECT().InternalGetByID(gomock.Any(), "r1").Return(nil, nil)
+		rs.EXPECT().InternalGetByID(gomock.Any(), nil, "r1").Return(nil, nil)
 		bts.EXPECT().InternalMarkCancelled(gomock.Any(), "t1", "resource deleted").Return(true, nil)
 
 		require.NoError(t, worker.Run(context.Background(), task))
@@ -74,14 +74,14 @@ func TestStreamingBuildWorkerRun(t *testing.T) {
 		task := &interfaces.BuildTask{
 			ID: "t1", ResourceID: "r1", Status: interfaces.BuildTaskStatusPending,
 		}
-		rs.EXPECT().InternalGetByID(gomock.Any(), "r1").Return(&interfaces.Resource{ID: "r1", CatalogID: "c1"}, nil)
+		rs.EXPECT().InternalGetByID(gomock.Any(), nil, "r1").Return(&interfaces.Resource{ID: "r1", CatalogID: "c1"}, nil)
 		cs.EXPECT().InternalGetByID(gomock.Any(), "c1", true).Return(&interfaces.Catalog{
 			ID:            "c1",
 			Enabled:       true,
 			ConnectorType: interfaces.ConnectorTypePostgreSQL,
 			ConnectorCfg:  interfaces.ConnectorConfig{},
 		}, nil)
-		bts.EXPECT().InternalMarkFailed(gomock.Any(), "t1", "PostgreSQL streaming build requires connector_config.database").
+		bts.EXPECT().InternalMarkFailed(gomock.Any(), nil, "t1", "PostgreSQL streaming build requires connector_config.database").
 			Return(true, nil)
 
 		require.NoError(t, sh.Run(context.Background(), task))
@@ -145,7 +145,7 @@ func TestHandleUpdateOperationWritesReplacementBeforeDeletingOldDocument(t *test
 	ctrl := gomock.NewController(t)
 	lim := vmock.NewMockLocalIndexManager(ctrl)
 	worker := &streamingBuildWorker{lim: lim}
-	buildTask := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{BuildKeyFields: []string{"id"}}}
+	buildTask := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{BuildKeyFields: []string{"id"}}}}
 	oldID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 1}})
 	require.NoError(t, err)
 	newID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 2}})
@@ -170,7 +170,7 @@ func TestHandleUpdateOperationKeepsOldDocumentWhenReplacementWriteFails(t *testi
 	ctrl := gomock.NewController(t)
 	lim := vmock.NewMockLocalIndexManager(ctrl)
 	worker := &streamingBuildWorker{lim: lim}
-	buildTask := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{BuildKeyFields: []string{"id"}}}
+	buildTask := &interfaces.BuildTask{IndexConfig: &interfaces.BuildTaskIndexConfig{IndexConfigContract: interfaces.IndexConfigContract{BuildKeyFields: []string{"id"}}}}
 	newID, err := generateDocumentID([]interfaces.KeyValue{{Key: "id", Value: 2}})
 	require.NoError(t, err)
 

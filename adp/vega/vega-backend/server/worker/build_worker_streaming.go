@@ -89,7 +89,7 @@ func (sbw *streamingBuildWorker) Run(ctx context.Context, buildTaskInfo *interfa
 	logger.Infof("Starting build for task: %s, resource: %s", taskID, resourceID)
 
 	// Get resource info
-	resource, err := sbw.rs.InternalGetByID(ctx, resourceID)
+	resource, err := sbw.rs.InternalGetByID(ctx, nil, resourceID)
 	if err != nil {
 		logger.Errorf("Failed to get resource for task %s: %v", taskID, err)
 		return err
@@ -116,7 +116,7 @@ func (sbw *streamingBuildWorker) Run(ctx context.Context, buildTaskInfo *interfa
 	}
 	if !catalog.Enabled {
 		logger.Errorf("Catalog is disabled for task %s, catalogID: %s", buildTaskInfo.ID, resource.CatalogID)
-		_, err = sbw.bts.InternalMarkFailed(ctx, buildTaskInfo.ID, "catalog is disabled")
+		_, err = sbw.bts.InternalMarkFailed(ctx, nil, buildTaskInfo.ID, "catalog is disabled")
 		if err != nil {
 			return fmt.Errorf("update build task status failed: %w", err)
 		}
@@ -124,7 +124,7 @@ func (sbw *streamingBuildWorker) Run(ctx context.Context, buildTaskInfo *interfa
 	}
 	if catalog.ConnectorType != interfaces.ConnectorTypeMySQL && catalog.ConnectorType != interfaces.ConnectorTypePostgreSQL {
 		logger.Errorf("Streaming build only supports MySQL and PostgreSQL connectors. Unsupported connector type: %s", catalog.ConnectorType)
-		_, err = sbw.bts.InternalMarkFailed(ctx, buildTaskInfo.ID, "unsupported connector type")
+		_, err = sbw.bts.InternalMarkFailed(ctx, nil, buildTaskInfo.ID, "unsupported connector type")
 		if err != nil {
 			return fmt.Errorf("update build task status failed: %w", err)
 		}
@@ -136,13 +136,13 @@ func (sbw *streamingBuildWorker) Run(ctx context.Context, buildTaskInfo *interfa
 	database, err := streamingDatabase(catalog)
 	if err != nil {
 		logger.Errorf("Invalid streaming connector configuration for task %s: %v", taskID, err)
-		if _, updateErr := sbw.bts.InternalMarkFailed(ctx, taskID, err.Error()); updateErr != nil {
+		if _, updateErr := sbw.bts.InternalMarkFailed(ctx, nil, taskID, err.Error()); updateErr != nil {
 			return fmt.Errorf("update build task status failed: %w", updateErr)
 		}
 		return nil
 	}
 
-	indexName := getIndexName(resource.ID, buildTaskInfo.ID)
+	indexName := logics.BuildIndexName(resource.ID, buildTaskInfo.ID)
 	err = createManagedLocalIndex(ctx, sbw.lim, indexName, buildTaskInfo, resource)
 	if err != nil {
 		return fmt.Errorf("create local index failed: %w", err)
@@ -150,7 +150,7 @@ func (sbw *streamingBuildWorker) Run(ctx context.Context, buildTaskInfo *interfa
 	// Execute build
 	err = sbw.executeBuild(ctx, catalog, resource, buildTaskInfo, indexName, database, sourceIdentifier)
 	if err != nil {
-		_, _ = sbw.bts.InternalMarkFailed(ctx, taskID, err.Error())
+		_, _ = sbw.bts.InternalMarkFailed(ctx, nil, taskID, err.Error())
 		return err
 	}
 

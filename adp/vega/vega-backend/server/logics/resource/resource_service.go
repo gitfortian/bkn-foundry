@@ -493,6 +493,7 @@ func (rs *resourceService) Create(ctx context.Context, req *interfaces.ResourceR
 		SourceMetadata:   req.SourceMetadata,
 		SchemaDefinition: req.SchemaDefinition,
 		IndexConfig:      req.IndexConfig,
+		LocalIndexStatus: interfaces.ResourceLocalIndexStatusUnavailable,
 		LogicType:        logicType,
 		LogicDefinition:  req.LogicDefinition,
 		Creator:          accountInfo,
@@ -572,7 +573,7 @@ func (rs *resourceService) GetByID(ctx context.Context, id string) (*interfaces.
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Get resource")
 	defer span.End()
 
-	resource, err := rs.ra.GetByID(ctx, id)
+	resource, err := rs.ra.GetByID(ctx, nil, id)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get resource failed")
 		return nil, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
@@ -637,7 +638,7 @@ func (rs *resourceService) CheckResourcePermission(ctx context.Context, resource
 		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_ID).
 			WithErrorDetails("resource_id is required")
 	}
-	resource, err := rs.ra.GetByID(ctx, resourceID)
+	resource, err := rs.ra.GetByID(ctx, nil, resourceID)
 	if err != nil {
 		span.SetStatus(codes.Error, "Get resource failed")
 		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
@@ -664,11 +665,11 @@ func (rs *resourceService) CheckResourcePermission(ctx context.Context, resource
 	return rs.checkResourceOrCatalog(ctx, resource.ID, resource.CatalogID, parentInternal, op)
 }
 
-func (rs *resourceService) InternalGetByID(ctx context.Context, id string) (*interfaces.Resource, error) {
+func (rs *resourceService) InternalGetByID(ctx context.Context, tx *sql.Tx, id string) (*interfaces.Resource, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "ResourceService.InternalGetByID")
 	defer span.End()
 
-	return rs.ra.GetByID(ctx, id)
+	return rs.ra.GetByID(ctx, tx, id)
 }
 
 // InternalGetByIDs is used by the server to batch read the basic information of resources internally without performing permission filtering or loading extended fields.
@@ -970,6 +971,15 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 			return err
 		}
 	}
+	previousFingerprint := ""
+	if buildRelevantChanged {
+		previousFingerprint, err = ResourceIndexConfigFingerprint(resource)
+		if err != nil {
+			span.SetStatus(codes.Error, "Fingerprint current resource index config failed")
+			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+				WithErrorDetails(fmt.Sprintf("invalid current resource index configuration: %v", err))
+		}
+	}
 
 	switch resource.Category {
 	case interfaces.ResourceCategoryLogicView:
@@ -1012,6 +1022,15 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 			return err
 		}
 	}
+	currentFingerprint := ""
+	if buildRelevantChanged {
+		currentFingerprint, err = ResourceIndexConfigFingerprint(resource)
+		if err != nil {
+			span.SetStatus(codes.Error, "Fingerprint updated resource index config failed")
+			return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+				WithErrorDetails(fmt.Sprintf("invalid updated resource index configuration: %v", err))
+		}
+	}
 
 	// Check if the catalog exists
 	exists, err := rs.cs.CheckExistByID(ctx, req.CatalogID)
@@ -1026,9 +1045,6 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 	resource.Name = req.Name
 	resource.Tags = req.Tags
 	resource.Description = req.Description
-	if buildRelevantChanged {
-		resource.LocalIndexName = ""
-	}
 
 	// Get account info
 	accountInfo := interfaces.AccountInfo{}
@@ -1061,15 +1077,21 @@ func (rs *resourceService) Update(ctx context.Context, resource *interfaces.Reso
 		span.SetStatus(codes.Error, "Resource update conflict")
 		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Resource_UpdateConflict)
 	}
-	if buildRelevantChanged {
-		if err := rs.ra.UpdateLocalIndexName(ctx, tx, resource.ID, ""); err != nil {
-			span.SetStatus(codes.Error, "Clear resource local index name failed")
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
-				verrors.VegaBackend_Resource_InternalError_UpdateFailed).
-				WithErrorDetails("failed to clear resource local index name")
+	if buildRelevantChanged && previousFingerprint != currentFingerprint &&
+		resource.LocalIndexStatus == interfaces.ResourceLocalIndexStatusAvailable {
+		updated, err := rs.ra.UpdateLocalIndexState(ctx, tx, resource.ID,
+			interfaces.ResourceLocalIndexStatusStale, resource.LocalIndexName, "")
+		if err != nil || !updated {
+			span.SetStatus(codes.Error, "Mark resource local index stale failed")
+			if err != nil {
+				otellog.LogError(ctx, "Mark resource local index stale failed", err)
+			}
+			return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+				WithErrorDetails("failed to mark resource local index stale")
 		}
+		resource.LocalIndexStatus = interfaces.ResourceLocalIndexStatusStale
+		resource.SyncMark = ""
 	}
-
 	if req.Extensions != nil {
 		if err := entityextension.NewStore(rs.appSetting).Replace(ctx, tx, entityextension.KindResource, resource.ID, *req.Extensions); err != nil {
 			span.SetStatus(codes.Error, "Replace resource extensions failed")
@@ -1165,11 +1187,11 @@ func (rs *resourceService) DeleteByIDs(ctx context.Context, ids []string) error 
 	for _, resource := range resources {
 		switch resource.Category {
 		case interfaces.ResourceCategoryTable:
-			// Cascade clear all build tasks of this resource + corresponding OpenSearch index (including historical orphans).
+			// Cascade clear all build tasks, the Resource-owned current index, and task-derived indexes.
 			// Now, when resources are deleted, tasks/indexes will also be deleted (dangerous operations will be confirmed and checked by the front end for the second time).
-			// Tasks that are running or stopped will be rejected by cascade (HasRunningExecution), and users need to stop them first before deleting them.
+			// Tasks that are running or stopping will be rejected by cascade (HasRunningExecution), and users need to stop them first before deleting them.
 			if err := logics.CascadeDeleteBuildTasks(ctx, rs.bta, rs.lim,
-				interfaces.BuildTasksQueryParams{ResourceID: resource.ID}); err != nil {
+				interfaces.BuildTasksQueryParams{ResourceID: resource.ID}, resource.LocalIndexName); err != nil {
 				span.SetStatus(codes.Error, "Cascade delete build tasks failed")
 				return err
 			}
@@ -1210,7 +1232,7 @@ func (rs *resourceService) CheckExistByID(ctx context.Context, id string) (bool,
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "Check resource exist by ID")
 	defer span.End()
 
-	resource, err := rs.ra.GetByID(ctx, id)
+	resource, err := rs.ra.GetByID(ctx, nil, id)
 	if err != nil {
 		span.SetStatus(codes.Error, "GetByID failed")
 		return false, rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_GetFailed).
@@ -1244,6 +1266,20 @@ func (rs *resourceService) InternalUpdateLocalIndexName(ctx context.Context, tx 
 	return rs.ra.UpdateLocalIndexName(ctx, tx, id, localIndexName)
 }
 
+func (rs *resourceService) InternalUpdateLocalIndexState(
+	ctx context.Context,
+	tx *sql.Tx,
+	id string,
+	localIndexStatus string,
+	localIndexName string,
+	syncMark string,
+) (bool, error) {
+	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "ResourceService.InternalUpdateLocalIndexState")
+	defer span.End()
+
+	return rs.ra.UpdateLocalIndexState(ctx, tx, id, localIndexStatus, localIndexName, syncMark)
+}
+
 func (rs *resourceService) InternalUpdateSemanticMetadata(ctx context.Context,
 	tx *sql.Tx, resource *interfaces.Resource, expectedUpdateTime int64) error {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "ResourceService.InternalUpdateSemanticMetadata")
@@ -1264,12 +1300,75 @@ func (rs *resourceService) InternalUpdateDiscoveryMetadata(ctx context.Context, 
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "ResourceService.InternalUpdateDiscoveryMetadata")
 	defer span.End()
 
+	if resource == nil {
+		span.SetStatus(codes.Error, "Resource is required")
+		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+	}
+	ownedTx := false
+	if tx == nil {
+		var err error
+		tx, err = rs.db.BeginTx(ctx, nil)
+		if err != nil {
+			span.SetStatus(codes.Error, "Begin discovery metadata transaction failed")
+			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+				WithErrorDetails("failed to update discovery metadata")
+		}
+		ownedTx = true
+		defer func() { _ = tx.Rollback() }()
+	}
+
+	current, err := rs.ra.GetByID(ctx, tx, resource.ID)
+	if err != nil {
+		span.SetStatus(codes.Error, "Read resource for discovery metadata update failed")
+		return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+			verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+			WithErrorDetails("failed to update discovery metadata")
+	}
+	if current == nil {
+		span.SetStatus(codes.Error, "Resource not found")
+		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
+	}
+	previousFingerprint, err := ResourceIndexConfigFingerprint(current)
+	if err != nil {
+		span.SetStatus(codes.Error, "Fingerprint current discovered resource failed")
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails(fmt.Sprintf("invalid current resource index configuration: %v", err))
+	}
+	currentFingerprint, err := ResourceIndexConfigFingerprint(resource)
+	if err != nil {
+		span.SetStatus(codes.Error, "Fingerprint discovered resource failed")
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails(fmt.Sprintf("invalid discovered resource index configuration: %v", err))
+	}
+
 	rowsAffected, err := rs.ra.UpdateDiscoveryMetadata(ctx, tx, resource, expectedUpdateTime)
 	if err != nil {
 		return err
 	}
 	if rowsAffected == 0 {
 		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_Resource_UpdateConflict)
+	}
+	if previousFingerprint != currentFingerprint && current.LocalIndexStatus == interfaces.ResourceLocalIndexStatusAvailable {
+		updated, err := rs.ra.UpdateLocalIndexState(ctx, tx, current.ID,
+			interfaces.ResourceLocalIndexStatusStale, current.LocalIndexName, "")
+		if err != nil || !updated {
+			span.SetStatus(codes.Error, "Mark discovered resource local index stale failed")
+			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+				WithErrorDetails("failed to mark resource local index stale")
+		}
+		resource.LocalIndexStatus = interfaces.ResourceLocalIndexStatusStale
+		resource.LocalIndexName = current.LocalIndexName
+		resource.SyncMark = ""
+	}
+	if ownedTx {
+		if err := tx.Commit(); err != nil {
+			span.SetStatus(codes.Error, "Commit discovery metadata transaction failed")
+			return rest.NewHTTPError(ctx, http.StatusInternalServerError,
+				verrors.VegaBackend_Resource_InternalError_UpdateFailed).
+				WithErrorDetails("failed to update discovery metadata")
+		}
 	}
 	return nil
 }
@@ -1312,6 +1411,7 @@ func (rs *resourceService) InternalCreate(ctx context.Context, tx *sql.Tx, req *
 		SourceMetadata:   req.SourceMetadata,
 		SchemaDefinition: req.SchemaDefinition,
 		IndexConfig:      req.IndexConfig,
+		LocalIndexStatus: interfaces.ResourceLocalIndexStatusUnavailable,
 		LogicType:        logicType,
 		LogicDefinition:  req.LogicDefinition,
 		Creator:          accountInfo,

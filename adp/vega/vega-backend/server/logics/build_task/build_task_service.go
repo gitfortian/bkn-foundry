@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +31,8 @@ import (
 	"vega-backend/logics/catalog"
 	"vega-backend/logics/local_index"
 	model_factory "vega-backend/logics/model_factory"
+	resourcelogic "vega-backend/logics/resource"
+	"vega-backend/logics/sync_checkpoint"
 	"vega-backend/logics/user_mgmt"
 )
 
@@ -129,6 +130,12 @@ func (bts *buildTaskService) Create(ctx context.Context, req *interfaces.CreateB
 	if err := validateBuildKeyFields(ctx, resource); err != nil {
 		span.SetStatus(codes.Error, "Invalid build key fields")
 		return "", err
+	}
+	if executeType == interfaces.BuildTaskExecuteTypeIncremental {
+		if err := validateIncrementalBaseline(ctx, resource); err != nil {
+			span.SetStatus(codes.Error, "Incremental baseline unavailable")
+			return "", err
+		}
 	}
 	req.ExecuteType = executeType
 
@@ -395,8 +402,28 @@ func (bts *buildTaskService) fillBuildTaskIndexSnapshot(ctx context.Context, res
 		}
 	}
 
-	if len(buildTask.IndexConfig.Features) == 0 && len(buildTask.IndexConfig.BuildKeyFields) == 0 {
-		buildTask.IndexConfig = nil
+	fields, err := resourcelogic.SnapshotBuildTaskIndexConfigFields(resource)
+	if err != nil {
+		return rest.NewHTTPError(ctx, http.StatusBadRequest, verrors.VegaBackend_InvalidParameter_RequestBody).
+			WithErrorDetails(fmt.Sprintf("invalid resource index configuration: %v", err))
+	}
+	buildTask.IndexConfig.Fields = fields
+	return nil
+}
+
+func validateIncrementalBaseline(ctx context.Context, resource *interfaces.Resource) error {
+	if !interfaces.HasAvailableLocalIndex(resource) || resource.SyncMark == "" {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
+			WithErrorDetails("incremental build requires an available local index and committed checkpoint")
+	}
+	checkpoint, err := sync_checkpoint.DecodeBatch(resource.SyncMark)
+	if err != nil {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
+			WithErrorDetails(fmt.Sprintf("invalid incremental checkpoint: %v", err))
+	}
+	if err := sync_checkpoint.ValidateCursor(checkpoint, resource.IndexConfig.BuildKeyFields, resource.SchemaDefinition); err != nil {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalBaselineUnavailable).
+			WithErrorDetails(fmt.Sprintf("invalid incremental checkpoint: %v", err))
 	}
 	return nil
 }
@@ -480,18 +507,20 @@ func (bts *buildTaskService) InternalSetProgress(
 	return bts.bta.SetProgress(ctx, tx, id, progress, time.Now().UnixMilli())
 }
 
-func (bts *buildTaskService) InternalMarkRunning(ctx context.Context, id string) (bool, error) {
+func (bts *buildTaskService) InternalMarkRunning(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "BuildTaskService.InternalMarkRunning")
 	defer span.End()
 
-	return bts.bta.MarkRunning(ctx, id, time.Now().UnixMilli())
+	return bts.bta.MarkRunning(ctx, tx, id, time.Now().UnixMilli())
 }
 
-func (bts *buildTaskService) InternalMarkFailed(ctx context.Context, id, detail string) (bool, error) {
+func (bts *buildTaskService) InternalMarkFailed(
+	ctx context.Context, tx *sql.Tx, id, detail string,
+) (bool, error) {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "BuildTaskService.InternalMarkFailed")
 	defer span.End()
 
-	return bts.bta.MarkFailed(ctx, id, detail, time.Now().UnixMilli())
+	return bts.bta.MarkFailed(ctx, tx, id, detail, time.Now().UnixMilli())
 }
 
 func (bts *buildTaskService) InternalMarkCancelled(ctx context.Context, id, detail string) (bool, error) {
@@ -718,6 +747,10 @@ func (bts *buildTaskService) Start(ctx context.Context, taskID string, reset boo
 		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
 			WithErrorDetails(fmt.Sprintf("cannot start task in status: %s", buildTask.Status))
 	}
+	if reset && buildTask.ExecuteType == interfaces.BuildTaskExecuteTypeIncremental {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IncrementalResetUnsupported).
+			WithErrorDetails("incremental build tasks cannot be reset")
+	}
 
 	cat, err := bts.cs.GetByID(ctx, buildTask.CatalogID, false)
 	if err != nil {
@@ -779,36 +812,30 @@ func (bts *buildTaskService) validateStartBuildTaskStillCurrent(ctx context.Cont
 	if resource == nil {
 		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_Resource_NotFound)
 	}
-
-	currentSnapshot := &interfaces.BuildTask{ResourceID: resource.ID, CatalogID: resource.CatalogID}
-	if err := bts.fillBuildTaskIndexSnapshot(ctx, resource, currentSnapshot); err != nil {
-		return err
-	}
-	if !reflect.DeepEqual(buildTask.IndexConfig, currentSnapshot.IndexConfig) {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
-			WithErrorDetails("resource index config has changed; create a new build task instead")
-	}
 	if err := validateBuildKeyFields(ctx, resource); err != nil {
 		return err
 	}
 
-	tasks, err := bts.InternalList(ctx, interfaces.BuildTasksQueryParams{
-		PaginationQueryParams: interfaces.PaginationQueryParams{
-			Limit:     1,
-			Sort:      interfaces.BuildTaskSortCreateTime,
-			Direction: interfaces.DESC_DIRECTION,
-		},
-		ResourceID: buildTask.ResourceID,
-		Statuses:   []string{interfaces.BuildTaskStatusCompleted},
-	})
-	if err != nil {
-		otellog.LogError(ctx, "Check latest completed build task failed", err)
-		return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
-			WithErrorDetails(err.Error())
+	if buildTask.IndexConfig == nil {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+			WithErrorDetails("build task has no index config snapshot; create a new build task instead")
 	}
-	if len(tasks) > 0 && tasks[0].ID != buildTask.ID && tasks[0].CreateTime > buildTask.CreateTime {
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_InvalidStateTransition).
-			WithErrorDetails("resource already has a newer completed build task")
+	taskFingerprint, err := resourcelogic.BuildTaskIndexConfigFingerprint(buildTask.IndexConfig)
+	if err != nil {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+			WithErrorDetails(fmt.Sprintf("invalid build task index config snapshot: %v", err))
+	}
+	currentFingerprint, err := resourcelogic.ResourceIndexConfigFingerprint(resource)
+	if err != nil {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+			WithErrorDetails(fmt.Sprintf("invalid current resource index configuration: %v", err))
+	}
+	if taskFingerprint != currentFingerprint {
+		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_IndexConfigChanged).
+			WithErrorDetails("resource index config has changed; create a new build task instead")
+	}
+	if buildTask.ExecuteType == interfaces.BuildTaskExecuteTypeIncremental {
+		return validateIncrementalBaseline(ctx, resource)
 	}
 	return nil
 }
@@ -869,12 +896,11 @@ func (bts *buildTaskService) Stop(ctx context.Context, taskID string) error {
 //   - Input IDs are de-duplicated while preserving their first-seen order.
 //   - Loads each id; if any missing, returns 404 BuildTask.NotFound with {missing_ids: [...]}
 //     unless ignoreMissing=true (then missing ids are dropped from the delete set).
-//   - If any task is in running/stopping status, returns 409 HasRunningExecution with {running_ids: [...]}.
-//     This check cannot be bypassed.
-//   - If any task owns the resource's current LocalIndexName, returns 409 ActiveIndexInUse
-//     unless deleteActiveIndex=true. When deleteActiveIndex=true, clears LocalIndexName before deleting.
-//   - Deletes all validated task rows in one database statement after dropping their indexes.
-func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool, deleteActiveIndex bool) error {
+//   - If any task is pending/running/stopping, returns 409 HasRunningExecution with {active_ids: [...]}.
+//     Pending tasks must be stopped before deletion; this check cannot be bypassed.
+//   - Deletes all validated terminal task rows in one database statement without changing Resource state
+//     or deleting OpenSearch indexes.
+func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, ignoreMissing bool) error {
 	ctx, span := oteltrace.StartNamedInternalSpan(ctx, "BuildTaskService.DeleteByIDs")
 	defer span.End()
 
@@ -890,9 +916,7 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 
 	toDelete := make([]*interfaces.BuildTask, 0, len(uniqueIDs))
 	missingIDs := make([]string, 0)
-	runningIDs := make([]string, 0)
-	activeIndexes := make([]map[string]string, 0)
-	activeResources := make(map[string]*interfaces.Resource)
+	activeIDs := make([]string, 0)
 
 	for _, id := range uniqueIDs {
 		buildTask, err := bts.bta.GetByID(ctx, id)
@@ -913,67 +937,30 @@ func (bts *buildTaskService) DeleteByIDs(ctx context.Context, ids []string, igno
 			span.SetStatus(codes.Error, "Permission denied")
 			return err
 		}
-		if buildTask.Status == interfaces.BuildTaskStatusRunning || buildTask.Status == interfaces.BuildTaskStatusStopping {
-			runningIDs = append(runningIDs, id)
+		switch buildTask.Status {
+		case interfaces.BuildTaskStatusCompleted,
+			interfaces.BuildTaskStatusFailed,
+			interfaces.BuildTaskStatusStopped,
+			interfaces.BuildTaskStatusCancelled:
+			toDelete = append(toDelete, buildTask)
+		default:
+			activeIDs = append(activeIDs, id)
 			continue
 		}
-		resource, err := bts.rs.GetByID(ctx, buildTask.ResourceID)
-		if err != nil {
-			span.SetStatus(codes.Error, "Get resource failed")
-			return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_BuildTask_InternalError_GetFailed).
-				WithErrorDetails(err.Error())
-		}
-		if resource != nil {
-			idx := interfaces.BuildIndexName(buildTask.ResourceID, buildTask.ID)
-			if resource.LocalIndexName == idx {
-				activeIndexes = append(activeIndexes, map[string]string{
-					"resource_id":   buildTask.ResourceID,
-					"build_task_id": buildTask.ID,
-					"index_name":    idx,
-				})
-				activeResources[buildTask.ID] = resource
-			}
-		}
-		toDelete = append(toDelete, buildTask)
 	}
 
-	if len(runningIDs) > 0 {
-		span.SetStatus(codes.Error, "Some tasks are running or stopping")
+	if len(activeIDs) > 0 {
+		span.SetStatus(codes.Error, "Some tasks are active")
 		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_HasRunningExecution).
-			WithErrorDetails(map[string]any{"running_ids": runningIDs})
+			WithErrorDetails(map[string]any{"active_ids": activeIDs})
 	}
 	if len(missingIDs) > 0 && !ignoreMissing {
 		span.SetStatus(codes.Error, "Some build tasks not found")
 		return rest.NewHTTPError(ctx, http.StatusNotFound, verrors.VegaBackend_BuildTask_NotFound).
 			WithErrorDetails(map[string]any{"missing_ids": missingIDs})
 	}
-	if len(activeIndexes) > 0 && !deleteActiveIndex {
-		span.SetStatus(codes.Error, "Some build task indexes are currently used by resources")
-		return rest.NewHTTPError(ctx, http.StatusConflict, verrors.VegaBackend_BuildTask_ActiveIndexInUse).
-			WithErrorDetails(map[string]any{"active_indexes": activeIndexes})
-	}
-	if deleteActiveIndex {
-		for taskID, resource := range activeResources {
-			if err := bts.rs.InternalUpdateLocalIndexName(ctx, nil, resource.ID, ""); err != nil {
-				span.SetStatus(codes.Error, "Clear active local index failed")
-				return rest.NewHTTPError(ctx, http.StatusInternalServerError, verrors.VegaBackend_Resource_InternalError_UpdateFailed).
-					WithErrorDetails(map[string]any{
-						"build_task_id": taskID,
-						"resource_id":   resource.ID,
-						"error":         err.Error(),
-					})
-			}
-		}
-	}
-
 	deleteIDs := make([]string, 0, len(toDelete))
 	for _, bt := range toDelete {
-		// Drop the index on a best-effort basis before deleting the task row, consistent with resource and catalog cascades.
-		// Semantic consistency is maintained to prevent the deletion of a single UI task from leaving an orphan index (#66 only covers the two paths of resources and directories).
-		idx := interfaces.BuildIndexName(bt.ResourceID, bt.ID)
-		if err := bts.lim.DeleteIndex(ctx, idx); err != nil {
-			otellog.LogError(ctx, fmt.Sprintf("Drop index %s for build task %s failed", idx, bt.ID), err)
-		}
 		deleteIDs = append(deleteIDs, bt.ID)
 	}
 	if len(deleteIDs) == 0 {

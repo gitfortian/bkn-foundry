@@ -39,13 +39,23 @@ Solution = "Check current task status; start requires status in {stopped, failed
 ErrorLink = ""
 
 [VegaBackend.BuildTask.HasRunningExecution]
-Description = "Build task has running execution and cannot be deleted"
-Solution = "Stop the task before deleting it"
+Description = "Active build task cannot be deleted"
+Solution = "Stop pending or running tasks and wait for stopping tasks to stop before deleting them"
 ErrorLink = ""
 
-[VegaBackend.BuildTask.ActiveIndexInUse]
-Description = "Build task index is currently the resource's active local index"
-Solution = "Pass delete_active_index=true to confirm deleting the active local index, or keep the default protection"
+[VegaBackend.BuildTask.IncrementalBaselineUnavailable]
+Description = "Resource has no usable incremental synchronization baseline"
+Solution = "Complete a full batch build first to establish an available index and synchronization checkpoint"
+ErrorLink = ""
+
+[VegaBackend.BuildTask.IncrementalResetUnsupported]
+Description = "Incremental build tasks do not support reset"
+Solution = "Use reset=false to continue from the Resource checkpoint, or create a full batch task to rebuild from the beginning"
+ErrorLink = ""
+
+[VegaBackend.BuildTask.IndexConfigChanged]
+Description = "Resource index build configuration has changed"
+Solution = "Create a new build task from the Resource's current configuration"
 ErrorLink = ""
 
 [VegaBackend.BuildTask.InternalError.CreateFailed]
