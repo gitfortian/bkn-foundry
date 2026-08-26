@@ -80,13 +80,6 @@ func (r *restHandler) listResources(c *gin.Context, visitor hydra.Visitor) {
 		rest.ReplyError(c, httpErr)
 		return
 	}
-	pageParam.Sort = interfaces.RESOURCE_SORT[sort]
-
-	extKeys := c.QueryArray("extension_key")
-	extVals := c.QueryArray("extension_value")
-	includeExt := strings.EqualFold(strings.TrimSpace(c.Query("include_extensions")), "true")
-	includeExtKeys := strings.TrimSpace(c.Query("include_extension_keys"))
-
 	params := interfaces.ResourcesQueryParams{
 		PaginationQueryParams: pageParam,
 		Name:                  name,
@@ -94,10 +87,6 @@ func (r *restHandler) listResources(c *gin.Context, visitor hydra.Visitor) {
 		Category:              category,
 		Status:                status,
 		Schema:                schema,
-		ExtensionKeys:         extKeys,
-		ExtensionValues:       extVals,
-		IncludeExtensions:     includeExt,
-		IncludeExtensionKeys:  includeExtKeys,
 	}
 
 	if err := ValidateResourceListQueryParams(ctx, params); err != nil {

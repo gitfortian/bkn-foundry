@@ -16,37 +16,42 @@ const (
 	ResourceCategoryIndex     string = "index"
 	ResourceCategoryLogicView string = "logicview"
 	ResourceCategoryDataset   string = "dataset"
-)
 
-const (
+	ResourceSortName       string = "name"
+	ResourceSortCreateTime string = "create_time"
+	ResourceSortUpdateTime string = "update_time"
+
 	ResourceStatusActive     string = "active"
 	ResourceStatusDisabled   string = "disabled"
 	ResourceStatusDeprecated string = "deprecated"
 	ResourceStatusStale      string = "stale"
-)
 
-const (
 	ResourceLocalIndexStatusUnavailable string = "unavailable"
 	ResourceLocalIndexStatusAvailable   string = "available"
 	ResourceLocalIndexStatusStale       string = "stale"
-)
 
-const (
 	DiscoverStatusNew       string = "new"
 	DiscoverStatusUnchanged string = "unchanged"
 	DiscoverStatusUpdated   string = "updated"
 	DiscoverStatusRestored  string = "restored"
 	DiscoverStatusMissing   string = "missing"
 	DiscoverStatusError     string = "error"
+
+	// The maximum length of the Property field name, display name, remarks, feature name, and feature remarks
+	MaxLength_PropertyName               = 255
+	MaxLength_PropertyDisplayName        = 255
+	MaxLength_PropertyFeatureName        = 255
+	MaxLength_PropertyDescription        = 1000
+	MaxLength_PropertyFeatureDescription = 1000
 )
 
-var (
-	RESOURCE_SORT = map[string]string{
-		"name":        "f_name",
-		"create_time": "f_create_time",
-		"update_time": "f_update_time",
-	}
-)
+// RESOURCE_SORT is a whitelist of supported API sort fields. The data access
+// layer maps these fields to database columns.
+var RESOURCE_SORT = map[string]string{
+	ResourceSortName:       "",
+	ResourceSortCreateTime: "",
+	ResourceSortUpdateTime: "",
+}
 
 // Resource represents a Data Resource entity.
 type Resource struct {
@@ -78,9 +83,6 @@ type Resource struct {
 	ColumnCount *int   `json:"column_count,omitempty"` // Number of schema_definition fields
 	RowCount    *int64 `json:"row_count,omitempty"`    // Source row count (the most recent estimated snapshot from discover, available only for some resource categories)
 
-	// Extensions root-level retrievable business KV (t_entity_extension); The list is omitted by default
-	Extensions map[string]string `json:"extensions,omitempty"`
-
 	// Fields specific to the logical view
 	LogicType       string                 `json:"logic_type,omitempty"`       // Logical types: derived(derived), composite(composite
 	LogicDefinition []*LogicDefinitionNode `json:"logic_definition,omitempty"` // Logical definition
@@ -92,15 +94,6 @@ type Resource struct {
 
 	Operations []string `json:"operations"`
 }
-
-const (
-	// The maximum length of the Property field name, display name, remarks, feature name, and feature remarks
-	MaxLength_PropertyName               = 255
-	MaxLength_PropertyDisplayName        = 255
-	MaxLength_PropertyFeatureName        = 255
-	MaxLength_PropertyDescription        = 1000
-	MaxLength_PropertyFeatureDescription = 1000
-)
 
 type Property struct {
 	Name        string `json:"name"`
@@ -114,8 +107,6 @@ type Property struct {
 
 	Features   []PropertyFeature `json:"features"`
 	Attributes map[string]any    `json:"attributes"`
-	// Extensions field-level display (within schema_definition JSON), not involved in list filtering
-	Extensions map[string]string `json:"extensions,omitempty"`
 }
 
 type PropertyFeature struct {
@@ -139,15 +130,11 @@ type ResourceIndexConfig struct {
 // ResourcesQueryParams holds resource list query parameters.
 type ResourcesQueryParams struct {
 	PaginationQueryParams
-	Name                 string
-	CatalogID            string
-	Category             string
-	Status               string
-	Schema               string
-	ExtensionKeys        []string
-	ExtensionValues      []string
-	IncludeExtensions    bool
-	IncludeExtensionKeys string
+	Name      string
+	CatalogID string
+	Category  string
+	Status    string
+	Schema    string
 }
 
 // ResourceCreateRequest represents create resource request.
@@ -170,8 +157,6 @@ type ResourceRequest struct {
 	IndexConfig *ResourceIndexConfig `json:"index_config,omitempty"` // Local index configuration
 
 	LogicDefinition []*LogicDefinitionNode `json:"logic_definition,omitempty"` // Logical definition
-
-	Extensions *map[string]string `json:"extensions,omitempty"`
 
 	ExpectedUpdateTime int64 `json:"expected_update_time,omitempty"`
 }
