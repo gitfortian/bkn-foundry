@@ -26,6 +26,15 @@ type kafkaLedgerStore struct {
 	err        error
 }
 
+type invalidScopeLedgerStore struct {
+	ievidenceledger.Store
+	err error
+}
+
+func (s invalidScopeLedgerStore) Commit(context.Context, ledgervo.Event) (ledgervo.DurableAck, error) {
+	return ledgervo.DurableAck{}, s.err
+}
+
 func (s *kafkaLedgerStore) CommitKafka(_ context.Context, _ ledgervo.Event, coordinate ievidenceledger.KafkaCoordinate) (ievidenceledger.KafkaResult, error) {
 	s.coordinate = coordinate
 	return s.result, s.err
@@ -46,6 +55,16 @@ func TestIngestKafkaClassifiesMissingTrustedScopeAsInvalidEvent(t *testing.T) {
 	_, err := service.IngestKafka(context.Background(), testEvent(), ievidenceledger.KafkaCoordinate{Topic: "openbkn.evidence.v1", Partition: 0, Offset: 18})
 	if !ledgersvc.IsCode(err, ledgersvc.CodeInvalidEvent) {
 		t.Fatalf("missing trusted scope = %v, want invalid_evidence_event terminal decision", err)
+	}
+}
+
+func TestIngestClassifiesPermanentOwnershipFailuresAsInvalidEvent(t *testing.T) {
+	for _, storeErr := range []error{ievidenceledger.ErrMissingScope, ievidenceledger.ErrOwnerMismatch} {
+		service := ledgersvc.New(invalidScopeLedgerStore{err: storeErr})
+		_, err := service.Ingest(context.Background(), testEvent())
+		if !ledgersvc.IsCode(err, ledgersvc.CodeInvalidEvent) {
+			t.Fatalf("store error %v mapped to %v, want invalid_evidence_event", storeErr, err)
+		}
 	}
 }
 

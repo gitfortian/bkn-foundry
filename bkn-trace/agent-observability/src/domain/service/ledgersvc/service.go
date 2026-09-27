@@ -71,6 +71,8 @@ func (s *Service) Ingest(ctx context.Context, event ledgervo.Event) (ledgervo.Du
 		return ledgervo.DurableAck{}, &DomainError{
 			Code: CodeInvalidEvent, Message: "event causality is cyclic or crosses its trusted interaction scope",
 		}
+	case errors.Is(err, ievidenceledger.ErrMissingScope), errors.Is(err, ievidenceledger.ErrOwnerMismatch):
+		return ledgervo.DurableAck{}, &DomainError{Code: CodeInvalidEvent, Message: err.Error()}
 	case err != nil:
 		return ledgervo.DurableAck{}, err
 	default:
