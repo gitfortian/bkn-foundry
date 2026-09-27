@@ -19,9 +19,9 @@ import (
 	"ontology-query/interfaces"
 )
 
-func TestOntologyTraceRequestContextUsesVerifiedOwnerAndIncomingOperation(t *testing.T) {
+func TestOntologyTraceRequestContextUsesVerifiedOwnerAndRegisteredParentOperation(t *testing.T) {
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest("GET", "/", nil)
+	c.Request = httptest.NewRequest("GET", "/api/ontology-query/in/v1/knowledge-networks/kn/object-types/ot", nil)
 	c.Request.Header.Set("x-bkn-delegation-id", "spoofed")
 	traceCtx := common.TraceContext{RequestID: "req_ontology_owner_001", ConversationID: "conv-1", InteractionID: "int-1", OperationID: "op-local"}
 	ctx := common.SetTraceContextToCtx(context.Background(), traceCtx)
@@ -32,8 +32,18 @@ func TestOntologyTraceRequestContextUsesVerifiedOwnerAndIncomingOperation(t *tes
 	}
 	c.Request.Header.Set(common.HeaderBKNOperationID, "op-local")
 	got = ontologyTraceRequestContext(c, ctx, visitor)
-	if !got.OperationScopePresent {
-		t.Fatal("matching incoming Core operation was not preserved")
+	if got.OperationScopePresent || got.CoreOperationID != "" {
+		t.Fatalf("unregistered child operation claimed Core scope: %+v", got)
+	}
+	c.Request.Header.Set(common.HeaderBKNParentOperationID, "op-core")
+	got = ontologyTraceRequestContext(c, ctx, visitor)
+	if !got.OperationScopePresent || got.CoreOperationID != "op-core" || got.OperationID != "op-local" {
+		t.Fatalf("derived child and Core parent operation = %+v", got)
+	}
+	c.Request.URL.Path = "/api/ontology-query/v1/knowledge-networks/kn/object-types/ot"
+	got = ontologyTraceRequestContext(c, ctx, visitor)
+	if got.OperationScopePresent || got.CoreOperationID != "" {
+		t.Fatalf("public route claimed Core operation from caller header: %+v", got)
 	}
 }
 
