@@ -12,17 +12,22 @@ import (
 	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 )
 
-type KafkaEmitter struct{ publisher *evidencepublisher.Publisher }
+type actionEvidencePublisher interface {
+	TryPublish(evidencepublisher.Event) evidencepublisher.PublishResult
+}
+
+type KafkaEmitter struct{ publisher actionEvidencePublisher }
 
 var (
-	runtimeOnce  sync.Once
-	runtimeValue *EvidencePublisherRuntime
-	runtimeStop  chan struct{}
-	runtimeDone  chan struct{}
-	runtimeClose sync.Once
+	runtimeOnce   sync.Once
+	runtimeValue  *EvidencePublisherRuntime
+	runtimeStop   chan struct{}
+	runtimeDone   chan struct{}
+	runtimeCancel context.CancelFunc
+	runtimeClose  sync.Once
 )
 
-func NewKafkaEmitter(publisher *evidencepublisher.Publisher) *KafkaEmitter {
+func NewKafkaEmitter(publisher actionEvidencePublisher) *KafkaEmitter {
 	return &KafkaEmitter{publisher: publisher}
 }
 
@@ -37,28 +42,36 @@ func NewConfiguredKafkaEmitter(logger interfaces.Logger) *KafkaEmitter {
 		}
 		runtimeStop = make(chan struct{})
 		runtimeDone = make(chan struct{})
-		go runEvidenceFlushLoop(runtimeStop, runtimeDone, 250*time.Millisecond, runtimeValue.Publisher.Flush, evidenceDropReporter(logger))
+		policyCtx, cancel := context.WithCancel(context.Background())
+		runtimeCancel = cancel
+		go func() { _ = runtimeValue.Runtime.Run(policyCtx) }()
+		go runEvidenceFlushLoop(runtimeStop, runtimeDone, 250*time.Millisecond, runtimeValue.Runtime.Flush, evidenceDropReporter(logger))
 	})
 	if runtimeValue == nil {
 		return NewKafkaEmitter(nil)
 	}
-	return NewKafkaEmitter(runtimeValue.Publisher)
+	return NewKafkaEmitter(runtimeValue.Runtime)
 }
 
-func CloseEvidencePublisher(ctx context.Context) {
+func CloseEvidencePublisher(ctx context.Context) error {
 	if runtimeValue == nil {
-		return
+		return nil
 	}
+	var closeErr error
 	runtimeClose.Do(func() {
+		if runtimeCancel != nil {
+			runtimeCancel()
+		}
 		if runtimeStop != nil {
 			close(runtimeStop)
 			<-runtimeDone
 		}
-		_ = runtimeValue.Publisher.Close(ctx)
+		_, closeErr = runtimeValue.Runtime.Close(ctx)
 		if runtimeValue.Producer != nil {
 			_ = runtimeValue.Producer.Close()
 		}
 	})
+	return closeErr
 }
 
 func runEvidenceFlushLoop(stop <-chan struct{}, done chan<- struct{}, interval time.Duration, flush func(context.Context) evidencepublisher.DrainResult, report EvidenceDropReporter) {

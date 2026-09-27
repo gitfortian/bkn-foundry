@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import uuid
 from contextvars import ContextVar
@@ -14,6 +15,7 @@ import aiohttp
 from app import observability
 from app.config import config
 from app.evidence_kafka import EvidenceKafkaConfig, EvidenceKafkaPublisher
+from app.evidence_policy import EvidencePolicyRuntime, TraceAdmissionClient
 
 logger = logging.getLogger("bkn-agent.evidence")
 
@@ -21,7 +23,7 @@ CONTRACT_VERSION = "2.2.0"
 LEDGER_CONTRACT_VERSION = "3.0.0"
 _HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ID_RE = re.compile(r"^[0-9A-Za-z_.:-]{1,128}$")
-_publisher: EvidenceKafkaPublisher | None = None
+_publisher: EvidencePolicyRuntime | EvidenceKafkaPublisher | None = None
 _REF_FIELDS = {
     "ref_id",
     "ref_type",
@@ -879,6 +881,7 @@ async def submit_events(
     if not ledger_events:
         return False
     accepted = True
+    dropped_reasons: dict[str, int] = {}
     for ledger_event in ledger_events:
         result = _publisher.try_publish(ledger_event)
         if result.disposition == "accepted":
@@ -886,6 +889,19 @@ async def submit_events(
                 current.locally_admitted_event_ids.add(result.event_id)
         else:
             accepted = False
+            reason = result.reason if result.reason in {
+                "publisher_unavailable", "publisher_closing", "queue_full",
+                "invalid_event", "message_too_large", "serialization_failed",
+            } else "other"
+            dropped_reasons[reason] = dropped_reasons.get(reason, 0) + 1
+    for reason, count in sorted(dropped_reasons.items()):
+        if reason == "publisher_closing":
+            logger.info("bkn_trace_evidence_disabled producer_id=bkn-agent dropped=%d", count)
+        else:
+            logger.warning(
+                "bkn_trace_coverage_gap producer_id=bkn-agent reason=%s dropped=%d",
+                reason, count,
+            )
     return accepted
 
 
@@ -1018,10 +1034,15 @@ async def drain_pending() -> bool:
 
 async def start_publisher() -> None:
     global _publisher
+    if os.getenv("BKN_TRACE_EVIDENCE_PUBLISHER_ENABLED", "true").lower() == "false":
+        _publisher = None
+        return
     publisher_config = EvidenceKafkaConfig.from_env()
-    publisher = EvidenceKafkaPublisher(publisher_config)
-    publisher.start()
-    _publisher = publisher
+    control = TraceAdmissionClient.from_env()
+    publisher = EvidenceKafkaPublisher(publisher_config, policy_controlled=True)
+    runtime = EvidencePolicyRuntime(publisher, control)
+    runtime.start()
+    _publisher = runtime
 
 
 def _causally_available(event_id: str, current: InteractionEvidence) -> bool:
