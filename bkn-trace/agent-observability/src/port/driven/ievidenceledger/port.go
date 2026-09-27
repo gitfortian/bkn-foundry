@@ -18,6 +18,7 @@ var (
 	ErrSequenceConflict  = errors.New("producer sequence conflicts with durable ledger")
 	ErrCausalityConflict = errors.New("event causality conflicts with durable ledger")
 	ErrOwnerMismatch     = errors.New("evidence owner does not match trusted conversation owner")
+	ErrMissingScope      = errors.New("evidence interaction or operation does not exist")
 )
 
 type Store interface {

@@ -93,6 +93,9 @@ func (s *Service) IngestKafka(ctx context.Context, event ledgervo.Event, coordin
 	if errors.Is(err, ievidenceledger.ErrOwnerMismatch) {
 		return ievidenceledger.KafkaResult{}, &DomainError{Code: CodeInvalidEvent, Message: "evidence owner does not match trusted conversation owner"}
 	}
+	if errors.Is(err, ievidenceledger.ErrMissingScope) {
+		return ievidenceledger.KafkaResult{}, &DomainError{Code: CodeInvalidEvent, Message: ievidenceledger.ErrMissingScope.Error()}
+	}
 	if err != nil {
 		return result, err
 	}

@@ -304,7 +304,7 @@ func verifyEvidenceOwnership(ctx context.Context, tx *sql.Tx, event ledgervo.Eve
 		event.ConversationID, event.InteractionID,
 	).Scan(&applicationID, &subjectType, &subjectID, &delegationID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return errors.New("evidence interaction does not exist")
+		return ievidenceledger.ErrMissingScope
 	}
 	if err != nil {
 		return err
@@ -325,7 +325,7 @@ func verifyEvidenceOwnership(ctx context.Context, tx *sql.Tx, event ledgervo.Eve
 			return err
 		}
 		if count != 1 {
-			return errors.New("evidence operation does not belong to interaction")
+			return ievidenceledger.ErrMissingScope
 		}
 	}
 	return nil

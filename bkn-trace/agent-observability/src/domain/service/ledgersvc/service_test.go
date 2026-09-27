@@ -40,6 +40,15 @@ func TestIngestKafkaClassifiesTrustedOwnerMismatchAsInvalidEvent(t *testing.T) {
 	}
 }
 
+func TestIngestKafkaClassifiesMissingTrustedScopeAsInvalidEvent(t *testing.T) {
+	store := &kafkaLedgerStore{err: ievidenceledger.ErrMissingScope}
+	service := ledgersvc.New(store)
+	_, err := service.IngestKafka(context.Background(), testEvent(), ievidenceledger.KafkaCoordinate{Topic: "openbkn.evidence.v1", Partition: 0, Offset: 18})
+	if !ledgersvc.IsCode(err, ledgersvc.CodeInvalidEvent) {
+		t.Fatalf("missing trusted scope = %v, want invalid_evidence_event terminal decision", err)
+	}
+}
+
 func TestIngestKafkaPassesCoordinateAndPreservesDurableConflictDecision(t *testing.T) {
 	store := &kafkaLedgerStore{result: ievidenceledger.KafkaResult{Decision: ievidenceledger.KafkaConflict, ReasonCode: "event_payload_conflict"}}
 	service := ledgersvc.New(store)
