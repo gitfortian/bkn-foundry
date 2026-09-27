@@ -71,6 +71,8 @@ func (s *Service) Ingest(ctx context.Context, event ledgervo.Event) (ledgervo.Du
 		return ledgervo.DurableAck{}, &DomainError{
 			Code: CodeInvalidEvent, Message: "event causality is cyclic or crosses its trusted interaction scope",
 		}
+	case errors.Is(err, ievidenceledger.ErrMissingScope), errors.Is(err, ievidenceledger.ErrOwnerMismatch):
+		return ledgervo.DurableAck{}, &DomainError{Code: CodeInvalidEvent, Message: err.Error()}
 	case err != nil:
 		return ledgervo.DurableAck{}, err
 	default:
@@ -92,6 +94,9 @@ func (s *Service) IngestKafka(ctx context.Context, event ledgervo.Event, coordin
 	result, err := store.CommitKafka(ctx, event, coordinate)
 	if errors.Is(err, ievidenceledger.ErrOwnerMismatch) {
 		return ievidenceledger.KafkaResult{}, &DomainError{Code: CodeInvalidEvent, Message: "evidence owner does not match trusted conversation owner"}
+	}
+	if errors.Is(err, ievidenceledger.ErrMissingScope) {
+		return ievidenceledger.KafkaResult{}, &DomainError{Code: CodeInvalidEvent, Message: ievidenceledger.ErrMissingScope.Error()}
 	}
 	if err != nil {
 		return result, err
