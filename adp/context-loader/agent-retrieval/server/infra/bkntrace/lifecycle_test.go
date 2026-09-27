@@ -375,11 +375,12 @@ func TestGuardFinishCreatesCorrelationWhenCallerHasNoSpan(t *testing.T) {
 	traceContext.RequestID = "req_finish_without_span_0001"
 	ctx = common.SetTraceContextToCtx(ctx, traceContext)
 	ctx = withEvidenceOutcome(ctx)
+	ec := eventContext{applicationID: "client-1", accountID: "user-1", subjectType: "user", observedAt: "2026-09-23T00:00:00Z"}
 	if result := publishEvidenceEvent(Event{
 		"event_id": "evt-1", "event_type": "retrieval.completed", "conversation_id": "conv-1",
 		"interaction_id": "int-1", "operation_id": "op-1", "attempt": 1,
 		"observed_at": "2026-09-23T00:00:00Z", "emitted_at": "2026-09-23T00:00:01Z",
-	}); result.Disposition != evidencepublisher.Accepted {
+	}, ec); result.Disposition != evidencepublisher.Accepted {
 		t.Fatalf("queue evidence event: %#v", result)
 	}
 	recordEvidenceAttempt(ctx)

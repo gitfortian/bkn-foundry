@@ -28,18 +28,45 @@ func currentEvidencePublisher() EvidencePublisher {
 	return evidencePublisher
 }
 
-func publishEvidenceEvent(event Event) evidencepublisher.PublishResult {
+func publishEvidenceEvent(event Event, ec eventContext) evidencepublisher.PublishResult {
 	publisher := currentEvidencePublisher()
 	if publisher == nil {
 		return evidencepublisher.PublishResult{Disposition: evidencepublisher.Dropped, Reason: evidencepublisher.ReasonPublisherClosing}
 	}
-	envelope, err := json.Marshal(event)
+	// The Kafka Ledger requires the owner inside the envelope. Derive it from
+	// trusted request context rather than accepting identity from event payload.
+	envelopeEvent := make(Event, len(event)+1)
+	for key, value := range event {
+		envelopeEvent[key] = value
+	}
+	envelopeEvent["owner"] = map[string]string{
+		"application_principal_id": ec.applicationID,
+		"effective_subject_type":   ec.subjectType,
+		"effective_subject_id":     ec.accountID,
+	}
+	envelope, err := json.Marshal(envelopeEvent)
 	if err != nil {
 		return evidencepublisher.PublishResult{Disposition: evidencepublisher.Dropped, Reason: evidencepublisher.ReasonSerialization}
 	}
 	get := func(key string) string { value, _ := event[key].(string); return value }
+	observedAt := get("observed_at")
+	if observedAt == "" {
+		observedAt = ec.observedAt
+	}
+	startedAt := get("started_at")
+	if startedAt == "" {
+		startedAt = observedAt
+	}
+	emittedAt := get("emitted_at")
+	if emittedAt == "" {
+		emittedAt = observedAt
+	}
+	conversationID := get("conversation_id")
+	if conversationID == "" {
+		conversationID = ec.conversationID
+	}
 	attempt, _ := event["attempt"].(int)
-	return publisher.TryPublish(evidencepublisher.Event{EventID: get("event_id"), EventType: get("event_type"), ConversationID: get("conversation_id"), InteractionID: get("interaction_id"), OperationID: get("operation_id"), Attempt: attempt, RequestID: get("bkn.request.id"), TraceID: get("trace_id"), SpanID: get("span_id"), ObservedAt: get("observed_at"), EmittedAt: get("emitted_at"), Envelope: envelope})
+	return publisher.TryPublish(evidencepublisher.Event{EventID: get("event_id"), EventType: get("event_type"), ConversationID: conversationID, InteractionID: get("interaction_id"), OperationID: get("operation_id"), Attempt: attempt, RequestID: get("bkn.request.id"), TraceID: get("trace_id"), SpanID: get("span_id"), StartedAt: startedAt, ObservedAt: observedAt, EmittedAt: emittedAt, Envelope: envelope})
 }
 
 func FlushEvidencePublisher(ctx context.Context) evidencepublisher.DrainResult {

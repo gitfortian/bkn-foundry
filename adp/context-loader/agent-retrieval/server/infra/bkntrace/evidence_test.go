@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 
@@ -96,15 +97,27 @@ func TestRecordInteractionArtifactPersistsGovernedContentAndLedgerLink(t *testin
 	if artifactBody["content"] != "6月份有哪些需求预测单？" || artifactBody["interaction_id"] != "interaction-1" {
 		t.Fatalf("artifact content or interaction was lost: %#v", artifactBody)
 	}
-	if len(publisher.SnapshotQueue()) != 1 {
-		t.Fatalf("Kafka event count = %d", len(publisher.SnapshotQueue()))
+	queued := publisher.SnapshotQueue()
+	if len(queued) != 1 {
+		t.Fatalf("Kafka event count = %d", len(queued))
 	}
 	_ = eventBody
 	var envelope map[string]any
-	if err := json.Unmarshal(publisher.SnapshotQueue()[0].Value, &envelope); err != nil {
+	if err := json.Unmarshal(queued[0].Value, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	payload := envelope["envelope"].(map[string]any)["payload"].(map[string]any)
+	if envelope["conversation_id"] != "conversation-1" {
+		t.Fatalf("Kafka conversation_id = %#v", envelope["conversation_id"])
+	}
+	if _, err := time.Parse(time.RFC3339Nano, envelope["started_at"].(string)); err != nil {
+		t.Fatalf("Kafka started_at is not Consumer-decodable: %v", err)
+	}
+	eventEnvelope := envelope["envelope"].(map[string]any)
+	owner := eventEnvelope["owner"].(map[string]any)
+	if owner["application_principal_id"] != "acct_demo" || owner["effective_subject_type"] != "user" || owner["effective_subject_id"] != "acct_demo" {
+		t.Fatalf("Kafka artifact owner = %#v", owner)
+	}
+	payload := eventEnvelope["payload"].(map[string]any)
 	if payload["question_artifact_ref"] != ref {
 		t.Fatalf("ledger event does not link the artifact: %#v", payload)
 	}

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openbkn-ai/bkn-foundry/comm-go/bkntrace/evidencepublisher"
 )
@@ -77,6 +78,31 @@ func TestSubmitEventsPublishesCanonicalKafkaRecord(t *testing.T) {
 		payload["producer_stream_id"] != "agent-retrieval:boot-1" || payload["producer_sequence"] != float64(1) {
 		t.Fatalf("canonical payload = %#v", payload)
 	}
+	var consumerShape struct {
+		StartedAt  time.Time `json:"started_at"`
+		ObservedAt time.Time `json:"observed_at"`
+		EmittedAt  time.Time `json:"emitted_at"`
+		Envelope   struct {
+			Owner struct {
+				ApplicationPrincipalID string `json:"application_principal_id"`
+				EffectiveSubjectType   string `json:"effective_subject_type"`
+				EffectiveSubjectID     string `json:"effective_subject_id"`
+			} `json:"owner"`
+		} `json:"envelope"`
+	}
+	if err := json.Unmarshal(queued[0].Value, &consumerShape); err != nil {
+		t.Fatalf("Consumer cannot decode the queued Record: %v", err)
+	}
+	if got := consumerShape.StartedAt.Format(time.RFC3339Nano); got != "2026-09-23T00:00:00Z" {
+		t.Fatalf("started_at=%q, want observed_at fallback", got)
+	}
+	if consumerShape.ObservedAt.IsZero() || !consumerShape.EmittedAt.Equal(consumerShape.ObservedAt) {
+		t.Fatalf("event timestamps are not Consumer-decodable: observed=%s emitted=%s", consumerShape.ObservedAt, consumerShape.EmittedAt)
+	}
+	owner := consumerShape.Envelope.Owner
+	if owner.ApplicationPrincipalID != "acct_demo" || owner.EffectiveSubjectType != "user" || owner.EffectiveSubjectID != "acct_demo" {
+		t.Fatalf("trusted owner missing from Evidence envelope: %#v", owner)
+	}
 	if queued[0].Key != "agent-retrieval:boot-1" || queued[0].Header("capture_policy_revision") != "41" ||
 		queued[0].Header("producer_instance_id") != "agent-retrieval#boot-1" ||
 		queued[0].Header("bkn-evidence-record-class") != "live" {
@@ -122,7 +148,7 @@ func TestSubmitEventsQueueFullFailsOpen(t *testing.T) {
 func TestSubmitEventsContinuesAfterIndividualDrop(t *testing.T) {
 	publisher, err := evidencepublisher.New(evidencepublisher.Config{
 		ProducerID: "agent-retrieval", BaseStreamID: "agent-retrieval", WorkloadIdentity: "agent-retrieval",
-		ProcessBootID: "boot-1", CapturePolicyRevision: "41", MaxRecordBytes: 512,
+		ProcessBootID: "boot-1", CapturePolicyRevision: "41", MaxRecordBytes: 1024,
 	}, &captureEvidenceSender{})
 	if err != nil {
 		t.Fatal(err)
