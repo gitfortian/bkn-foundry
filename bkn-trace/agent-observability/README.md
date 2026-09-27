@@ -169,7 +169,7 @@ Trace Graph 单次最多返回 1000 个 span 节点。命中上限时服务会�
 
 ### Evidence 写入安全边界
 
-受管 Conversation、Interaction、Operation 生命周期继续监听于集群内部的 `agent-observability-internal:8081`，同时在公开 8080 接口为 OAuth SDK 客户端开放。公开写入由服务端根据 OAuth 与 BKN Safe 身份派生 owner，不接受客户端伪造 owner。Evidence Ledger 与 Artifact 保留在 8080 的已发布生产者接口，并继续校验独立的 `bkn-trace-evidence-ingest` token，以兼容 bkn-agent、Vega、BKN Backend、ontology-query 和 Context Loader。公开读取仍由 OAuth 与 Access Profile 保护。Chart 的 NetworkPolicy 默认只允许带稳定 `app.kubernetes.io/name=agent-retrieval` 标签的 Pod 访问 8081，其他部署可通过 `networkPolicy.allowedClients` 显式扩展。
+受管 Conversation、Interaction、Operation 生命周期继续监听于集群内部的 `agent-observability-internal:8081`，同时在公开 8080 接口为 OAuth SDK 客户端开放。公开写入由服务端根据 OAuth 与 BKN Safe 身份派生 owner，不接受客户端伪造 owner。Evidence Event 经 Kafka 进入 Ledger；Artifact 继续使用独立的 8080 HTTP 接口和凭据。公开读取仍由 OAuth 与 Access Profile 保护。Chart 的 NetworkPolicy 默认允许带 `app.kubernetes.io/name=agent-retrieval` 或现有 `app=agent-retrieval`、`app=agent-operator-integration`、`app=bkn-agent` 标签的 Pod 访问 8081；Gateway、Backend 等其他客户端可通过 `networkPolicy.allowedClients` 显式扩展。
 
 该 NetworkPolicy 依赖 Kubernetes 1.23 或更高版本。离线执行 `helm template` 时应显式传入 `--kube-version 1.23.0` 或实际目标集群版本；连接集群的 `helm install/upgrade` 会按目标集群能力校验。
 

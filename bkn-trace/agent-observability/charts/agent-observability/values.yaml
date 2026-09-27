@@ -39,6 +39,12 @@ networkPolicy:
     - namespace: ""
       podLabels:
         app: agent-retrieval
+    - namespace: ""
+      podLabels:
+        app: agent-operator-integration
+    - namespace: ""
+      podLabels:
+        app: bkn-agent
 
 ingress:
   enabled: true
