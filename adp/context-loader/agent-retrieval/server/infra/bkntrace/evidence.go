@@ -234,7 +234,7 @@ func RecordInteractionArtifact(
 	// Artifact persistence is the governed operation. The supplementary Kafka
 	// event is best effort and must not turn a committed artifact into a failure.
 	if currentEvidencePublisher() != nil {
-		if result := publishEvidenceEvent(event); result.Disposition != evidencepublisher.Accepted {
+		if result := publishEvidenceEvent(event, ec); result.Disposition != evidencepublisher.Accepted {
 			log.Printf("BKN Trace Kafka artifact event dropped: %s", result.Reason)
 		}
 	}
@@ -918,7 +918,7 @@ func SubmitEvents(ctx context.Context, logger interfaces.Logger, req any, events
 		if stringValue(event["conversation_id"]) == "" && ec.conversationID != "" {
 			event["conversation_id"] = ec.conversationID
 		}
-		if result := publishEvidenceEvent(event); result.Disposition != evidencepublisher.Accepted {
+		if result := publishEvidenceEvent(event, ec); result.Disposition != evidencepublisher.Accepted {
 			if logger != nil {
 				logger.WithContext(ctx).Warnf("BKN Trace Kafka evidence dropped: %s", result.Reason)
 			} else {
